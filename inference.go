@@ -489,35 +489,39 @@ func (r *RequestRegistry) Cancel(id string) bool {
 	return false
 }
 
-// Get retrieves a request entry by ID
+// Get retrieves a request entry by ID (returns a copy to prevent data races)
 func (r *RequestRegistry) Get(id string) *RequestEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	return r.requests[id]
+	if entry, ok := r.requests[id]; ok {
+		entryCopy := *entry
+		return &entryCopy
+	}
+	return nil
 }
 
-// List returns all request entries
-func (r *RequestRegistry) List() []*RequestEntry {
+// List returns all request entries (copies to prevent data races)
+func (r *RequestRegistry) List() []RequestEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	entries := make([]*RequestEntry, 0, len(r.requests))
+	entries := make([]RequestEntry, 0, len(r.requests))
 	for _, entry := range r.requests {
-		entries = append(entries, entry)
+		entries = append(entries, *entry)
 	}
 	return entries
 }
 
-// ListRunning returns only running request entries
-func (r *RequestRegistry) ListRunning() []*RequestEntry {
+// ListRunning returns only running request entries (copies to prevent data races)
+func (r *RequestRegistry) ListRunning() []RequestEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	entries := make([]*RequestEntry, 0)
+	entries := make([]RequestEntry, 0)
 	for _, entry := range r.requests {
 		if entry.Status == "running" {
-			entries = append(entries, entry)
+			entries = append(entries, *entry)
 		}
 	}
 	return entries
@@ -920,21 +924,32 @@ func runHTTPInferenceStream(req *InferenceRequest, providerType ProviderType, mo
 	// Create output channel
 	chunks := make(chan StreamChunkInference, 100)
 
-	// Process stream in goroutine
+	// Process stream in goroutine — producer owns the channel close
 	go func() {
 		defer close(chunks)
 		defer resp.Body.Close()
+
+		// safeSend sends a chunk to the channel, respecting context cancellation.
+		// Returns false if the context was cancelled and the goroutine should exit.
+		safeSend := func(chunk StreamChunkInference) bool {
+			select {
+			case chunks <- chunk:
+				return true
+			case <-req.Context.Done():
+				return false
+			}
+		}
 
 		reader := bufio.NewReader(resp.Body)
 		for {
 			// Check for cancellation
 			select {
 			case <-req.Context.Done():
-				chunks <- StreamChunkInference{
+				safeSend(StreamChunkInference{
 					ID:    req.ID,
 					Done:  true,
 					Error: req.Context.Err(),
-				}
+				})
 				return
 			default:
 			}
@@ -942,17 +957,17 @@ func runHTTPInferenceStream(req *InferenceRequest, providerType ProviderType, mo
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				if err == io.EOF {
-					chunks <- StreamChunkInference{
+					safeSend(StreamChunkInference{
 						ID:           req.ID,
 						Done:         true,
 						FinishReason: "stop",
-					}
+					})
 				} else {
-					chunks <- StreamChunkInference{
+					safeSend(StreamChunkInference{
 						ID:    req.ID,
 						Done:  true,
 						Error: err,
-					}
+					})
 				}
 				return
 			}
@@ -968,11 +983,11 @@ func runHTTPInferenceStream(req *InferenceRequest, providerType ProviderType, mo
 
 			data := strings.TrimPrefix(line, "data: ")
 			if data == "[DONE]" {
-				chunks <- StreamChunkInference{
+				safeSend(StreamChunkInference{
 					ID:           req.ID,
 					Done:         true,
 					FinishReason: "stop",
-				}
+				})
 				return
 			}
 
@@ -984,18 +999,20 @@ func runHTTPInferenceStream(req *InferenceRequest, providerType ProviderType, mo
 			if len(chunk.Choices) > 0 {
 				delta := chunk.Choices[0].Delta
 				if delta.Content != "" {
-					chunks <- StreamChunkInference{
+					if !safeSend(StreamChunkInference{
 						ID:      req.ID,
 						Content: delta.Content,
 						Done:    false,
+					}) {
+						return
 					}
 				}
 				if chunk.Choices[0].FinishReason != "" {
-					chunks <- StreamChunkInference{
+					safeSend(StreamChunkInference{
 						ID:           req.ID,
 						Done:         true,
 						FinishReason: chunk.Choices[0].FinishReason,
-					}
+					})
 					return
 				}
 			}
@@ -1090,9 +1107,15 @@ func RunInference(req *InferenceRequest, registry *RequestRegistry) (*InferenceR
 	// Inject continuation context for eigenfield persistence
 	injectContinuationContext(req)
 
-	// Ensure context is set
+	// Ensure context is set with a timeout to prevent indefinite hangs
 	if req.Context == nil {
-		req.Context = context.Background()
+		var cancel context.CancelFunc
+		timeout := req.Timeout
+		if timeout <= 0 {
+			timeout = 5 * time.Minute
+		}
+		req.Context, cancel = context.WithTimeout(context.Background(), timeout)
+		defer cancel()
 	}
 
 	// Ensure ID is set early for consistent tracking
@@ -1212,6 +1235,7 @@ func RunInference(req *InferenceRequest, registry *RequestRegistry) (*InferenceR
 	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Start(); err != nil {
+		stdout.Close() // Close the pipe to prevent resource leak
 		if registry != nil {
 			registry.Complete(req.ID, "failed")
 		}
@@ -1461,9 +1485,17 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 	// Inject continuation context for eigenfield persistence
 	injectContinuationContext(req)
 
-	// Ensure context is set
+	// timeoutCancel releases the timeout context created when req.Context is nil.
+	// Defaults to no-op so all code paths can call it unconditionally.
+	timeoutCancel := func() {}
 	if req.Context == nil {
-		req.Context = context.Background()
+		timeout := req.Timeout
+		if timeout <= 0 {
+			timeout = 5 * time.Minute
+		}
+		var cancel context.CancelFunc
+		req.Context, cancel = context.WithTimeout(context.Background(), timeout)
+		timeoutCancel = cancel
 	}
 
 	// Ensure ID is set early for consistent tracking
@@ -1482,6 +1514,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 	if hookResult := dispatch("PreInference", "", preInferenceData); hookResult != nil {
 		// Check if hook wants to block
 		if hookResult.Decision == "block" {
+			timeoutCancel()
 			return nil, fmt.Errorf("inference blocked by hook: %s", hookResult.Message)
 		}
 		// Check if hook injected additional context
@@ -1516,6 +1549,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 		chunks, err := runHTTPInferenceStream(req, providerType, modelName, customConfig)
 		if err != nil {
 			cancel()
+			timeoutCancel()
 			if registry != nil {
 				registry.Complete(req.ID, "failed")
 			}
@@ -1524,24 +1558,46 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 			return nil, err
 		}
 
-		// Wrap channel to handle cleanup
+		// Wrap channel to handle cleanup with context-aware sends
 		wrappedChunks := make(chan StreamChunkInference, 100)
 		go func() {
 			defer close(wrappedChunks)
 			defer cancel()
+			defer timeoutCancel()
 			defer clearInferenceActiveSignal()
 
-			for chunk := range chunks {
-				wrappedChunks <- chunk
-				if chunk.Done {
+			for {
+				select {
+				case <-ctx.Done():
+					// Consumer went away or context cancelled — stop forwarding
 					if registry != nil {
-						if chunk.Error != nil {
-							registry.Complete(req.ID, "failed")
-						} else {
-							registry.Complete(req.ID, "completed")
-						}
+						registry.Complete(req.ID, "cancelled")
 					}
 					return
+				case chunk, ok := <-chunks:
+					if !ok {
+						// Inner channel closed
+						return
+					}
+					// Use select to avoid blocking if consumer is gone
+					select {
+					case wrappedChunks <- chunk:
+					case <-ctx.Done():
+						if registry != nil {
+							registry.Complete(req.ID, "cancelled")
+						}
+						return
+					}
+					if chunk.Done {
+						if registry != nil {
+							if chunk.Error != nil {
+								registry.Complete(req.ID, "failed")
+							} else {
+								registry.Complete(req.ID, "completed")
+							}
+						}
+						return
+					}
 				}
 			}
 		}()
@@ -1577,6 +1633,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
+		timeoutCancel()
 		if registry != nil {
 			registry.Complete(req.ID, "failed")
 		}
@@ -1586,7 +1643,9 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 	}
 
 	if err := cmd.Start(); err != nil {
+		stdout.Close() // Close the pipe to prevent resource leak
 		cancel()
+		timeoutCancel()
 		if registry != nil {
 			registry.Complete(req.ID, "failed")
 		}
@@ -1602,6 +1661,18 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 	go func() {
 		defer close(chunks)
 		defer cancel()
+		defer timeoutCancel()
+
+		// safeSend sends a chunk to the channel, respecting context cancellation.
+		// Returns false if the context was cancelled and the goroutine should exit.
+		safeSend := func(chunk StreamChunkInference) bool {
+			select {
+			case chunks <- chunk:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 
 		// Track token counts for completion event
 		var promptTokens, completionTokens int
@@ -1631,11 +1702,11 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 				}
 				emitInferenceError(req.ID, "request cancelled")
 				clearInferenceActiveSignal()
-				chunks <- StreamChunkInference{
+				safeSend(StreamChunkInference{
 					ID:    req.ID,
 					Done:  true,
 					Error: ctx.Err(),
-				}
+				})
 				return
 			default:
 			}
@@ -1704,7 +1775,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 								Arguments: json.RawMessage(""),
 							}
 							// Emit tool_use start event
-							chunks <- StreamChunkInference{
+							if !safeSend(StreamChunkInference{
 								ID:        req.ID,
 								EventType: "tool_use_start",
 								ToolCall: &ToolCallData{
@@ -1712,6 +1783,8 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 									Name: eventData.ContentBlock.Name,
 								},
 								Done: false,
+							}) {
+								return
 							}
 						}
 					}
@@ -1726,11 +1799,13 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 								gotContent = true
 								gotStreamContent = true // Mark that we're receiving content via stream_event
 								fullContent.WriteString(eventData.Delta.Text)
-								chunks <- StreamChunkInference{
+								if !safeSend(StreamChunkInference{
 									ID:        req.ID,
 									Content:   eventData.Delta.Text,
 									EventType: "text",
 									Done:      false,
+								}) {
+									return
 								}
 							}
 						case "input_json_delta":
@@ -1739,7 +1814,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 								// Append to arguments
 								tc.Arguments = append(tc.Arguments, []byte(eventData.Delta.PartialJSON)...)
 								// Emit partial tool call update
-								chunks <- StreamChunkInference{
+								if !safeSend(StreamChunkInference{
 									ID:        req.ID,
 									Content:   eventData.Delta.PartialJSON,
 									EventType: "tool_use_delta",
@@ -1749,6 +1824,8 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 										Arguments: json.RawMessage(eventData.Delta.PartialJSON),
 									},
 									Done: false,
+								}) {
+									return
 								}
 							}
 						}
@@ -1758,11 +1835,13 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 					// Content block finished
 					if tc, ok := activeToolCalls[eventData.Index]; ok {
 						// Emit completed tool call
-						chunks <- StreamChunkInference{
+						if !safeSend(StreamChunkInference{
 							ID:        req.ID,
 							EventType: "tool_use",
 							ToolCall:  tc,
 							Done:      false,
+						}) {
+							return
 						}
 						delete(activeToolCalls, eventData.Index)
 					}
@@ -1788,7 +1867,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 								cacheCreateTokens = msgStart.Usage.CacheCreateTokens
 							}
 							// Emit session info
-							chunks <- StreamChunkInference{
+							if !safeSend(StreamChunkInference{
 								ID:        req.ID,
 								EventType: "session_start",
 								SessionInfo: &SessionInfo{
@@ -1797,6 +1876,8 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 									Tools:     sessionTools,
 								},
 								Done: false,
+							}) {
+								return
 							}
 						}
 					}
@@ -1831,7 +1912,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 						sessionModel = sysMsg.Session.Model
 						sessionTools = sysMsg.Session.Tools
 						// Emit session info
-						chunks <- StreamChunkInference{
+						if !safeSend(StreamChunkInference{
 							ID:        req.ID,
 							EventType: "session_info",
 							SessionInfo: &SessionInfo{
@@ -1840,6 +1921,8 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 								Tools:     sessionTools,
 							},
 							Done: false,
+						}) {
+							return
 						}
 					}
 				}
@@ -1863,11 +1946,13 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 							if c.Text != "" && !gotStreamContent {
 								gotContent = true
 								fullContent.WriteString(c.Text) // Accumulate for PostInference
-								chunks <- StreamChunkInference{
+								if !safeSend(StreamChunkInference{
 									ID:        req.ID,
 									Content:   c.Text,
 									EventType: "text",
 									Done:      false,
+								}) {
+									return
 								}
 							}
 						case "tool_use":
@@ -1875,15 +1960,17 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 							if c.Name == "StructuredOutput" && len(c.Input) > 0 {
 								gotContent = true
 								fullContent.WriteString(string(c.Input)) // Accumulate for PostInference
-								chunks <- StreamChunkInference{
+								if !safeSend(StreamChunkInference{
 									ID:        req.ID,
 									Content:   string(c.Input),
 									EventType: "text",
 									Done:      false,
+								}) {
+									return
 								}
 							} else if c.Name != "" {
 								// Emit tool use event
-								chunks <- StreamChunkInference{
+								if !safeSend(StreamChunkInference{
 									ID:        req.ID,
 									EventType: "tool_use",
 									ToolCall: &ToolCallData{
@@ -1892,6 +1979,8 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 										Arguments: c.Input,
 									},
 									Done: false,
+								}) {
+									return
 								}
 							}
 						}
@@ -1914,11 +2003,11 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 				if claudeMsg.Message != nil {
 					for _, c := range claudeMsg.Message.Content {
 						if c.Type == "tool_result" && c.ToolUseID != "" {
-							if DebugMode {
+							if DebugMode.Load() {
 								log.Printf("[DEBUG] Received tool_result for tool %s (isError=%v)", c.ToolUseID, c.IsError)
 							}
 							// Emit tool result event
-							chunks <- StreamChunkInference{
+							if !safeSend(StreamChunkInference{
 								ID:        req.ID,
 								EventType: "tool_result",
 								ToolResult: &ToolResultData{
@@ -1927,6 +2016,8 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 									IsError:    c.IsError,
 								},
 								Done: false,
+							}) {
+								return
 							}
 						}
 					}
@@ -1935,7 +2026,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 				// Capture usage from result - but DON'T emit Done yet!
 				// In agentic mode, Claude may continue generating after tool results.
 				// We'll emit Done only when the process actually exits.
-				if DebugMode {
+				if DebugMode.Load() {
 					log.Printf("[DEBUG] Received 'result' message from Claude CLI (NOT emitting Done)")
 				}
 				if claudeMsg.Usage != nil {
@@ -1957,21 +2048,25 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 
 				// Prefer structured_output for JSON schema responses
 				if !gotContent && len(claudeMsg.StructuredOutput) > 0 {
-					chunks <- StreamChunkInference{
+					if !safeSend(StreamChunkInference{
 						ID:        req.ID,
 						Content:   string(claudeMsg.StructuredOutput),
 						EventType: "text",
 						Done:      false,
+					}) {
+						return
 					}
 					gotContent = true
 				}
 				// Fallback to result text if no content yet
 				if !gotContent && claudeMsg.Result != "" {
-					chunks <- StreamChunkInference{
+					if !safeSend(StreamChunkInference{
 						ID:        req.ID,
 						Content:   claudeMsg.Result,
 						EventType: "text",
 						Done:      false,
+					}) {
+						return
 					}
 					gotContent = true
 				}
@@ -1985,21 +2080,21 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 			log.Printf("[ERROR] Scanner error while reading Claude CLI output: %v", err)
 			emitInferenceError(req.ID, "scanner error: "+err.Error())
 			clearInferenceActiveSignal()
-			chunks <- StreamChunkInference{
+			safeSend(StreamChunkInference{
 				ID:    req.ID,
 				Done:  true,
 				Error: fmt.Errorf("scanner error: %w", err),
-			}
+			})
 			cmd.Process.Kill() // Clean up the process
 			return
 		}
 
 		// Wait for process to complete
-		if DebugMode {
+		if DebugMode.Load() {
 			log.Printf("[DEBUG] Scanner loop finished, waiting for Claude CLI to exit...")
 		}
 		waitErr := cmd.Wait()
-		if DebugMode {
+		if DebugMode.Load() {
 			log.Printf("[DEBUG] Claude CLI exited (err=%v), will now emit Done chunk", waitErr)
 		}
 
@@ -2018,11 +2113,11 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 		if waitErr != nil {
 			emitInferenceError(req.ID, waitErr.Error())
 			clearInferenceActiveSignal()
-			chunks <- StreamChunkInference{
+			safeSend(StreamChunkInference{
 				ID:    req.ID,
 				Done:  true,
 				Error: waitErr,
-			}
+			})
 		} else {
 			// Emit completion event
 			resp := &InferenceResponse{
@@ -2036,7 +2131,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 			clearInferenceActiveSignal()
 
 			// Emit final Done chunk with usage - NOW that process has exited
-			chunks <- StreamChunkInference{
+			safeSend(StreamChunkInference{
 				ID:           req.ID,
 				Done:         true,
 				FinishReason: finishReason,
@@ -2047,7 +2142,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 					CacheCreateTokens: cacheCreateTokens,
 					CostUSD:           costUSD,
 				},
-			}
+			})
 
 			// Dispatch PostInference hooks (for artifact extraction, logging)
 			postInferenceData := map[string]interface{}{
@@ -2070,6 +2165,18 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 
 // GlobalRegistry is the shared registry for the serve module
 var GlobalRegistry = NewRequestRegistry()
+
+// StartRegistryCleanup starts a background goroutine that periodically
+// removes completed/failed/cancelled entries older than 1 hour.
+func StartRegistryCleanup() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			GlobalRegistry.Cleanup(1 * time.Hour)
+		}
+	}()
+}
 
 // === CLI COMMAND ===
 
@@ -2740,8 +2847,14 @@ func saveSignalField(state *SignalFieldState) error {
 	return os.Rename(tmpFile, stateFile)
 }
 
+// signalFieldMu serializes read-modify-write access to the signal field file
+var signalFieldMu sync.Mutex
+
 // depositSignal deposits a signal at a location
 func depositSignal(location, signalType, agentID string, halfLifeHours float64, metadata map[string]interface{}) error {
+	signalFieldMu.Lock()
+	defer signalFieldMu.Unlock()
+
 	state, err := loadSignalField()
 	if err != nil {
 		return err
@@ -2769,6 +2882,9 @@ func depositSignal(location, signalType, agentID string, halfLifeHours float64, 
 
 // removeSignal removes a signal at a location
 func removeSignal(location, signalType string) error {
+	signalFieldMu.Lock()
+	defer signalFieldMu.Unlock()
+
 	state, err := loadSignalField()
 	if err != nil {
 		return err

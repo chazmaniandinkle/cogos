@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -176,7 +177,9 @@ func DetectConflicts(workspaceRoot, branchA, branchB string) ([]Conflict, error)
 // getTreeFiles returns map of file paths to content hashes for a branch
 func getTreeFiles(workspaceRoot, branch, prefix string) (map[string]string, error) {
 	// Use git ls-tree to get file list
-	cmd := exec.Command("git", "ls-tree", "-r", branch, prefix)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "ls-tree", "-r", branch, prefix)
 	cmd.Dir = workspaceRoot
 	output, err := cmd.Output()
 	if err != nil {
@@ -262,7 +265,9 @@ func detectTextConflict(workspaceRoot, branchA, branchB, filePath string) (*Conf
 
 // getFileContent retrieves file content from a specific branch
 func getFileContent(workspaceRoot, branch, filePath string) (string, error) {
-	cmd := exec.Command("git", "show", branch+":"+filePath)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "show", branch+":"+filePath)
 	cmd.Dir = workspaceRoot
 	output, err := cmd.Output()
 	if err != nil {
@@ -292,7 +297,9 @@ func CreateMergeEvent(workspaceRoot, sessionID string, parentHeads []ParentHead,
 	}
 
 	// Get current commit hash (should be merge commit)
-	cmd := exec.Command("git", "rev-parse", "HEAD")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
 	cmd.Dir = workspaceRoot
 	output, err := cmd.Output()
 	if err != nil {
@@ -301,7 +308,9 @@ func CreateMergeEvent(workspaceRoot, sessionID string, parentHeads []ParentHead,
 	commitHash := strings.TrimSpace(string(output))
 
 	// Get tree hash
-	cmd = exec.Command("git", "rev-parse", "HEAD^{tree}")
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel2()
+	cmd = exec.CommandContext(ctx2, "git", "rev-parse", "HEAD^{tree}")
 	cmd.Dir = workspaceRoot
 	output, err = cmd.Output()
 	if err != nil {
@@ -476,7 +485,9 @@ func PerformMerge(workspaceRoot, sessionID, branchA, branchB string) (*MergeEven
 	}
 
 	// Step 3: Execute git merge
-	cmd := exec.Command("git", "merge", "--no-ff", branchB, "-m", fmt.Sprintf("Merge %s into %s", branchB, branchA))
+	mergeCtx, mergeCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer mergeCancel()
+	cmd := exec.CommandContext(mergeCtx, "git", "merge", "--no-ff", branchB, "-m", fmt.Sprintf("Merge %s into %s", branchB, branchA))
 	cmd.Dir = workspaceRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("git merge failed: %w\nOutput: %s", err, string(output))
@@ -498,7 +509,9 @@ func PerformMerge(workspaceRoot, sessionID, branchA, branchB string) (*MergeEven
 
 // getCommitHash retrieves commit hash for a branch
 func getCommitHash(workspaceRoot, branch string) string {
-	cmd := exec.Command("git", "rev-parse", branch)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", branch)
 	cmd.Dir = workspaceRoot
 	output, err := cmd.Output()
 	if err != nil {
@@ -509,7 +522,9 @@ func getCommitHash(workspaceRoot, branch string) string {
 
 // getTreeHash retrieves tree hash for a branch
 func getTreeHash(workspaceRoot, branch string) string {
-	cmd := exec.Command("git", "rev-parse", branch+"^{tree}")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", branch+"^{tree}")
 	cmd.Dir = workspaceRoot
 	output, err := cmd.Output()
 	if err != nil {

@@ -16,10 +16,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/storer"
 )
 
 // === CONFIGURATION ===
@@ -141,6 +143,27 @@ func ComputeFileSalience(repoPath string, filePath string, daysWindow int, cfg *
 		return nil, fmt.Errorf("file not found: %s", filePath)
 	}
 
+	// Churn calculation is expensive; allow disabling
+	enableChurn := false
+	if val := os.Getenv("COG_SALIENCE_CHURN"); val != "" {
+		lower := strings.ToLower(val)
+		if lower == "1" || lower == "true" || lower == "yes" {
+			enableChurn = true
+		}
+	}
+
+	// Normalize to repo-relative path for git operations
+	relPath := filePath
+	if filepath.IsAbs(filePath) {
+		if rel, err := filepath.Rel(repoPath, filePath); err == nil {
+			cleanRel := filepath.Clean(rel)
+			if cleanRel != ".." && !strings.HasPrefix(cleanRel, ".."+string(filepath.Separator)) {
+				relPath = cleanRel
+			}
+		}
+	}
+	relPath = filepath.ToSlash(relPath)
+
 	// Open git repository
 	repo, err := git.PlainOpen(repoPath)
 	if err != nil {
@@ -153,7 +176,7 @@ func ComputeFileSalience(repoPath string, filePath string, daysWindow int, cfg *
 	// Get commit iterator
 	commitIter, err := repo.Log(&git.LogOptions{
 		PathFilter: func(path string) bool {
-			return path == filePath
+			return path == relPath
 		},
 	})
 	if err != nil {
@@ -172,7 +195,7 @@ func ComputeFileSalience(repoPath string, filePath string, daysWindow int, cfg *
 	err = commitIter.ForEach(func(c *object.Commit) error {
 		// Skip commits older than window
 		if c.Author.When.Before(cutoffTime) {
-			return nil
+			return storer.ErrStop
 		}
 
 		commitCount++
@@ -185,12 +208,14 @@ func ComputeFileSalience(repoPath string, filePath string, daysWindow int, cfg *
 
 		// Calculate changes (churn)
 		// Get file stats from commit
-		stats, err := c.Stats()
-		if err == nil {
-			for _, stat := range stats {
-				if stat.Name == filePath {
-					totalChanges += stat.Addition + stat.Deletion
-					break
+		if enableChurn {
+			stats, err := c.Stats()
+			if err == nil {
+				for _, stat := range stats {
+					if stat.Name == relPath {
+						totalChanges += stat.Addition + stat.Deletion
+						break
+					}
 				}
 			}
 		}

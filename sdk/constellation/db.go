@@ -108,6 +108,11 @@ func (c *Constellation) runMigrations() error {
 	return nil
 }
 
+// DB returns the underlying sql.DB for direct queries.
+func (c *Constellation) DB() *sql.DB {
+	return c.db
+}
+
 // Close closes the database connection.
 func (c *Constellation) Close() error {
 	if c.db != nil {

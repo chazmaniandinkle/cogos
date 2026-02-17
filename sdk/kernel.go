@@ -83,9 +83,9 @@ func (k *Kernel) StateDir() string {
 	return filepath.Join(k.root, ".cog", ".state")
 }
 
-// MemoryDir returns the .cog/memory directory path.
+// MemoryDir returns the .cog/mem directory path.
 func (k *Kernel) MemoryDir() string {
-	return filepath.Join(k.root, ".cog", "memory")
+	return filepath.Join(k.root, ".cog", "mem")
 }
 
 // RegisterProjector adds a projector to the kernel.

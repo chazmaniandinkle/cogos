@@ -10,7 +10,7 @@
 #   make clean    - Remove build artifacts
 #   make install  - Install to current directory
 
-VERSION := 2.0.0
+VERSION := 2.1.0
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w -X main.BuildTime=$(BUILD_TIME)
 BUILD_TAGS := fts5
@@ -29,7 +29,9 @@ PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64
 # Default: build for current platform
 build: $(BINARY)
 
-$(BINARY): cog.go go.mod
+GO_SOURCES := $(wildcard *.go)
+
+$(BINARY): $(GO_SOURCES) go.mod
 	$(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) .
 
 # Build for all platforms
@@ -51,12 +53,31 @@ linux-arm64:
 android-arm64:
 	GOOS=android GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -buildmode=pie -ldflags="$(LDFLAGS)" -o $(BINARY)-android-arm64 .
 
-# Install to default location
+# Workspace root (two levels up from apps/cogos/)
+WORKSPACE_ROOT := $(shell cd ../.. && pwd)
+INSTALL_TARGET := $(WORKSPACE_ROOT)/.cog/cog
+
+# Install to .cog/cog (atomic: build, verify, checksum, move)
 install: build
-	@echo "Installed $(BINARY) ($(GOOS)/$(GOARCH))"
+	@echo "=== Installing to $(INSTALL_TARGET) ==="
+	@./$(BINARY) version > /dev/null 2>&1 || (echo "ERROR: built binary fails version check" && exit 1)
+	@if [ -f "$(INSTALL_TARGET)" ]; then \
+		cp "$(INSTALL_TARGET)" "$(INSTALL_TARGET).bak"; \
+		echo "  Backed up existing binary to .cog/cog.bak"; \
+	fi
+	@cp $(BINARY) "$(INSTALL_TARGET).tmp"
+	@chmod +x "$(INSTALL_TARGET).tmp"
+	@mv "$(INSTALL_TARGET).tmp" "$(INSTALL_TARGET)"
+	@NEW_SHA=$$(shasum -a 256 "$(INSTALL_TARGET)" | cut -d' ' -f1); \
+		echo "  Installed $(BINARY) $(VERSION) ($(GOOS)/$(GOARCH))"; \
+		echo "  SHA-256: $$NEW_SHA"
 
 # Run tests
 test: build
+	@echo "=== Unit Tests ==="
+	$(GO) test -tags "$(BUILD_TAGS)" -count=1 ./...
+	@echo ""
+	@echo "=== Smoke Tests ==="
 	@echo "=== Version Test ==="
 	./$(BINARY) version
 	@echo ""
@@ -86,10 +107,27 @@ clean:
 
 # Development helpers
 fmt:
-	gofmt -s -w cog.go
+	gofmt -s -w *.go
 
 vet:
 	$(GO) vet ./...
+
+lint: vet
+	@echo "=== Checking for bare exec.Command ==="
+	@if grep -n 'exec\.Command(' *.go | grep -v '_test\.go' | grep -v 'CommandContext' | grep -v '// bare-ok' > /dev/null 2>&1; then \
+		echo "ERROR: bare exec.Command found (use CommandContext with timeout):"; \
+		grep -n 'exec\.Command(' *.go | grep -v '_test\.go' | grep -v 'CommandContext' | grep -v '// bare-ok'; \
+		exit 1; \
+	else \
+		echo "  All exec.Command calls use CommandContext"; \
+	fi
+	@if grep -rn 'exec\.Command(' sdk/ | grep -v '_test\.go' | grep -v 'CommandContext' | grep -v '// bare-ok' > /dev/null 2>&1; then \
+		echo "ERROR: bare exec.Command found in sdk/:"; \
+		grep -rn 'exec\.Command(' sdk/ | grep -v '_test\.go' | grep -v 'CommandContext' | grep -v '// bare-ok'; \
+		exit 1; \
+	else \
+		echo "  SDK: All exec.Command calls use CommandContext"; \
+	fi
 
 # Show binary info
 info: build

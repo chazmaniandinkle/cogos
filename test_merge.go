@@ -22,23 +22,23 @@ func setupTestRepo(t *testing.T) string {
 	tempDir := t.TempDir()
 
 	// Initialize git repo
-	cmd := exec.Command("git", "init")
+	cmd := exec.Command("git", "init") // bare-ok: test infrastructure
 	cmd.Dir = tempDir
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("failed to init git repo: %v", err)
 	}
 
 	// Configure git
-	exec.Command("git", "config", "user.name", "Test User").Run()
-	exec.Command("git", "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "config", "user.name", "Test User").Run()  // bare-ok: test infrastructure
+	exec.Command("git", "config", "user.email", "test@example.com").Run() // bare-ok: test infrastructure
 
 	// Create .cog directory structure
 	cogDir := filepath.Join(tempDir, ".cog")
 	if err := os.MkdirAll(filepath.Join(cogDir, "ledger"), 0755); err != nil {
 		t.Fatalf("failed to create .cog/ledger: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(cogDir, "memory"), 0755); err != nil {
-		t.Fatalf("failed to create .cog/memory: %v", err)
+	if err := os.MkdirAll(filepath.Join(cogDir, "mem"), 0755); err != nil {
+		t.Fatalf("failed to create .cog/mem: %v", err)
 	}
 
 	// Create initial commit
@@ -47,13 +47,13 @@ func setupTestRepo(t *testing.T) string {
 		t.Fatalf("failed to create test file: %v", err)
 	}
 
-	cmd = exec.Command("git", "add", ".")
+	cmd = exec.Command("git", "add", ".") // bare-ok: test infrastructure
 	cmd.Dir = tempDir
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("failed to add files: %v", err)
 	}
 
-	cmd = exec.Command("git", "commit", "-m", "Initial commit")
+	cmd = exec.Command("git", "commit", "-m", "Initial commit") // bare-ok: test infrastructure
 	cmd.Dir = tempDir
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("failed to create initial commit: %v", err)
@@ -64,7 +64,7 @@ func setupTestRepo(t *testing.T) string {
 
 // createBranch creates a new branch and switches to it
 func createBranch(t testing.TB, repoPath, branchName string) {
-	cmd := exec.Command("git", "checkout", "-b", branchName)
+	cmd := exec.Command("git", "checkout", "-b", branchName) // bare-ok: test infrastructure
 	cmd.Dir = repoPath
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("failed to create branch %s: %v", branchName, err)
@@ -85,13 +85,13 @@ func commitFile(t *testing.T, repoPath, filePath, content, commitMsg string) {
 		t.Fatalf("failed to write file: %v", err)
 	}
 
-	cmd := exec.Command("git", "add", ".cog/"+filePath)
+	cmd := exec.Command("git", "add", ".cog/"+filePath) // bare-ok: test infrastructure
 	cmd.Dir = repoPath
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("failed to add file: %v", err)
 	}
 
-	cmd = exec.Command("git", "commit", "-m", commitMsg)
+	cmd = exec.Command("git", "commit", "-m", commitMsg) // bare-ok: test infrastructure
 	cmd.Dir = repoPath
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("failed to commit: %v", err)
@@ -100,7 +100,7 @@ func commitFile(t *testing.T, repoPath, filePath, content, commitMsg string) {
 
 // switchBranch switches to a different branch
 func switchBranch(t testing.TB, repoPath, branchName string) {
-	cmd := exec.Command("git", "checkout", branchName)
+	cmd := exec.Command("git", "checkout", branchName) // bare-ok: test infrastructure
 	cmd.Dir = repoPath
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("failed to switch to branch %s: %v", branchName, err)
@@ -447,7 +447,7 @@ func BenchmarkConflictDetection(b *testing.B) {
 
 	// Create branches with many files
 	for i := 0; i < 100; i++ {
-		commitFileForBench(b, repo, filepath.Join("memory", fmt.Sprintf("file%d.md", i)),
+		commitFileForBench(b, repo, filepath.Join("mem", fmt.Sprintf("file%d.md", i)),
 			fmt.Sprintf("content %d\n", i), "Add files")
 	}
 
@@ -466,21 +466,21 @@ func BenchmarkConflictDetection(b *testing.B) {
 
 func setupTestRepoForBench(b *testing.B) string {
 	tempDir := b.TempDir()
-	cmd := exec.Command("git", "init")
+	cmd := exec.Command("git", "init") // bare-ok: test infrastructure
 	cmd.Dir = tempDir
 	cmd.Run()
 
 	cogDir := filepath.Join(tempDir, ".cog")
-	os.MkdirAll(filepath.Join(cogDir, "memory"), 0755)
+	os.MkdirAll(filepath.Join(cogDir, "mem"), 0755)
 
 	testFile := filepath.Join(cogDir, "test.txt")
 	os.WriteFile(testFile, []byte("initial\n"), 0644)
 
-	cmd = exec.Command("git", "add", ".")
+	cmd = exec.Command("git", "add", ".") // bare-ok: test infrastructure
 	cmd.Dir = tempDir
 	cmd.Run()
 
-	cmd = exec.Command("git", "commit", "-m", "Initial")
+	cmd = exec.Command("git", "commit", "-m", "Initial") // bare-ok: test infrastructure
 	cmd.Dir = tempDir
 	cmd.Run()
 
@@ -493,11 +493,11 @@ func commitFileForBench(b *testing.B, repoPath, filePath, content, commitMsg str
 	os.MkdirAll(dir, 0755)
 	os.WriteFile(fullPath, []byte(content), 0644)
 
-	cmd := exec.Command("git", "add", ".cog/"+filePath)
+	cmd := exec.Command("git", "add", ".cog/"+filePath) // bare-ok: test infrastructure
 	cmd.Dir = repoPath
 	cmd.Run()
 
-	cmd = exec.Command("git", "commit", "-m", commitMsg)
+	cmd = exec.Command("git", "commit", "-m", commitMsg) // bare-ok: test infrastructure
 	cmd.Dir = repoPath
 	cmd.Run()
 }

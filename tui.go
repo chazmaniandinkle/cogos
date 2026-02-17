@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -692,7 +693,9 @@ func (m tuiModel) inferViaHTTP(userMsg string) (string, error) {
 
 // inferViaCLI falls back to cog infer command
 func (m tuiModel) inferViaCLI(userMsg string) (string, error) {
-	cmd := exec.Command(filepath.Join(m.cogRoot, "cog"), "infer", userMsg)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, filepath.Join(m.cogRoot, "cog"), "infer", userMsg)
 	cmd.Dir = m.workspaceRoot
 
 	output, err := cmd.Output()

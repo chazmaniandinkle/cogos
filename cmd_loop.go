@@ -22,7 +22,7 @@ func cmdLoop(args []string) error {
 	scriptPath := filepath.Join(root, ".cog", "scripts", "autonomous-loop.py")
 
 	// Build command
-	cmd := exec.Command("python3", scriptPath, args[0])
+	cmd := exec.Command("python3", scriptPath, args[0]) // bare-ok: interactive long-running process
 	if len(args) > 1 {
 		cmd.Args = append(cmd.Args, args[1:]...)
 	}

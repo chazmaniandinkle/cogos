@@ -47,11 +47,10 @@ func cmdConstellation(args []string) error {
 // constellationIndex indexes all cogdocs in the workspace
 func constellationIndex(workspaceRoot string) error {
 	fmt.Println("Opening constellation database...")
-	c, err := constellation.Open(workspaceRoot)
+	c, err := getConstellation()
 	if err != nil {
 		return fmt.Errorf("failed to open constellation: %w", err)
 	}
-	defer c.Close()
 
 	fmt.Println("Indexing all cogdocs in workspace...")
 	err = c.IndexWorkspace()
@@ -65,11 +64,10 @@ func constellationIndex(workspaceRoot string) error {
 
 // constellationSearch performs a full-text search
 func constellationSearch(workspaceRoot, query string) error {
-	c, err := constellation.Open(workspaceRoot)
+	c, err := getConstellation()
 	if err != nil {
 		return fmt.Errorf("failed to open constellation: %w", err)
 	}
-	defer c.Close()
 
 	results, err := c.Search(query, 10)
 	if err != nil {
@@ -96,11 +94,10 @@ func constellationSearch(workspaceRoot, query string) error {
 
 // constellationHealth shows database statistics
 func constellationHealth(workspaceRoot string) error {
-	c, err := constellation.Open(workspaceRoot)
+	c, err := getConstellation()
 	if err != nil {
 		return fmt.Errorf("failed to open constellation: %w", err)
 	}
-	defer c.Close()
 
 	health, err := c.Health()
 	if err != nil {
@@ -117,11 +114,10 @@ func constellationHealth(workspaceRoot string) error {
 
 // constellationSubstance analyzes document substance vs metadata ratios
 func constellationSubstance(workspaceRoot string, args []string) error {
-	c, err := constellation.Open(workspaceRoot)
+	c, err := getConstellation()
 	if err != nil {
 		return fmt.Errorf("failed to open constellation: %w", err)
 	}
-	defer c.Close()
 
 	// Parse flags
 	mode := "summary"

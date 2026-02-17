@@ -91,7 +91,7 @@ func BenchmarkNormalizePath(b *testing.B) {
 // BenchmarkTraverseWaypoints benchmarks graph traversal
 func BenchmarkTraverseWaypoints(b *testing.B) {
 	tmpDir := b.TempDir()
-	memoryDir := filepath.Join(tmpDir, ".cog", "memory", "semantic")
+	memoryDir := filepath.Join(tmpDir, ".cog", "mem", "semantic")
 	os.MkdirAll(memoryDir, 0755)
 
 	// Create 10 test documents

@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -208,8 +209,9 @@ func spawnFleet(root, configName, task string) (*FleetEntry, error) {
 		return nil, err
 	}
 
-	// Launch Python runner in background
-	cmd := exec.Command("python3", "-m", "lablib.fleet_runner",
+	// Launch Python runner in background with timeout
+	fleetCtx, fleetCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	cmd := exec.CommandContext(fleetCtx, "python3", "-m", "lablib.fleet_runner",
 		"--fleet-id", fleetID,
 		"--fleet-dir", fleetPath,
 	)
@@ -223,11 +225,21 @@ func spawnFleet(root, configName, task string) (*FleetEntry, error) {
 	}
 
 	if err := cmd.Start(); err != nil {
+		fleetCancel()
 		entry.State = FleetFailed
 		registry.Fleets[fleetID] = entry
 		saveFleetRegistry(root, registry)
 		return nil, fmt.Errorf("failed to start runner: %w", err)
 	}
+
+	// Clean up context and log file when process exits
+	go func() {
+		cmd.Wait()
+		fleetCancel()
+		if logFile != nil {
+			logFile.Close()
+		}
+	}()
 
 	// Update state to running
 	entry.State = FleetRunning
@@ -522,7 +534,9 @@ func cmdFleet(args []string) int {
 			cmdArgs = append(cmdArgs, "--refresh")
 		}
 
-		cmd := exec.Command("python3", cmdArgs...)
+		statsCtx, statsCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer statsCancel()
+		cmd := exec.CommandContext(statsCtx, "python3", cmdArgs...)
 		cmd.Dir = filepath.Join(root, "projects/cog_lab_package")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr

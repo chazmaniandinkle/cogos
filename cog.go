@@ -10,6 +10,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1087,9 +1088,36 @@ func resolveURI(uri string) (string, error) {
 	}
 }
 
+// === TIMEOUT HELPERS ===
+
+// gitCmd creates an exec.Cmd for a local git operation with a 30-second timeout.
+// The returned cancel function MUST be deferred by the caller.
+func gitCmd(args ...string) (*exec.Cmd, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return exec.CommandContext(ctx, "git", args...), cancel
+}
+
+// hookCmd creates an exec.Cmd for hook/script execution with a 60-second timeout.
+// The timeout is intentionally generous for user-defined scripts.
+// The returned cancel function MUST be deferred by the caller.
+func hookCmd(program string, args ...string) (*exec.Cmd, context.CancelFunc) {
+	// Hook timeout: 60s (configurable via this constant)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	return exec.CommandContext(ctx, program, args...), cancel
+}
+
+// externalCmd creates an exec.Cmd for external tool execution with a 30-second timeout.
+// The returned cancel function MUST be deferred by the caller.
+func externalCmd(program string, args ...string) (*exec.Cmd, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return exec.CommandContext(ctx, program, args...), cancel
+}
+
 // gitBlobHash computes the git blob hash of a file
 func gitBlobHash(path string) (string, error) {
-	out, err := exec.Command("git", "hash-object", path).Output()
+	cmd, cancel := gitCmd("hash-object", path)
+	defer cancel()
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
@@ -1116,7 +1144,9 @@ func gitCanonicalBlobHash(path string) (string, error) {
 // === GIT PRIMITIVES ===
 
 func gitRoot() (string, error) {
-	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	cmd, cancel := gitCmd("rev-parse", "--show-toplevel")
+	defer cancel()
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("not a git repository")
 	}
@@ -1207,7 +1237,9 @@ func resolveWorkspaceUncached() (string, string, error) {
 }
 
 func gitTreeHash() (string, error) {
-	out, err := exec.Command("git", "write-tree").Output()
+	cmd, cancel := gitCmd("write-tree")
+	defer cancel()
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
@@ -1217,12 +1249,15 @@ func gitTreeHash() (string, error) {
 // gitCogTreeHash computes the tree hash of .cog/ directory
 func gitCogTreeHash(gitRoot string) (string, error) {
 	// Stage .cog/ first to include unstaged changes
-	stageCmd := exec.Command("git", "-C", gitRoot, "add", "-A", ".cog/")
+	stageCmd, stageCancel := gitCmd("-C", gitRoot, "add", "-A", ".cog/")
+	defer stageCancel()
 	if err := stageCmd.Run(); err != nil {
 		// Non-fatal: may fail if nothing to stage
 	}
 
-	out, err := exec.Command("git", "-C", gitRoot, "write-tree", "--prefix=.cog/").Output()
+	writeCmd, writeCancel := gitCmd("-C", gitRoot, "write-tree", "--prefix=.cog/")
+	defer writeCancel()
+	out, err := writeCmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to compute tree hash: %w", err)
 	}
@@ -1325,7 +1360,8 @@ func BuildCognitiveStateTree(gitRoot string) (string, error) {
 		}
 
 		// Create blob for file
-		cmd := exec.Command("git", "-C", gitRoot, "hash-object", "-w", path)
+		cmd, cancel := gitCmd("-C", gitRoot, "hash-object", "-w", path)
+		defer cancel()
 		output, err := cmd.Output()
 		if err != nil {
 			return fmt.Errorf("failed to hash file %s: %w", path, err)
@@ -1394,7 +1430,8 @@ func BuildCognitiveStateTree(gitRoot string) (string, error) {
 		}
 
 		// Create tree object
-		cmd := exec.Command("git", "-C", gitRoot, "mktree")
+		cmd, cancel := gitCmd("-C", gitRoot, "mktree")
+		defer cancel()
 		cmd.Stdin = strings.NewReader(treeInput.String())
 		output, err := cmd.Output()
 		if err != nil {
@@ -1431,13 +1468,15 @@ func BuildCognitiveStateTree(gitRoot string) (string, error) {
 // This implements atomic hash writing with pre-validation (Phase 1.2)
 func WriteCanonicalHash(gitRoot string, treeHash string) error {
 	// Validate hash exists in git object store before writing
-	cmd := exec.Command("git", "-C", gitRoot, "cat-file", "-e", treeHash)
+	cmd, cancel := gitCmd("-C", gitRoot, "cat-file", "-e", treeHash)
+	defer cancel()
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("invalid tree hash %s: not found in git object store", treeHash)
 	}
 
 	// Verify it's actually a tree object, not a blob or commit
-	typeCmd := exec.Command("git", "-C", gitRoot, "cat-file", "-t", treeHash)
+	typeCmd, typeCancel := gitCmd("-C", gitRoot, "cat-file", "-t", treeHash)
+	defer typeCancel()
 	typeOut, err := typeCmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to check object type: %w", err)
@@ -1466,7 +1505,8 @@ func HealthCheckCanonicalTree(gitRoot string) error {
 	}
 
 	// Count files in tree using git ls-tree
-	lsTreeCmd := exec.Command("git", "-C", gitRoot, "ls-tree", "-r", hash)
+	lsTreeCmd, lsCancel := gitCmd("-C", gitRoot, "ls-tree", "-r", hash)
+	defer lsCancel()
 	output, err := lsTreeCmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to read tree %s: %w", hash, err)
@@ -1524,8 +1564,10 @@ func HealthCheckCanonicalTree(gitRoot string) error {
 
 // gitDiffTree computes which files differ between two tree hashes
 func gitDiffTree(gitRoot, fromHash, toHash string) ([]string, error) {
-	out, err := exec.Command("git", "-C", gitRoot, "diff-tree", "-r", "--name-only",
-		fromHash, toHash).Output()
+	cmd, cancel := gitCmd("-C", gitRoot, "diff-tree", "-r", "--name-only",
+		fromHash, toHash)
+	defer cancel()
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
@@ -1543,12 +1585,16 @@ func gitDiffTree(gitRoot, fromHash, toHash string) ([]string, error) {
 }
 
 func gitHead() string {
-	out, _ := exec.Command("git", "rev-parse", "HEAD").Output()
+	cmd, cancel := gitCmd("rev-parse", "HEAD")
+	defer cancel()
+	out, _ := cmd.Output()
 	return strings.TrimSpace(string(out))
 }
 
 func gitStagedCogfiles() ([]string, error) {
-	out, err := exec.Command("git", "diff", "--cached", "--name-only", "--", "*.cog.md", "*.cog").Output()
+	cmd, cancel := gitCmd("diff", "--cached", "--name-only", "--", "*.cog.md", "*.cog")
+	defer cancel()
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
@@ -1573,7 +1619,9 @@ func getChangedFiles(gitRoot, since string, patterns []string) ([]string, error)
 		args = append(args, patterns...)
 	}
 
-	out, err := exec.Command("git", args...).Output()
+	cmd, cancel := gitCmd(args...)
+	defer cancel()
+	out, err := cmd.Output()
 	if err != nil {
 		// If ref doesn't exist, return all matching files
 		if since != "HEAD" {
@@ -2250,16 +2298,18 @@ func runHandler(handler Handler, inputData map[string]interface{}) *HookResult {
 
 	// Fall back to external script (SLOW PATH)
 	var cmd *exec.Cmd
+	var cancel context.CancelFunc
 	ext := filepath.Ext(handler.Script)
 
 	switch ext {
 	case ".py":
-		cmd = exec.Command("python3", handler.Script)
+		cmd, cancel = hookCmd("python3", handler.Script)
 	case ".sh":
-		cmd = exec.Command("bash", handler.Script)
+		cmd, cancel = hookCmd("bash", handler.Script)
 	default:
-		cmd = exec.Command(handler.Script)
+		cmd, cancel = hookCmd(handler.Script)
 	}
+	defer cancel()
 
 	// Prepare input
 	inputJSON, _ := json.Marshal(inputData)
@@ -2270,7 +2320,7 @@ func runHandler(handler Handler, inputData map[string]interface{}) *HookResult {
 		cmd.Dir = root
 	}
 
-	// Run with timeout (handled by exec, we'll add explicit timeout later)
+	// Run with 60s timeout (see hookCmd)
 	output, err := cmd.Output()
 	if err != nil {
 		// On error, allow by default (graceful degradation)
@@ -2534,7 +2584,8 @@ func execWaveTitle(params interface{}) error {
 		return nil // Graceful degradation
 	}
 
-	cmd := exec.Command(wshPath, "setmeta", "-b", "this", fmt.Sprintf("title=%s", title))
+	cmd, cancel := externalCmd(wshPath, "setmeta", "-b", "this", fmt.Sprintf("title=%s", title))
+	defer cancel()
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "[event] wave.title warning: %v\n", err)
 	}
@@ -2561,7 +2612,8 @@ func execWaveState(params interface{}) error {
 		return nil // Graceful degradation
 	}
 
-	cmd := exec.Command(wshPath, "setvar", fmt.Sprintf("%s=%s", key, value))
+	cmd, cancel := externalCmd(wshPath, "setvar", fmt.Sprintf("%s=%s", key, value))
+	defer cancel()
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "[event] wave.state warning: %v\n", err)
 	}
@@ -3364,7 +3416,8 @@ func cmdTree(args []string) int {
 		}
 
 		// Count files in tree
-		cmd := exec.Command("git", "-C", root, "ls-tree", "-r", treeHash)
+		cmd, cmdCancel := gitCmd("-C", root, "ls-tree", "-r", treeHash)
+		defer cmdCancel()
 		output, err := cmd.Output()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error counting files: %v\n", err)
@@ -3799,7 +3852,8 @@ func cmdHFS(args []string) int {
 	switch subCmd {
 	case "check":
 		// Run validator
-		cmd := exec.Command(validator, "check")
+		cmd, cancel := externalCmd(validator, "check")
+		defer cancel()
 		cmd.Dir = filepath.Join(root, ".cog")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -3813,7 +3867,8 @@ func cmdHFS(args []string) int {
 
 	case "json":
 		// JSON output for programmatic use
-		cmd := exec.Command(validator, "json")
+		cmd, cancel := externalCmd(validator, "json")
+		defer cancel()
 		cmd.Dir = filepath.Join(root, ".cog")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -3825,7 +3880,8 @@ func cmdHFS(args []string) int {
 			fmt.Fprintf(os.Stderr, "Usage: cog hfs suggest <filename>\n")
 			return 1
 		}
-		cmd := exec.Command(validator, "suggest", args[1])
+		cmd, cancel := externalCmd(validator, "suggest", args[1])
+		defer cancel()
 		cmd.Dir = filepath.Join(root, ".cog")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr

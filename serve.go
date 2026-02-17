@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -162,7 +163,7 @@ func isLaunchdEnabled() bool {
 // getStartTimeFromPID tries to get the process start time
 func getStartTimeFromPID(pid int) (time.Time, error) {
 	// Use ps to get the process start time
-	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=") // bare-ok: instant ps lookup
 	out, err := cmd.Output()
 	if err != nil {
 		return time.Time{}, err
@@ -458,7 +459,7 @@ type DeltaContent struct {
 // === SERVER ===
 
 // DebugMode controls verbose logging in inference
-var DebugMode = false
+var DebugMode atomic.Bool
 
 type serveServer struct {
 	port          int
@@ -471,8 +472,53 @@ func newServeServer(port int, kernel *sdk.Kernel) *serveServer {
 	return &serveServer{port: port, kernel: kernel}
 }
 
+// deepCopyContextState creates a deep copy of a ContextState so that the copy
+// does not share any pointers, slices, or maps with the original. This prevents
+// data races when the original is mutated concurrently.
+func deepCopyContextState(src *ContextState) *ContextState {
+	if src == nil {
+		return nil
+	}
+	dst := *src // shallow copy of value fields
+
+	// Deep copy pointer-to-struct fields (ContextTier)
+	if src.Tier1Identity != nil {
+		t := *src.Tier1Identity
+		dst.Tier1Identity = &t
+	}
+	if src.Tier2Temporal != nil {
+		t := *src.Tier2Temporal
+		dst.Tier2Temporal = &t
+	}
+	if src.Tier3Present != nil {
+		t := *src.Tier3Present
+		dst.Tier3Present = &t
+	}
+	if src.Tier4Semantic != nil {
+		t := *src.Tier4Semantic
+		dst.Tier4Semantic = &t
+	}
+
+	// Deep copy slices
+	if src.AllowedTools != nil {
+		dst.AllowedTools = append([]string(nil), src.AllowedTools...)
+	}
+	if src.DisallowedTools != nil {
+		dst.DisallowedTools = append([]string(nil), src.DisallowedTools...)
+	}
+
+	// Deep copy json.RawMessage (which is []byte)
+	if src.Schema != nil {
+		dst.Schema = append(json.RawMessage(nil), src.Schema...)
+	}
+
+	return &dst
+}
+
 // Start begins the HTTP server
 func (s *serveServer) Start() error {
+	StartRegistryCleanup()
+
 	mux := http.NewServeMux()
 
 	// Inference routes (keep custom streaming implementation)
@@ -497,9 +543,16 @@ func (s *serveServer) Start() error {
 		mux.HandleFunc("GET /signals", s.handleSignals)
 	}
 
+	// CogField graph endpoint
+	mux.HandleFunc("GET /api/cogfield/graph", s.handleCogFieldGraph)
+	mux.HandleFunc("/api/cogfield/sessions/", s.handleSessionDetail)
+	mux.HandleFunc("/api/cogfield/buses/", s.handleBusDetail)
+	mux.HandleFunc("/api/cogfield/expand/", s.handleExpandNode)
+	mux.HandleFunc("/api/cogfield/documents/", s.handleDocumentDetail)
+
 	mux.HandleFunc("/", s.handleRoot)
 
-	addr := fmt.Sprintf(":%d", s.port)
+	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
 
 	// Check port availability before printing banner
 	listener, err := net.Listen("tcp", addr)
@@ -524,7 +577,7 @@ func (s *serveServer) Start() error {
 	}
 
 	// Graceful shutdown
-	done := make(chan bool)
+	done := make(chan bool, 1)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -569,7 +622,12 @@ func (s *serveServer) Start() error {
 
 func (s *serveServer) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		if origin == "" || strings.HasPrefix(origin, "http://localhost") || strings.HasPrefix(origin, "http://127.0.0.1") {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5100")
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
@@ -616,7 +674,7 @@ func (s *serveServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 // This allows clients like cogcode to see what context was constructed
 func (s *serveServer) handleTAA(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// CORS is handled by corsMiddleware
 
 	s.taaStateMutex.RLock()
 	ctx := s.lastTAAState
@@ -682,35 +740,36 @@ func (s *serveServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":    status,
 		"timestamp": nowISO(),
 		"claude":    err == nil,
-		"debug":     DebugMode,
+		"debug":     DebugMode.Load(),
 	})
 }
 
 func (s *serveServer) handleDebug(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// CORS is handled by corsMiddleware
 
 	switch r.Method {
 	case "GET":
 		// Return current debug state
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"debug": DebugMode,
+			"debug": DebugMode.Load(),
 		})
 	case "POST":
 		// Toggle or set debug mode
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10) // 64KB limit
 		var req struct {
 			Debug *bool `json:"debug"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			// Toggle if no body
-			DebugMode = !DebugMode
+			// Toggle if no body (or body too large)
+			DebugMode.Store(!DebugMode.Load())
 		} else if req.Debug != nil {
-			DebugMode = *req.Debug
+			DebugMode.Store(*req.Debug)
 		} else {
-			DebugMode = !DebugMode
+			DebugMode.Store(!DebugMode.Load())
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"debug": DebugMode,
+			"debug": DebugMode.Load(),
 		})
 	default:
 		s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed", "invalid_request")
@@ -720,9 +779,7 @@ func (s *serveServer) handleDebug(w http.ResponseWriter, r *http.Request) {
 // handleServices provides service status and management via launchd
 func (s *serveServer) handleServices(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	// CORS is handled by corsMiddleware
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
@@ -737,12 +794,13 @@ func (s *serveServer) handleServices(w http.ResponseWriter, r *http.Request) {
 
 	case "POST":
 		// Restart a service
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10) // 64KB limit
 		var req struct {
 			Service string `json:"service"` // "kernel" or "cog-chat"
 			Action  string `json:"action"`  // "restart", "start", "stop"
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			s.writeError(w, http.StatusBadRequest, "Invalid JSON", "invalid_request")
+			s.writeError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error(), "invalid_request")
 			return
 		}
 
@@ -757,16 +815,18 @@ func (s *serveServer) handleServices(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Execute launchctl command
+		// Execute launchctl command with timeout to prevent kernel hang
 		var cmd *exec.Cmd
 		uid := os.Getuid()
+		launchctlCtx, launchctlCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer launchctlCancel()
 		switch req.Action {
 		case "restart":
-			cmd = exec.Command("launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/%s", uid, launchdLabel))
+			cmd = exec.CommandContext(launchctlCtx, "launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/%s", uid, launchdLabel))
 		case "start":
-			cmd = exec.Command("launchctl", "kickstart", fmt.Sprintf("gui/%d/%s", uid, launchdLabel))
+			cmd = exec.CommandContext(launchctlCtx, "launchctl", "kickstart", fmt.Sprintf("gui/%d/%s", uid, launchdLabel))
 		case "stop":
-			cmd = exec.Command("launchctl", "kill", "SIGTERM", fmt.Sprintf("gui/%d/%s", uid, launchdLabel))
+			cmd = exec.CommandContext(launchctlCtx, "launchctl", "kill", "SIGTERM", fmt.Sprintf("gui/%d/%s", uid, launchdLabel))
 		default:
 			s.writeError(w, http.StatusBadRequest, "Unknown action: "+req.Action, "invalid_request")
 			return
@@ -823,9 +883,11 @@ func (s *serveServer) getServicesStatus() map[string]interface{} {
 			"exitCode": nil,
 		}
 
-		// Check launchd status
-		cmd := exec.Command("launchctl", "list", svc.label)
+		// Check launchd status (with timeout to prevent kernel hang)
+		listCtx, listCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd := exec.CommandContext(listCtx, "launchctl", "list", svc.label)
 		output, err := cmd.Output()
+		listCancel()
 		if err == nil {
 			status["launchd"] = true
 			// Parse output: "PID\tStatus\tLabel"
@@ -954,6 +1016,13 @@ func checkProviderHealth(pt ProviderType, config *ProviderConfig) *ProviderHealt
 	if config == nil || config.BaseURL == "" {
 		errMsg := "no configuration"
 		health.Error = &errMsg
+		now := nowISO()
+		health.LastCheck = &now
+		// Cache the "no configuration" result to avoid repeated checks
+		healthCache.mu.Lock()
+		healthCache.results[pt] = health
+		healthCache.checked[pt] = time.Now()
+		healthCache.mu.Unlock()
 		return health
 	}
 
@@ -1331,6 +1400,7 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Parse request
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
 	var req ChatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error(), "invalid_request")
@@ -1534,9 +1604,10 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 	}
 
 	// Store TAA context for /v1/taa endpoint and emit as SSE event
+	// Deep copy to prevent data races — the original may be mutated concurrently.
 	if inferReq.ContextState != nil {
 		s.taaStateMutex.Lock()
-		s.lastTAAState = inferReq.ContextState
+		s.lastTAAState = deepCopyContextState(inferReq.ContextState)
 		s.taaStateMutex.Unlock()
 		s.emitTAAContext(w, flusher, inferReq.ContextState, inferReq.Model)
 	}
@@ -1742,9 +1813,10 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 
 func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID string) {
 	// Store TAA context for /v1/taa endpoint
+	// Deep copy to prevent data races — the original may be mutated concurrently.
 	if inferReq.ContextState != nil {
 		s.taaStateMutex.Lock()
-		s.lastTAAState = inferReq.ContextState
+		s.lastTAAState = deepCopyContextState(inferReq.ContextState)
 		s.taaStateMutex.Unlock()
 	}
 
@@ -1812,7 +1884,7 @@ func (s *serveServer) handleRequests(w http.ResponseWriter, r *http.Request) {
 	// Get query parameter for filtering
 	statusFilter := r.URL.Query().Get("status")
 
-	var entries []*RequestEntry
+	var entries []RequestEntry
 	if statusFilter == "running" {
 		entries = GlobalRegistry.ListRunning()
 	} else {
@@ -2057,6 +2129,7 @@ func (s *serveServer) handleMutate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
 	var req httputil.MutateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error(), "invalid_request")
@@ -2124,7 +2197,7 @@ func (s *serveServer) handleWatch(w http.ResponseWriter, r *http.Request) {
 
 	// Upgrade to WebSocket
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: []string{"*"},
+		OriginPatterns: []string{"localhost:*", "127.0.0.1:*"},
 	})
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "failed to upgrade: "+err.Error(), "server_error")
@@ -2332,7 +2405,7 @@ func cmdServeStart(port int) int {
 	}
 
 	// Build command to run serve in foreground mode
-	cmd := exec.Command(cogBinary, "serve", "--port", strconv.Itoa(port))
+	cmd := exec.Command(cogBinary, "serve", "--port", strconv.Itoa(port)) // bare-ok: long-running daemon process
 	cmd.Stdout = logOut
 	cmd.Stderr = logOut
 	cmd.Dir = root
@@ -2555,8 +2628,10 @@ func cmdServeEnable(port int) int {
 		return 1
 	}
 
-	// Load with launchctl
-	cmd := exec.Command("launchctl", "load", plistPath)
+	// Load with launchctl (with timeout to prevent hang)
+	loadCtx, loadCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer loadCancel()
+	cmd := exec.CommandContext(loadCtx, "launchctl", "load", plistPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -2582,8 +2657,10 @@ func cmdServeDisable() int {
 		return 0
 	}
 
-	// Unload with launchctl
-	cmd := exec.Command("launchctl", "unload", plistPath)
+	// Unload with launchctl (with timeout to prevent hang)
+	unloadCtx, unloadCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer unloadCancel()
+	cmd := exec.CommandContext(unloadCtx, "launchctl", "unload", plistPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

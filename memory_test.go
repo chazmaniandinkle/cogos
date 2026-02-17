@@ -108,7 +108,7 @@ func TestMemoryWrite(t *testing.T) {
 	}
 
 	// Verify file was created
-	fullPath := filepath.Join(tmpDir, ".cog", "memory", "semantic", "test", "doc.md")
+	fullPath := filepath.Join(tmpDir, ".cog", "mem", "semantic", "test", "doc.md")
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 		t.Fatal("File was not created")
 	}
@@ -148,7 +148,7 @@ func TestMemoryAppend(t *testing.T) {
 	}
 
 	// Verify appended content
-	fullPath := filepath.Join(tmpDir, ".cog", "memory", "semantic", "test.md")
+	fullPath := filepath.Join(tmpDir, ".cog", "mem", "semantic", "test.md")
 	content, err := os.ReadFile(fullPath)
 	if err != nil {
 		t.Fatalf("Failed to read file: %v", err)
@@ -223,7 +223,7 @@ func TestMemoryStats(t *testing.T) {
 // TestTraverseWaypoints tests waypoint graph traversal
 func TestTraverseWaypoints(t *testing.T) {
 	tmpDir := t.TempDir()
-	memoryDir := filepath.Join(tmpDir, ".cog", "memory")
+	memoryDir := filepath.Join(tmpDir, ".cog", "mem")
 	os.MkdirAll(memoryDir, 0755)
 
 	// Create test documents

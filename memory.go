@@ -6,20 +6,26 @@
 // - Parallel file processing with goroutines
 // - Native frontmatter parsing
 // - Integrated salience scoring
+// - FTS5 constellation search as primary path (grep fallback)
 // - 60x performance improvement (3-5s → 50-100ms)
 
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cogos-dev/cogos/sdk/constellation"
 )
 
 // === WAYPOINT GRAPH STRUCTURES ===
@@ -47,14 +53,15 @@ type WaypointNode struct {
 
 // MemorySearchResult represents a single search result
 type MemorySearchResult struct {
-	Path           string
-	Score          float64
-	Title          string
-	Type           string
-	MemoryStrength float64
-	Salience       float64
-	Depth          int
-	SourceType     string
+	Path            string
+	Score           float64
+	Title           string
+	Type            string
+	MemoryStrength  float64
+	Salience        float64
+	KeywordStrength float64
+	Depth           int
+	SourceType      string
 }
 
 // === WAYPOINT GRAPH LOADING ===
@@ -180,6 +187,8 @@ func TraverseWaypoints(
 
 	// Convert activations to results
 	results := make([]MemorySearchResult, 0, len(activations))
+	const maxWaypointReads = 200 // Limit file I/O during waypoint traversal
+	waypointReads := 0
 	for path, node := range activations {
 		// Skip direct matches - they're already in initialMatches
 		if node.Depth == 0 {
@@ -191,7 +200,10 @@ func TraverseWaypoints(
 		docType := "unknown"
 		memStrength := 0.5
 
-		if content, err := os.ReadFile(path); err == nil {
+		if waypointReads >= maxWaypointReads {
+			// Skip file I/O if we've hit the limit; use defaults
+		} else if content, err := os.ReadFile(path); err == nil {
+			waypointReads++
 			if doc, err := ExtractFrontmatter(string(content)); err == nil {
 				if data, err := ParseFrontmatter(doc.Frontmatter); err == nil {
 					if t, ok := data["title"].(string); ok {
@@ -228,57 +240,133 @@ func TraverseWaypoints(
 
 // === MEMORY SEARCH ===
 
-// MemorySearch performs comprehensive memory search with ranking
-func MemorySearch(
-	cogRoot string,
-	query string,
-	deepMode bool,
-	deepDepth int,
-	decayFactor float64,
-	rawMode bool,
-) ([]MemorySearchResult, error) {
-	memoryDir := filepath.Join(cogRoot, ".cog", "mem")
+// constellationSearch attempts FTS5 search via the constellation database.
+// Returns results and true if successful, or nil and false if constellation
+// is unavailable or errors out (signaling that grep fallback should be used).
+func constellationMemorySearch(cogRoot string, query string, rawMode bool) ([]MemorySearchResult, bool) {
+	// Check if constellation DB exists before trying to open it
+	dbPath := filepath.Join(cogRoot, ".cog", ".state", "constellation.db")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return nil, false
+	}
 
-	// Execute CQL search to get initial file matches
-	cqlScript := filepath.Join(cogRoot, ".cog", "scripts", "code-api", "cql.ts")
-	var searchResults []string
+	c, err := getConstellation()
+	if err != nil {
+		return nil, false
+	}
 
-	if _, err := os.Stat(cqlScript); err == nil {
-		// Use CQL for structured search
-		cmd := exec.Command("npx", "tsx", cqlScript, query)
-		cmd.Env = append(os.Environ(), fmt.Sprintf("COG_ROOT=%s", cogRoot))
-		output, err := cmd.Output()
-		if err == nil {
-			// Parse CQL output to extract file paths
-			lines := strings.Split(string(output), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				// CQL returns indented paths or paths with .md/.cog.md
-				if strings.HasSuffix(line, ".md") || strings.HasSuffix(line, ".cog.md") {
-					// Make absolute
-					absPath := line
-					if !strings.HasPrefix(line, "/") {
-						absPath = filepath.Join(cogRoot, line)
-					}
-					if _, err := os.Stat(absPath); err == nil {
-						searchResults = append(searchResults, absPath)
-					}
-				}
-			}
+	// FTS5 search — request generous limit for ranking
+	nodes, err := c.Search(query, 50)
+	if err != nil {
+		return nil, false
+	}
+
+	if len(nodes) == 0 {
+		// Constellation worked but found nothing — still a valid result.
+		// Return empty so we don't redundantly grep.
+		return []MemorySearchResult{}, true
+	}
+
+	// Filter to memory sector only (.cog/mem/)
+	memPrefix := filepath.Join(cogRoot, ".cog", "mem") + "/"
+	var memNodes []constellation.Node
+	for _, n := range nodes {
+		if strings.HasPrefix(n.Path, memPrefix) {
+			memNodes = append(memNodes, n)
 		}
 	}
 
-	// Fallback to grep if CQL not available or returned nothing
-	if len(searchResults) == 0 {
-		cmd := exec.Command("grep", "-ril", query, memoryDir)
-		output, err := cmd.Output()
-		if err == nil {
-			lines := strings.Split(string(output), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if line != "" && (strings.HasSuffix(line, ".md") || strings.HasSuffix(line, ".cog.md")) {
-					searchResults = append(searchResults, line)
+	if len(memNodes) == 0 {
+		return []MemorySearchResult{}, true
+	}
+
+	// Map BM25 scores to 0-1 range.
+	// BM25 returns negative values; closer to 0 is better (more relevant).
+	// We normalize so the best match gets score ~1.0.
+	minRank := memNodes[0].Rank // most negative = best
+	for _, n := range memNodes {
+		if n.Rank < minRank {
+			minRank = n.Rank
+		}
+	}
+
+	results := make([]MemorySearchResult, 0, len(memNodes))
+	for _, n := range memNodes {
+		// Normalize BM25: best → 1.0, worst → near 0
+		var normalizedScore float64
+		if minRank < 0 {
+			normalizedScore = n.Rank / minRank // both negative, result is 0-1
+		} else {
+			normalizedScore = 1.0
+		}
+		// Apply sigmoid-like compression to keep scores in useful range
+		score := 0.2 + 0.8*(1.0/(1.0+math.Exp(-5.0*(normalizedScore-0.5))))
+
+		title := n.Title
+		if title == "" {
+			title = ExtractTitleFromFilename(n.Path)
+		}
+		docType := n.Type
+		if docType == "" {
+			docType = "unknown"
+		}
+
+		result := MemorySearchResult{
+			Path:            n.Path,
+			Score:           score,
+			Title:           title,
+			Type:            docType,
+			MemoryStrength:  0.5, // default; enriched below if not raw mode
+			KeywordStrength: normalizedScore,
+			Salience:        0.0,
+			Depth:           0,
+			SourceType:      "fts5",
+		}
+
+		if !rawMode {
+			// Enrich with frontmatter memory_strength if available
+			if content, err := os.ReadFile(n.Path); err == nil {
+				if doc, err := ExtractFrontmatter(string(content)); err == nil {
+					if data, err := ParseFrontmatter(doc.Frontmatter); err == nil {
+						if ms, ok := data["memory_strength"].(float64); ok {
+							result.MemoryStrength = ms
+						}
+					}
 				}
+			}
+			// Blend BM25 relevance with memory_strength
+			result.Score = normalizedScore * ((result.MemoryStrength + 0.5) / 2.0)
+		}
+
+		results = append(results, result)
+	}
+
+	// Sort by score descending
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
+
+	return results, true
+}
+
+// grepMemorySearch performs the original grep-based memory search.
+// This is the fallback path when constellation is unavailable.
+func grepMemorySearch(cogRoot string, query string, rawMode bool) ([]MemorySearchResult, error) {
+	memoryDir := filepath.Join(cogRoot, ".cog", "mem")
+
+	// Search for matching files via grep
+	var searchResults []string
+
+	grepCtx, grepCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer grepCancel()
+	cmd := exec.CommandContext(grepCtx, "grep", "-ril", "--", query, memoryDir)
+	output, err := cmd.Output()
+	if err == nil {
+		lines := strings.Split(string(output), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" && (strings.HasSuffix(line, ".md") || strings.HasSuffix(line, ".cog.md")) {
+				searchResults = append(searchResults, line)
 			}
 		}
 	}
@@ -303,18 +391,18 @@ func MemorySearch(
 		return results, nil
 	}
 
-	// Parallel processing for ranking
+	// Parallel processing for ranking (phase 1: keyword + memory_strength only, no salience)
 	results := make([]MemorySearchResult, len(searchResults))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-
-	// Load salience config
-	salienceCfg := DefaultSalienceConfig()
+	sem := make(chan struct{}, 20) // Limit concurrent goroutines to 20
 
 	// Process each file in parallel
 	for i, filePath := range searchResults {
 		wg.Add(1)
 		go func(idx int, path string) {
+			sem <- struct{}{}        // Acquire semaphore slot
+			defer func() { <-sem }() // Release semaphore slot
 			defer wg.Done()
 
 			result := MemorySearchResult{
@@ -355,18 +443,11 @@ func MemorySearch(
 					keywordStrength = 0.2
 				}
 
-				// Compute salience score
-				salienceScore := 0.0
-				if sal, err := ComputeFileSalience(cogRoot, path, 90, salienceCfg); err == nil {
-					salienceScore = sal.Total
-				}
-
-				// Combined score: keyword_match * (memory_strength + salience) / 2
-				combinedScore := keywordStrength * ((memoryStrength + salienceScore) / 2.0)
-
-				result.Score = combinedScore
-				result.Salience = salienceScore
+				// Initial score without salience
+				result.Score = keywordStrength * (memoryStrength / 2.0)
+				result.Salience = 0.0
 				result.MemoryStrength = memoryStrength
+				result.KeywordStrength = keywordStrength
 			}
 
 			// Use filename as fallback for title
@@ -387,6 +468,95 @@ func MemorySearch(
 	}
 
 	wg.Wait()
+
+	return results, nil
+}
+
+// MemorySearch performs comprehensive memory search with ranking.
+// Primary path: FTS5 via constellation database (fast, ranked by BM25).
+// Fallback path: grep + keyword counting (if constellation DB unavailable).
+func MemorySearch(
+	cogRoot string,
+	query string,
+	deepMode bool,
+	deepDepth int,
+	decayFactor float64,
+	rawMode bool,
+) ([]MemorySearchResult, error) {
+
+	var results []MemorySearchResult
+	usedFTS := false
+
+	// Primary path: try constellation FTS5 search
+	if ftsResults, ok := constellationMemorySearch(cogRoot, query, rawMode); ok {
+		results = ftsResults
+		usedFTS = true
+	}
+
+	// Fallback path: grep-based search
+	if !usedFTS {
+		grepResults, err := grepMemorySearch(cogRoot, query, rawMode)
+		if err != nil {
+			return nil, err
+		}
+		results = grepResults
+	}
+
+	// If no results or raw mode, return early
+	if len(results) == 0 || rawMode {
+		return results, nil
+	}
+
+	// Sort by base score before salience refinement
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
+
+	// Salience refinement (disabled by default — go-git PathFilter is O(commits×tree)
+	// which causes hangs on repos with 1000+ commits. BM25/keyword scores are sufficient.
+	// Enable with COG_MEMORY_SALIENCE_FORCE=1 if needed.)
+	salienceLimit := 0
+	if val := os.Getenv("COG_MEMORY_SALIENCE_LIMIT"); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed >= 0 {
+			salienceLimit = parsed
+		}
+	}
+	if val := os.Getenv("COG_MEMORY_SALIENCE_DISABLE"); val != "" {
+		lower := strings.ToLower(val)
+		if lower == "1" || lower == "true" || lower == "yes" {
+			salienceLimit = 0
+		}
+	}
+	forceSalience := false
+	if val := os.Getenv("COG_MEMORY_SALIENCE_FORCE"); val != "" {
+		lower := strings.ToLower(val)
+		if lower == "1" || lower == "true" || lower == "yes" {
+			forceSalience = true
+		}
+	}
+	if !forceSalience && salienceLimit > 0 && len(results) > salienceLimit {
+		salienceLimit = 0
+	}
+
+	if salienceLimit > 0 {
+		if salienceLimit > len(results) {
+			salienceLimit = len(results)
+		}
+
+		salienceCfg := DefaultSalienceConfig()
+		for i := 0; i < salienceLimit; i++ {
+			path := results[i].Path
+			if sal, err := ComputeFileSalience(cogRoot, path, 90, salienceCfg); err == nil {
+				results[i].Salience = sal.Total
+				results[i].Score = results[i].KeywordStrength * ((results[i].MemoryStrength + sal.Total) / 2.0)
+			}
+		}
+
+		// Re-sort after salience refinement
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].Score > results[j].Score
+		})
+	}
 
 	// If deep mode enabled, traverse waypoint graph
 	if deepMode {
@@ -503,6 +673,16 @@ func MemoryRead(cogRoot string, path string) (string, error) {
 	} else if !strings.HasPrefix(path, "/") {
 		// Memory-relative path
 		fullPath = filepath.Join(memoryDir, path)
+	} else {
+		// Absolute path — still validate it's within memory dir
+		fullPath = path
+	}
+
+	// Validate path stays within memory directory
+	cleanFull := filepath.Clean(fullPath)
+	cleanMem := filepath.Clean(memoryDir)
+	if !strings.HasPrefix(cleanFull, cleanMem+string(filepath.Separator)) && cleanFull != cleanMem {
+		return "", fmt.Errorf("path traversal blocked: %s escapes memory directory", path)
 	}
 
 	// Check if file exists
@@ -516,9 +696,19 @@ func MemoryRead(cogRoot string, path string) (string, error) {
 		return "", fmt.Errorf("failed to read memory: %w", err)
 	}
 
-	// Update last_accessed timestamp asynchronously
+	// Update last_accessed timestamp asynchronously with timeout
 	go func() {
-		UpdateLastAccessed(fullPath)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			UpdateLastAccessed(fullPath)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
 	}()
 
 	return string(content), nil
@@ -596,6 +786,13 @@ func marshalYAML(data map[string]interface{}) (string, error) {
 func MemoryWrite(cogRoot string, path string, title string, content string) error {
 	memoryDir := filepath.Join(cogRoot, ".cog", "mem")
 	fullPath := filepath.Join(memoryDir, path)
+
+	// Validate path stays within memory directory
+	cleanFull := filepath.Clean(fullPath)
+	cleanMem := filepath.Clean(memoryDir)
+	if !strings.HasPrefix(cleanFull, cleanMem+string(filepath.Separator)) && cleanFull != cleanMem {
+		return fmt.Errorf("path traversal blocked: %s escapes memory directory", path)
+	}
 
 	// Create directory if needed
 	dir := filepath.Dir(fullPath)

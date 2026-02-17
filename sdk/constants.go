@@ -32,7 +32,7 @@ type SRCConstants struct {
 	GEff float64
 
 	// VarianceRatio is the thought/action efficiency: Var(X)/Var(X̂) = 6 (exact).
-	// When γ = κ = 1: (γ+κ)(2γ+κ)/γ = (1+1)(2+1)/1 = 6.
+	// When γ = κ = 1: (2γ+κ)(γ+κ)/κ² = (3)(2)/1 = 6. General: (2r+1)(r+1) where r=γ/κ.
 	// This is why minds exist: thinking is 6x cheaper than doing.
 	VarianceRatio int
 

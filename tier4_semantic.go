@@ -44,8 +44,8 @@ func QueryConstellation(workspaceRoot, anchor, goal string, budget int) (string,
 		fmt.Fprintf(os.Stderr, "[TAA] Tier 4: querying with anchor=%q goal=%q budget=%d\n", anchor, goal, budget)
 	}
 
-	// Open constellation database
-	c, err := constellation.Open(workspaceRoot)
+	// Open constellation database (singleton)
+	c, err := getConstellation()
 	if err != nil {
 		// If constellation doesn't exist yet, return empty (not an error)
 		fmt.Fprintf(os.Stderr, "[TAA] Tier 4: constellation not available: %v\n", err)
@@ -57,7 +57,6 @@ func QueryConstellation(workspaceRoot, anchor, goal string, budget int) (string,
 		fmt.Fprintf(os.Stderr, "[TAA] Tier 4: constellation returned nil\n")
 		return "", nil
 	}
-	defer c.Close()
 
 	// If no anchor/goal, skip (no query basis)
 	if anchor == "" && goal == "" {
