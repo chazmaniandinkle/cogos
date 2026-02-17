@@ -11,11 +11,13 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -176,21 +178,13 @@ func (s *serveServer) handleCogFieldGraph(w http.ResponseWriter, r *http.Request
 
 	start := time.Now()
 
-	// Resolve workspace root
-	root, _, err := ResolveWorkspace()
-	if err != nil {
-		http.Error(w, "Failed to resolve workspace", http.StatusInternalServerError)
-		return
-	}
-
-	// Open constellation DB
-	c, err := constellation.Open(root)
+	// Open constellation DB (singleton)
+	c, err := getConstellation()
 	if err != nil {
 		log.Printf("cogfield: failed to open constellation: %v", err)
 		http.Error(w, "Failed to open constellation database", http.StatusInternalServerError)
 		return
 	}
-	defer c.Close()
 
 	graph, err := buildCogFieldGraph(c)
 	if err != nil {
@@ -350,12 +344,16 @@ func buildCogFieldGraph(c *constellation.Constellation) (*CogFieldGraph, error) 
 		edgesByRelation[relation]++
 	}
 
-	// --- Thread 2: shared_tags (docs sharing 2+ non-date tags) ---
+	// --- Thread 2: shared_tags (docs sharing 2+ non-trivial tags) ---
+	// Exclude date tags, generic type tags (session, claude-code, etc.), and
+	// skip pairs where both nodes are sessions (they share generic tags and
+	// create massive cliques that dominate the thread).
 	tagEdgeRows, err := db.Query(`
 		SELECT t1.document_id, t2.document_id, COUNT(*) as n
 		FROM tags t1
 		JOIN tags t2 ON t1.tag = t2.tag AND t1.document_id < t2.document_id
 		WHERE t1.tag NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+		  AND t1.tag NOT IN ('session', 'claude-code', 'claude', 'code')
 		GROUP BY t1.document_id, t2.document_id
 		HAVING n >= 2
 		ORDER BY n DESC
@@ -371,10 +369,13 @@ func buildCogFieldGraph(c *constellation.Constellation) (*CogFieldGraph, error) 
 			if err := tagEdgeRows.Scan(&doc1, &doc2, &shared); err != nil {
 				continue
 			}
-			if _, ok1 := nodeMap[doc1]; !ok1 {
+			n1, ok1 := nodeMap[doc1]
+			n2, ok2 := nodeMap[doc2]
+			if !ok1 || !ok2 {
 				continue
 			}
-			if _, ok2 := nodeMap[doc2]; !ok2 {
+			// Skip session↔session pairs — they pollute with generic tags
+			if n1.EntityType == "session" && n2.EntityType == "session" {
 				continue
 			}
 			weight := math.Min(float64(shared)*0.15, 1.0)
@@ -388,7 +389,10 @@ func buildCogFieldGraph(c *constellation.Constellation) (*CogFieldGraph, error) 
 		}
 	}
 
-	// --- Thread 3: siblings (same parent directory, groups of 2-19) ---
+	// --- Thread 3: siblings (same parent directory, groups of 2-9) ---
+	// Cap at 10 (was 20). Groups of 10+ create 45+ edges which form
+	// visual cliques. For large directories, use a chain instead of a
+	// full clique to keep edge count O(n) not O(n²).
 	dirGroups := make(map[string][]string) // parent dir → doc IDs
 	for id, p := range pathMap {
 		if _, ok := nodeMap[id]; !ok {
@@ -398,50 +402,137 @@ func buildCogFieldGraph(c *constellation.Constellation) (*CogFieldGraph, error) 
 		dirGroups[dir] = append(dirGroups[dir], id)
 	}
 	for _, group := range dirGroups {
-		if len(group) < 2 || len(group) >= 20 {
+		if len(group) < 2 {
 			continue
 		}
 		sort.Strings(group) // deterministic ordering
-		for i := 0; i < len(group); i++ {
-			for j := i + 1; j < len(group); j++ {
+
+		if len(group) <= 10 {
+			// Small groups: full clique (max 45 edges)
+			for i := 0; i < len(group); i++ {
+				for j := i + 1; j < len(group); j++ {
+					edges = append(edges, CogFieldEdge{
+						Source:   group[i],
+						Target:   group[j],
+						Relation: "sibling",
+						Weight:   0.4,
+						Thread:   "siblings",
+					})
+				}
+			}
+		} else {
+			// Large groups: chain (n-1 edges, keeps them linked without O(n²) explosion)
+			for i := 1; i < len(group); i++ {
 				edges = append(edges, CogFieldEdge{
-					Source:   group[i],
-					Target:   group[j],
+					Source:   group[i-1],
+					Target:   group[i],
 					Relation: "sibling",
-					Weight:   0.4,
+					Weight:   0.3,
 					Thread:   "siblings",
 				})
 			}
 		}
 	}
 
-	// --- Thread 4: temporal (created same day, groups of 2-30) ---
+	// --- Thread 4: temporal (created same day, non-session documents only) ---
+	// Sessions dominate temporal groups (28 sessions on a single day = 378 edges).
+	// Exclude sessions so temporal links only connect content documents.
 	dateGroups := make(map[string][]string) // date → doc IDs
 	for id, date := range dateMap {
-		if _, ok := nodeMap[id]; !ok {
+		node, ok := nodeMap[id]
+		if !ok || date == "" {
 			continue
 		}
-		if date != "" {
-			dateGroups[date] = append(dateGroups[date], id)
+		// Skip sessions — they cluster by date and create massive cliques
+		if node.EntityType == "session" {
+			continue
 		}
+		dateGroups[date] = append(dateGroups[date], id)
 	}
 	for _, group := range dateGroups {
-		if len(group) < 2 || len(group) > 30 {
+		if len(group) < 2 {
 			continue
 		}
 		sort.Strings(group)
-		for i := 0; i < len(group); i++ {
-			for j := i + 1; j < len(group); j++ {
+
+		if len(group) <= 12 {
+			// Small groups: full clique
+			for i := 0; i < len(group); i++ {
+				for j := i + 1; j < len(group); j++ {
+					edges = append(edges, CogFieldEdge{
+						Source:   group[i],
+						Target:   group[j],
+						Relation: "temporal",
+						Weight:   0.15,
+						Thread:   "temporal",
+					})
+				}
+			}
+		} else {
+			// Large groups: chain to avoid O(n²)
+			for i := 1; i < len(group); i++ {
 				edges = append(edges, CogFieldEdge{
-					Source:   group[i],
-					Target:   group[j],
+					Source:   group[i-1],
+					Target:   group[i],
 					Relation: "temporal",
-					Weight:   0.15,
+					Weight:   0.1,
 					Thread:   "temporal",
 				})
 			}
 		}
 	}
+
+	// --- Add session + bus nodes via adapters ---
+	root, _, _ := ResolveWorkspace()
+	if root != "" {
+		for _, adapter := range adapters {
+			summaryNodes, summaryEdges := adapter.SummaryNodes(root)
+			nodes = append(nodes, summaryNodes...)
+			edges = append(edges, summaryEdges...)
+		}
+	}
+
+	// --- Mark isolates ---
+	// Nodes with zero visible (explicit/chain) edges get meta.isolate=true
+	// so the frontend can dim or deprioritize them.
+	connectedNodes := make(map[string]bool)
+	for _, e := range edges {
+		if e.Thread == "explicit" || e.Thread == "chain" {
+			connectedNodes[e.Source] = true
+			connectedNodes[e.Target] = true
+		}
+	}
+
+	// Rebuild nodeMap since adapters may have added new nodes.
+	// Deduplicate: adapters can produce duplicates (e.g. multiple event files for same session).
+	seen := make(map[string]bool)
+	var deduped []CogFieldNode
+	for _, n := range nodes {
+		if seen[n.ID] {
+			continue
+		}
+		seen[n.ID] = true
+		deduped = append(deduped, n)
+	}
+	nodes = deduped
+	nodeMap = make(map[string]*CogFieldNode)
+	for i := range nodes {
+		nodeMap[nodes[i].ID] = &nodes[i]
+	}
+
+	isolateCount := 0
+	for i := range nodes {
+		if !connectedNodes[nodes[i].ID] {
+			isolateCount++
+			if nodes[i].Meta == nil {
+				nodes[i].Meta = make(map[string]interface{})
+			}
+			nodes[i].Meta["isolate"] = true
+			// Reduce strength of isolates so they render smaller
+			nodes[i].Strength = nodes[i].Strength * 0.3
+		}
+	}
+	log.Printf("cogfield: %d/%d nodes are isolates (no explicit/chain edges)", isolateCount, len(nodes))
 
 	// --- Build stats ---
 	nodesByType := make(map[string]int)
@@ -489,4 +580,169 @@ func buildCogFieldGraph(c *constellation.Constellation) (*CogFieldGraph, error) 
 		Edges: edges,
 		Stats: stats,
 	}, nil
+}
+
+// sessionJSONLEvent is the union type for the two JSONL formats found in .cog/.state/events/
+type sessionJSONLEvent struct {
+	// Flat format fields
+	ID        string `json:"id,omitempty"`
+	Seq       int    `json:"seq,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	Ts        string `json:"ts,omitempty"`
+	Type      string `json:"type,omitempty"`
+
+	// Hashed payload envelope format
+	HashedPayload *struct {
+		Type      string                 `json:"type"`
+		Timestamp string                 `json:"timestamp"`
+		SessionID string                 `json:"session_id"`
+		Data      map[string]interface{} `json:"data"`
+	} `json:"hashed_payload,omitempty"`
+	Metadata *struct {
+		Seq int `json:"seq"`
+	} `json:"metadata,omitempty"`
+
+	// Reconciler/bridge format
+	Data map[string]interface{} `json:"data,omitempty"`
+}
+
+// buildSessionNodes scans .cog/.state/events/*.jsonl and creates a CogFieldNode per session file
+func buildSessionNodes(root string) []CogFieldNode {
+	eventsDir := filepath.Join(root, ".cog", ".state", "events")
+	entries, err := os.ReadDir(eventsDir)
+	if err != nil {
+		return nil
+	}
+
+	var nodes []CogFieldNode
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+
+		// Parse filename: {date}-{sessionID}.jsonl
+		base := strings.TrimSuffix(name, ".jsonl")
+		parts := strings.SplitN(base, "-", 4) // YYYY-MM-DD-sessionID
+		var sessionID string
+		if len(parts) >= 4 {
+			sessionID = parts[3]
+		} else {
+			sessionID = base
+		}
+
+		fpath := filepath.Join(eventsDir, name)
+		f, err := os.Open(fpath)
+		if err != nil {
+			continue
+		}
+
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+
+		var firstLine, lastLine string
+		lineCount := 0
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			lineCount++
+			if lineCount == 1 {
+				firstLine = line
+			}
+			lastLine = line
+		}
+		f.Close()
+
+		if lineCount == 0 {
+			continue
+		}
+
+		// Extract timestamps from first/last lines
+		var firstEvent, lastEvent sessionJSONLEvent
+		json.Unmarshal([]byte(firstLine), &firstEvent)
+		json.Unmarshal([]byte(lastLine), &lastEvent)
+
+		created := extractTimestamp(firstEvent)
+		modified := extractTimestamp(lastEvent)
+
+		node := CogFieldNode{
+			ID:         "session:" + sessionID,
+			Label:      sessionID,
+			EntityType: "session",
+			Sector:     "sessions",
+			Tags:       []string{},
+			Created:    created,
+			Modified:   modified,
+			Strength:   math.Min(float64(lineCount)/20.0, 10.0),
+			Meta: map[string]interface{}{
+				"event_count": lineCount,
+				"file":        name,
+			},
+		}
+		nodes = append(nodes, node)
+	}
+
+	return nodes
+}
+
+// extractTimestamp pulls the timestamp from either JSONL format
+func extractTimestamp(evt sessionJSONLEvent) string {
+	if evt.HashedPayload != nil && evt.HashedPayload.Timestamp != "" {
+		return evt.HashedPayload.Timestamp
+	}
+	if evt.Ts != "" {
+		return evt.Ts
+	}
+	return ""
+}
+
+// busRegistryEntry matches the JSON format in .cog/.state/buses/registry.json
+type busRegistryEntry struct {
+	BusID        string   `json:"bus_id"`
+	State        string   `json:"state"`
+	Participants []string `json:"participants"`
+	Transport    string   `json:"transport"`
+	Endpoint     string   `json:"endpoint"`
+	CreatedAt    string   `json:"created_at"`
+	LastEventSeq int      `json:"last_event_seq"`
+	LastEventAt  string   `json:"last_event_at"`
+	EventCount   int      `json:"event_count"`
+}
+
+// buildBusNodes reads .cog/.state/buses/registry.json and creates a CogFieldNode per bus
+func buildBusNodes(root string) []CogFieldNode {
+	registryPath := filepath.Join(root, ".cog", ".state", "buses", "registry.json")
+	data, err := os.ReadFile(registryPath)
+	if err != nil {
+		return nil
+	}
+
+	var entries []busRegistryEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil
+	}
+
+	var nodes []CogFieldNode
+	for _, bus := range entries {
+		node := CogFieldNode{
+			ID:         "bus:" + bus.BusID,
+			Label:      bus.BusID,
+			EntityType: "bus",
+			Sector:     "buses",
+			Tags:       bus.Participants,
+			Created:    bus.CreatedAt,
+			Modified:   bus.LastEventAt,
+			Strength:   math.Min(float64(bus.EventCount)*2.0, 10.0),
+			Meta: map[string]interface{}{
+				"state":       bus.State,
+				"event_count": bus.EventCount,
+				"transport":   bus.Transport,
+			},
+		}
+		nodes = append(nodes, node)
+	}
+
+	return nodes
 }
