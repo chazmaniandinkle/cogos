@@ -10,7 +10,7 @@
 #   make clean    - Remove build artifacts
 #   make install  - Install to current directory
 
-VERSION := 2.1.0
+VERSION := 2.1.1
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w -X main.BuildTime=$(BUILD_TIME)
 BUILD_TAGS := fts5

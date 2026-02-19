@@ -314,6 +314,7 @@ type StreamChunk struct {
 	Created int64        `json:"created"`
 	Model   string       `json:"model"`
 	Choices []ChatChoice `json:"choices"`
+	Usage   *UsageInfo   `json:"usage,omitempty"`
 }
 
 // ModelListResponse represents the /v1/models response
@@ -1805,32 +1806,24 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 				s.checkSummarization(sessionID)
 			}
 
-			// Emit usage stats if available
+			// Build usage info if available
+			var usageInfo *UsageInfo
 			if chunk.Usage != nil {
-				usageChunk := map[string]any{
-					"id":         chunk.ID,
-					"object":     "chat.completion.chunk",
-					"created":    created,
-					"model":      model,
-					"choices":    []any{}, // Required for OpenAI SDK compatibility
-					"event_type": "usage",
-					"usage": map[string]any{
-						"prompt_tokens":     chunk.Usage.InputTokens,
-						"completion_tokens": chunk.Usage.OutputTokens,
-						"total_tokens":      chunk.Usage.InputTokens + chunk.Usage.OutputTokens,
-					},
+				usageInfo = &UsageInfo{
+					PromptTokens:     chunk.Usage.InputTokens,
+					CompletionTokens: chunk.Usage.OutputTokens,
+					TotalTokens:      chunk.Usage.InputTokens + chunk.Usage.OutputTokens,
 				}
-				data, _ := json.Marshal(usageChunk)
-				fmt.Fprintf(w, "data: %s\n\n", data)
-				flusher.Flush()
 			}
 
-			// Final chunk with finish reason
+			// OpenAI streaming spec: finish_reason chunk first, then
+			// usage-only chunk, then [DONE]. Include usage on the
+			// finish_reason chunk too — some SDKs read it there.
 			finishReason := chunk.FinishReason
 			if finishReason == "" {
 				finishReason = "stop"
 			}
-			openAIChunk := &StreamChunk{
+			finishChunk := &StreamChunk{
 				ID:      chunk.ID,
 				Object:  "chat.completion.chunk",
 				Created: created,
@@ -1842,9 +1835,29 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 						FinishReason: finishReason,
 					},
 				},
+				Usage: usageInfo,
 			}
-			data, _ := json.Marshal(openAIChunk)
+			data, _ := json.Marshal(finishChunk)
 			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+
+			// Dedicated usage-only chunk (standard OpenAI stream_options
+			// include_usage format). Emitted after finish_reason, before
+			// [DONE], with empty choices array.
+			if usageInfo != nil {
+				usageChunk := &StreamChunk{
+					ID:      chunk.ID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []ChatChoice{},
+					Usage:   usageInfo,
+				}
+				data, _ = json.Marshal(usageChunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
+
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 
