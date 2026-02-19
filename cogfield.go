@@ -80,6 +80,10 @@ func normalizeEntityType(docType string) string {
 		return "hook"
 	case "ontology", "term", "claim", "pattern", "theorem", "principle":
 		return "ontology"
+	case "component":
+		return "component"
+	case "node":
+		return "node"
 	case "identity":
 		return "agent"
 	default:
@@ -98,6 +102,8 @@ func inferSector(path, dbSector string) string {
 			return dbSector
 		case "architecture", "semantic/architecture":
 			return "architecture"
+		case "infrastructure":
+			return "infrastructure"
 		}
 	}
 

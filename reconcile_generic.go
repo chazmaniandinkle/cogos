@@ -273,7 +273,7 @@ func cmdGenericStatus(resourceType string, args []string) int {
 
 	// State summary
 	state, err := LoadReconcileState(root, resourceType)
-	if err != nil {
+	if err != nil || state == nil {
 		fmt.Println("\nState: not found")
 	} else {
 		managed, unmanaged := 0, 0

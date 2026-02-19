@@ -5473,6 +5473,8 @@ func main() {
 		code = cmdApply(os.Args[2:])
 	case "status":
 		code = cmdStatus(os.Args[2:])
+	case "components":
+		code = cmdComponents(os.Args[2:])
 	case "snapshot":
 		code = cmdSnapshot(os.Args[2:])
 	case "refresh":
