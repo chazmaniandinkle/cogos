@@ -70,6 +70,23 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// filteredEnviron returns a copy of os.Environ() with the CLAUDECODE variable
+// removed. Claude Code sets CLAUDECODE in its process environment; if a child
+// `claude` CLI inherits it, the CLI refuses to start ("cannot be launched inside
+// another Claude Code session"). Filtering it out allows CogOS to spawn Claude
+// CLI from within a Claude Code session (e.g. during development/testing).
+func filteredEnviron() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		if strings.HasPrefix(e, "CLAUDECODE=") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
 // Harness is the inference execution engine. Create one with [New] and call
 // [Harness.RunInference] (sync) or [Harness.RunInferenceStream] (streaming).
 //
@@ -342,8 +359,7 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 
 	// Create command with context for cancellation
 	cmd := exec.CommandContext(ctx, ClaudeCommand, args...)
-
-	// Set working directory
+	cmd.Env = filteredEnviron()
 	cmd.Dir = h.kernel.ResolveWorkDir(req.WorkspaceRoot)
 
 	stdout, err := cmd.StdoutPipe()
@@ -754,6 +770,7 @@ func (h *Harness) RunInferenceStream(req *InferenceRequest) (<-chan StreamChunkI
 	)
 
 	cmd := exec.CommandContext(ctx, ClaudeCommand, args...)
+	cmd.Env = filteredEnviron()
 	cmd.Dir = h.kernel.ResolveWorkDir(req.WorkspaceRoot)
 
 	stdout, err := cmd.StdoutPipe()
