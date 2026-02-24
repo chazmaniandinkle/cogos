@@ -75,6 +75,14 @@ func (b *busEventBroker) publish(busID string, evt *BusEventData) {
 	}
 }
 
+// sseWriteWindow is the rolling write-deadline extension applied before each
+// SSE write.  The server's global WriteTimeout (5 min) is an absolute cap that
+// kills long-lived SSE connections.  ResponseController.SetWriteDeadline lets
+// us push the deadline forward on every write, converting the hard cap into a
+// per-write idle timeout.  We use 5 minutes so that a quiet-but-alive stream
+// (30 s heartbeats) never hits the deadline.
+const sseWriteWindow = 5 * time.Minute
+
 // handleEventsStream serves GET /v1/events/stream?bus_id={id}
 // This is the SSE endpoint that OpenClaw's CogBus monitor connects to.
 func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request) {
@@ -93,6 +101,17 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
+	}
+
+	// ResponseController lets us extend the per-response write deadline so the
+	// server's global WriteTimeout doesn't kill this long-lived SSE stream.
+	rc := http.NewResponseController(w)
+
+	// extendDeadline pushes the write deadline forward by sseWriteWindow.
+	// Must be called before every write+flush to prevent the global
+	// WriteTimeout from terminating the connection.
+	extendDeadline := func() {
+		_ = rc.SetWriteDeadline(time.Now().Add(sseWriteWindow))
 	}
 
 	// Resolve per-workspace busChat; fall back to server default.
@@ -114,6 +133,7 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	connData, _ := json.Marshal(connected)
+	extendDeadline()
 	fmt.Fprintf(w, "data: %s\n\n", connData)
 	flusher.Flush()
 
@@ -121,6 +141,7 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 	if busChat != nil {
 		events, err := busChat.manager.readBusEvents(busID)
 		if err == nil {
+			extendDeadline()
 			for i := range events {
 				envelope := busEventEnvelope{
 					ID:        fmt.Sprintf("replay_%s_%d", busID, events[i].Seq),
@@ -165,12 +186,14 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 			if err != nil {
 				continue
 			}
+			extendDeadline()
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 
 		case <-ticker.C:
 			// SSE comment keep-alive — prevents proxy/client timeout without
 			// generating a data event that subscribers need to handle.
+			extendDeadline()
 			fmt.Fprintf(w, ": keep-alive\n\n")
 			flusher.Flush()
 		}
