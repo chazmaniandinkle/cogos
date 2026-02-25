@@ -1788,7 +1788,6 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	// If no explicit X-Allowed-Tools header was provided, look up the agent's
 	// CRD and apply its modelConfig.allowedTools. The UCP Identity packet
 	// carries the agent name (e.g., "Sentinel", "Whirl").
-	inferReq.SkipPermissions = true // default: skip permissions (backward compatible)
 	if ucpContext != nil && ucpContext.Identity != nil && ucpContext.Identity.Name != "" {
 		agentName := strings.ToLower(ucpContext.Identity.Name)
 		policy, err := GetAgentCRDToolPolicy(workspaceRoot, agentName)
@@ -1800,7 +1799,6 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 				inferReq.AllowedTools = policy.AllowedTools
 				log.Printf("[CRD] Applied tool policy for agent %q: %v", agentName, policy.AllowedTools)
 			}
-			inferReq.SkipPermissions = policy.DangerouslySkipPermissions
 		}
 	}
 

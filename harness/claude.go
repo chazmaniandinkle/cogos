@@ -52,10 +52,11 @@ func BuildClaudeArgs(req *InferenceRequest) []string {
 		"--verbose",
 	}
 
-	// Only skip permissions when the agent CRD allows it (or when no CRD policy exists)
-	if req.SkipPermissions {
-		args = append(args, "--dangerously-skip-permissions")
-	}
+	// Always skip permissions in harness mode — the subprocess has no TTY
+	// to prompt for approval. Tool restriction is enforced via --allowed-tools.
+	// (The CRD's dangerouslySkipPermissions field is for direct Claude Code
+	// shell usage, not for the CogOS harness subprocess.)
+	args = append(args, "--dangerously-skip-permissions")
 
 	// Build system prompt: chain TAA context + client system prompt
 	if sp := chainSystemPrompt(req); sp != "" {
