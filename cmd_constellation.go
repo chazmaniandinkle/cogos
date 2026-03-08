@@ -12,10 +12,11 @@ import (
 // cmdConstellation handles constellation subcommands
 func cmdConstellation(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("Usage: cog constellation {index|search|health|substance}")
+		fmt.Println("Usage: cog constellation {index|index-bus|search|health|substance}")
 		fmt.Println()
 		fmt.Println("Commands:")
-		fmt.Println("  index           Index all cogdocs in the workspace")
+		fmt.Println("  index           Index all cogdocs + bus events in the workspace")
+		fmt.Println("  index-bus       Index bus events only (backfill historical chat)")
 		fmt.Println("  search <query>  Search constellation knowledge graph")
 		fmt.Println("  health          Show constellation database stats")
 		fmt.Println("  substance       Analyze document substance vs metadata")
@@ -30,6 +31,8 @@ func cmdConstellation(args []string) error {
 	switch args[0] {
 	case "index":
 		return constellationIndex(workspaceRoot)
+	case "index-bus":
+		return constellationIndexBus(workspaceRoot)
 	case "search":
 		if len(args) < 2 {
 			return fmt.Errorf("search requires a query argument")
@@ -44,7 +47,7 @@ func cmdConstellation(args []string) error {
 	}
 }
 
-// constellationIndex indexes all cogdocs in the workspace
+// constellationIndex indexes all cogdocs and bus events in the workspace
 func constellationIndex(workspaceRoot string) error {
 	fmt.Println("Opening constellation database...")
 	c, err := getConstellation()
@@ -55,10 +58,40 @@ func constellationIndex(workspaceRoot string) error {
 	fmt.Println("Indexing all cogdocs in workspace...")
 	err = c.IndexWorkspace()
 	if err != nil {
-		return fmt.Errorf("indexing failed: %w", err)
+		// IndexWorkspace returns first non-fatal error (e.g. bad frontmatter)
+		// but still indexes all valid docs. Treat as warning, not fatal.
+		fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+	}
+
+	// Backfill bus events into constellation
+	fmt.Println("Indexing bus events...")
+	if err := backfillBusEvents(workspaceRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: bus event indexing failed: %v\n", err)
+	}
+
+	// Run embedding backfill synchronously (the async goroutine in IndexWorkspace
+	// dies when the CLI process exits — run it here instead)
+	if client := getEmbedClient(workspaceRoot); client != nil {
+		fmt.Println("Backfilling embeddings...")
+		indexer := constellation.NewEmbedIndexer(c, client)
+		n, err := indexer.BackfillAll(20)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: embedding backfill failed after %d docs: %v\n", n, err)
+		} else {
+			fmt.Printf("Embedded %d documents\n", n)
+		}
 	}
 
 	// Show stats after indexing
+	return constellationHealth(workspaceRoot)
+}
+
+// constellationIndexBus indexes only bus events (backfill historical chat)
+func constellationIndexBus(workspaceRoot string) error {
+	fmt.Println("Indexing bus events into constellation...")
+	if err := backfillBusEvents(workspaceRoot); err != nil {
+		return fmt.Errorf("bus event indexing failed: %w", err)
+	}
 	return constellationHealth(workspaceRoot)
 }
 
