@@ -243,6 +243,132 @@ func TestQueryConstellationWithIris_ScoreThresholdScaling(t *testing.T) {
 	}
 }
 
+func TestResolutionTierSelection(t *testing.T) {
+	// Tests the score-based resolution tier logic from QueryConstellationWithIris.
+	// Given a set of scored candidates and threshold parameters, verify that each
+	// candidate renders at the correct resolution: full, section, or metadata-only.
+
+	makeNode := func(title, content string) constellation.Node {
+		return constellation.Node{
+			Title:   title,
+			Type:    "cogdoc",
+			Sector:  "semantic",
+			Content: content,
+		}
+	}
+
+	// Simulate the threshold computation from QueryConstellationWithIris
+	const (
+		fullBase    = 0.6
+		sectionBase = 0.3
+	)
+
+	cases := []struct {
+		name         string
+		pressure     float64
+		topScore     float64
+		scores       []float64 // CombinedScore for each candidate
+		wantTiers    []string  // "full", "section", or "metadata"
+	}{
+		{
+			name:      "low pressure — most candidates at full resolution",
+			pressure:  0.1,
+			topScore:  1.0,
+			scores:    []float64{1.0, 0.8, 0.7, 0.5, 0.3},
+			// pressureScale = 2*0.1 - 0.01 = 0.19
+			// fullThreshold = 1.0 * (0.6 + 0.4*0.19) = 0.676
+			// sectionThreshold = 1.0 * (0.3 + 0.7*0.19) = 0.433
+			wantTiers: []string{"full", "full", "full", "section", "metadata"},
+		},
+		{
+			name:      "high pressure — only top candidate at full",
+			pressure:  0.9,
+			topScore:  1.0,
+			scores:    []float64{1.0, 0.99, 0.95, 0.8, 0.5},
+			// pressureScale = 2*0.9 - 0.81 = 0.99
+			// fullThreshold = 1.0 * (0.6 + 0.4*0.99) = 0.996
+			// sectionThreshold = 1.0 * (0.3 + 0.7*0.99) = 0.993
+			wantTiers: []string{"full", "metadata", "metadata", "metadata", "metadata"},
+		},
+		{
+			name:      "zero pressure — lowest thresholds",
+			pressure:  0.0,
+			topScore:  1.0,
+			scores:    []float64{1.0, 0.65, 0.55, 0.35, 0.25},
+			// pressureScale = 0
+			// fullThreshold = 0.6
+			// sectionThreshold = 0.3
+			wantTiers: []string{"full", "full", "section", "section", "metadata"},
+		},
+		{
+			name:      "tau2 boundary (0.75) — aggressive culling",
+			pressure:  0.75,
+			topScore:  1.0,
+			scores:    []float64{1.0, 0.98, 0.96, 0.90, 0.70},
+			// pressureScale = 2*0.75 - 0.5625 = 0.9375
+			// fullThreshold = 1.0 * (0.6 + 0.4*0.9375) = 0.975
+			// sectionThreshold = 1.0 * (0.3 + 0.7*0.9375) = 0.95625
+			wantTiers: []string{"full", "full", "section", "metadata", "metadata"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pressureScale := 2*tc.pressure - tc.pressure*tc.pressure
+			fullThreshold := tc.topScore * (fullBase + (1.0-fullBase)*pressureScale)
+			sectionThreshold := tc.topScore * (sectionBase + (1.0-sectionBase)*pressureScale)
+
+			for i, score := range tc.scores {
+				node := makeNode(
+					"Doc "+strings.Repeat("A", i+1),
+					"# Section One\nFirst section content.\n\n## Section Two\nSecond section content.",
+				)
+
+				var tier string
+				var rendered string
+				switch {
+				case score >= fullThreshold:
+					tier = "full"
+					rendered = formatNodeWithConfig(node, 2000)
+				case score >= sectionThreshold:
+					tier = "section"
+					rendered = formatNodeSection(node, 1000)
+				default:
+					tier = "metadata"
+					rendered = formatNodeMetadataOnly(node)
+				}
+
+				if tier != tc.wantTiers[i] {
+					t.Errorf("candidate %d (score=%.2f): got tier %q, want %q (fullThreshold=%.4f sectionThreshold=%.4f)",
+						i, score, tier, tc.wantTiers[i], fullThreshold, sectionThreshold)
+				}
+
+				// Verify rendered content has expected characteristics
+				if !strings.Contains(rendered, node.Title) {
+					t.Errorf("candidate %d: rendered output missing title %q", i, node.Title)
+				}
+
+				switch tier {
+				case "full":
+					if !strings.Contains(rendered, "First section content") {
+						t.Errorf("candidate %d: full render should include content body", i)
+					}
+				case "section":
+					// Section format includes metadata and longest section
+					if !strings.Contains(rendered, "Type: cogdoc") {
+						t.Errorf("candidate %d: section render should include metadata", i)
+					}
+				case "metadata":
+					// Metadata-only should NOT include content body
+					if strings.Contains(rendered, "First section content") {
+						t.Errorf("candidate %d: metadata render should not include content body", i)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestQueryConstellationWithIris_FallbackToStandard(t *testing.T) {
 	// When embedding is not enabled (the default), QueryConstellationWithIris
 	// should fall back to standard QueryConstellation behavior.
