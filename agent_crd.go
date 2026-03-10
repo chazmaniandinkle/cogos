@@ -253,6 +253,7 @@ func GetAgentCRDToolPolicy(root, agentName string) (*AgentCRDToolPolicyResult, e
 	}
 
 	result := &AgentCRDToolPolicyResult{
+		AgentType:    crd.Spec.Type,
 		AllowedTools: crd.Spec.ModelConfig.AllowedTools,
 		DenyTools:    crd.Spec.Capabilities.Tools.Deny,
 	}
@@ -272,6 +273,7 @@ func GetAgentCRDToolPolicy(root, agentName string) (*AgentCRDToolPolicyResult, e
 
 // AgentCRDToolPolicyResult contains the resolved tool policy for an agent.
 type AgentCRDToolPolicyResult struct {
+	AgentType                  string   // Agent type from CRD spec: "interactive", "declarative", "headless"
 	AllowedTools              []string // Claude CLI --allowed-tools patterns
 	DenyTools                 []string // Tools explicitly denied
 	DangerouslySkipPermissions bool    // Whether to pass --dangerously-skip-permissions

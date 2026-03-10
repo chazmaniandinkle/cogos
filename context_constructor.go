@@ -60,26 +60,46 @@ type TAAProfileCoherence struct {
 	FailureMode string  `yaml:"failure_mode"`
 }
 
-// LoadTAAProfile loads a TAA profile by name from the profiles directory
+// LoadTAAProfile loads a TAA profile by name from the profiles directory.
+// If the exact profile is not found, it tries fallbacks: "openclaw", then "default".
+// This enables agent-specific profiles (e.g., "cog", "sandy") with graceful
+// degradation to the standard profile when no agent-specific one exists.
 func LoadTAAProfile(workspaceRoot, profileName string) (*TAAProfile, error) {
-	profilePath := filepath.Join(workspaceRoot, ".cog", "config", "taa", "profiles", profileName+".yaml")
-
-	data, err := os.ReadFile(profilePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read TAA profile %s: %w", profileName, err)
+	candidates := []string{profileName}
+	if profileName != "openclaw" && profileName != "default" {
+		candidates = append(candidates, "openclaw", "default")
+	} else if profileName != "default" {
+		candidates = append(candidates, "default")
 	}
 
-	var profile TAAProfile
-	if err := yaml.Unmarshal(data, &profile); err != nil {
-		return nil, fmt.Errorf("failed to parse TAA profile %s: %w", profileName, err)
+	var lastErr error
+	for _, name := range candidates {
+		profilePath := filepath.Join(workspaceRoot, ".cog", "config", "taa", "profiles", name+".yaml")
+		data, err := os.ReadFile(profilePath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var profile TAAProfile
+		if err := yaml.Unmarshal(data, &profile); err != nil {
+			lastErr = fmt.Errorf("failed to parse TAA profile %s: %w", name, err)
+			continue
+		}
+
+		// Set defaults
+		if profile.Tiers.TotalTokens == 0 {
+			profile.Tiers.TotalTokens = TotalContextTokens
+		}
+
+		if name != profileName {
+			log.Printf("[TAA] Profile %q not found, using fallback %q", profileName, name)
+		}
+
+		return &profile, nil
 	}
 
-	// Set defaults
-	if profile.Tiers.TotalTokens == 0 {
-		profile.Tiers.TotalTokens = TotalContextTokens
-	}
-
-	return &profile, nil
+	return nil, fmt.Errorf("no valid TAA profile found (tried: %v): %w", candidates, lastErr)
 }
 
 // Total context budget constants

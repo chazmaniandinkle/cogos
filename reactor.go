@@ -9,13 +9,32 @@ package main
 
 import (
 	"log"
+	"path"
+	"strings"
 	"sync"
 )
+
+// matchEventType checks if eventType matches the pattern.
+// Supports glob patterns via path.Match (e.g., "agent.*", "*.error", "*").
+// Falls back to exact match if the pattern contains no glob characters.
+// Note: path.Match treats "." as a regular character; "*" matches any
+// sequence of non-"/" characters, so "agent.*" matches "agent.capabilities"
+// but not "agent.event.processed" (the second dot acts as a boundary).
+func matchEventType(pattern, eventType string) bool {
+	if !strings.ContainsAny(pattern, "*?[") {
+		return pattern == eventType
+	}
+	matched, err := path.Match(pattern, eventType)
+	if err != nil {
+		return pattern == eventType // malformed pattern → exact match fallback
+	}
+	return matched
+}
 
 // ReactorRule defines a deterministic reaction to a bus event.
 type ReactorRule struct {
 	Name      string              // Human-readable rule name for logging
-	EventType string              // Match on CogBlock.Type (exact match)
+	EventType string              // Match on CogBlock.Type; supports glob patterns (e.g. "agent.*", "*.error", "*")
 	BusFilter string              // Optional bus ID filter ("" = any bus)
 	Action    func(block *CogBlock) // Callback when rule matches
 }
@@ -60,7 +79,7 @@ func (r *Reactor) Start() {
 		r.mu.Unlock()
 
 		for _, rule := range rules {
-			if block.Type != rule.EventType {
+			if !matchEventType(rule.EventType, block.Type) {
 				continue
 			}
 			if rule.BusFilter != "" && busID != rule.BusFilter {

@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -123,6 +125,191 @@ func (cs *ContextState) BuildContextString() string {
 	}
 
 	return strings.Join(parts, "\n\n---\n\n")
+}
+
+// === STABILITY-ORDERED BLOCK OUTPUT ===
+//
+// ContextBlock represents a discrete unit of context with stability metadata.
+// Blocks are extracted from tier content by parsing markdown headers, then
+// sorted by stability score: most stable first (periphery), most dynamic
+// last (foveal tip, adjacent to conversation).
+//
+// This ordering simultaneously aligns three gradients:
+//   - Cache gradient:     stable (cached KV blocks) → dynamic (recomputed)
+//   - Attention gradient: low (distant from conversation) → high (adjacent)
+//   - Foveation gradient: peripheral (low-res) → foveal (high-res)
+
+// ContextBlock is a discrete unit of rendered context with stability metadata.
+type ContextBlock struct {
+	Source    string `json:"source"`    // e.g. "tier2:working-memory", "tier4:constellation"
+	Label    string `json:"label"`     // Human-readable: "Working Memory", "Current Focus"
+	Content  string `json:"content"`   // The rendered markdown content
+	Tokens   int    `json:"tokens"`    // Estimated token count
+	Hash     string `json:"hash"`      // SHA-256 prefix for cache comparison
+	Stability int   `json:"stability"` // 0-100: higher = more stable = rendered first (periphery)
+}
+
+// blockStabilityScores maps block source labels to stability scores.
+// Higher = more stable = placed earlier in output (peripheral, cached).
+// Lower = more dynamic = placed later (foveal tip, adjacent to conversation).
+var blockStabilityScores = map[string]int{
+	"identity":          95, // Almost never changes within a session
+	"working-memory":    80, // Persistent state, changes slowly
+	"session-state":     70, // Session metadata, stable within session
+	"knowledge":         50, // Constellation results vary with anchor/goal
+	"peripheral-buses":  35, // Other sessions' activity, moderately dynamic
+	"recent-context":    15, // Recent exchanges, changes every turn
+	"focus":             10, // Current focus/intent, changes every turn
+}
+
+// stabilityFor returns the stability score for a block source label.
+// Unknown sources get a default of 40 (mid-range).
+func stabilityFor(source string) int {
+	if score, ok := blockStabilityScores[source]; ok {
+		return score
+	}
+	return 40
+}
+
+// blockHash returns a short hex hash of content for cache comparison.
+func blockHash(content string) string {
+	h := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(h[:4]) // 8 hex chars
+}
+
+// estimateTokens gives a rough token estimate (chars/4 heuristic).
+func estimateTokens(s string) int {
+	return (len(s) + 3) / 4
+}
+
+// DecomposeToBlocks extracts ContextBlocks from all tiers by parsing markdown
+// section headers (## ). Each header starts a new block. Content before the
+// first header becomes a block labeled with the tier's default label.
+func (cs *ContextState) DecomposeToBlocks() []ContextBlock {
+	if cs == nil {
+		return nil
+	}
+
+	var blocks []ContextBlock
+
+	type tierInfo struct {
+		tier         *ContextTier
+		defaultLabel string
+		sourcePrefix string
+	}
+
+	tiers := []tierInfo{
+		{cs.Tier1Identity, "Identity", "tier1"},
+		{cs.Tier2Temporal, "Temporal Context", "tier2"},
+		{cs.Tier3Present, "Present Context", "tier3"},
+		{cs.Tier4Semantic, "Knowledge", "tier4"},
+	}
+
+	for _, ti := range tiers {
+		if ti.tier == nil || ti.tier.Content == "" {
+			continue
+		}
+		blocks = append(blocks, decomposeTierContent(ti.tier.Content, ti.sourcePrefix, ti.defaultLabel)...)
+	}
+
+	return blocks
+}
+
+// decomposeTierContent splits a tier's markdown content into blocks on "## " headers.
+func decomposeTierContent(content, sourcePrefix, defaultLabel string) []ContextBlock {
+	var blocks []ContextBlock
+	lines := strings.Split(content, "\n")
+
+	var currentLabel string
+	var currentSource string
+	var currentLines []string
+
+	flush := func() {
+		text := strings.TrimSpace(strings.Join(currentLines, "\n"))
+		if text == "" {
+			return
+		}
+		blocks = append(blocks, ContextBlock{
+			Source:    currentSource,
+			Label:     currentLabel,
+			Content:   text,
+			Tokens:    estimateTokens(text),
+			Hash:      blockHash(text),
+			Stability: stabilityFor(sourceToKey(currentSource)),
+		})
+	}
+
+	// Initial block (content before first ## header)
+	currentLabel = defaultLabel
+	currentSource = sourcePrefix + ":" + slugify(defaultLabel)
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "## ") {
+			flush()
+			currentLabel = strings.TrimPrefix(line, "## ")
+			currentSource = sourcePrefix + ":" + slugify(currentLabel)
+			currentLines = nil
+			continue
+		}
+		currentLines = append(currentLines, line)
+	}
+	flush()
+
+	return blocks
+}
+
+// sourceToKey extracts the label part from a source like "tier2:working-memory".
+func sourceToKey(source string) string {
+	if idx := strings.Index(source, ":"); idx >= 0 {
+		return source[idx+1:]
+	}
+	return source
+}
+
+// slugify converts a label to a lowercase hyphenated key.
+func slugify(s string) string {
+	s = strings.ToLower(s)
+	s = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			return r
+		}
+		if r == ' ' || r == '_' || r == '/' {
+			return '-'
+		}
+		return -1
+	}, s)
+	// Collapse multiple hyphens
+	for strings.Contains(s, "--") {
+		s = strings.ReplaceAll(s, "--", "-")
+	}
+	return strings.Trim(s, "-")
+}
+
+// BuildOrderedContextString decomposes all tiers into blocks, sorts by stability
+// (most stable first = periphery, most dynamic last = foveal tip), and concatenates
+// with block marker comments for cache comparison.
+func (cs *ContextState) BuildOrderedContextString() (string, []ContextBlock) {
+	blocks := cs.DecomposeToBlocks()
+	if len(blocks) == 0 {
+		return "", nil
+	}
+
+	// Sort: highest stability first (peripheral) → lowest last (foveal tip)
+	sort.SliceStable(blocks, func(i, j int) bool {
+		return blocks[i].Stability > blocks[j].Stability
+	})
+
+	var sb strings.Builder
+	for i, b := range blocks {
+		if i > 0 {
+			sb.WriteString("\n\n---\n\n")
+		}
+		// Block marker for cache boundary identification
+		fmt.Fprintf(&sb, "<!-- block:%s hash:%s tokens:%d stability:%d -->\n", b.Source, b.Hash, b.Tokens, b.Stability)
+		sb.WriteString(b.Content)
+	}
+
+	return sb.String(), blocks
 }
 
 // chainSystemPrompt combines TAA context and client system prompt into a single

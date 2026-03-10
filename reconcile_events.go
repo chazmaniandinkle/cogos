@@ -36,6 +36,12 @@ const (
 
 	// EventReconcileError is emitted when a reconciliation fails.
 	EventReconcileError = "cog.reconcile.error"
+
+	// BlockComponentDrift is the CogBus block type for component drift events.
+	BlockComponentDrift = "component.drift"
+
+	// reconcileBusID is the bus channel for reconciliation events.
+	reconcileBusID = "bus_chat_system_capabilities"
 )
 
 // ─── ReconcileEvent struct ──────────────────────────────────────────────────

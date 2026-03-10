@@ -6,6 +6,7 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -595,5 +596,176 @@ func TestCapabilitiesPayloadToMap_EmptyOptionals(t *testing.T) {
 	// Tools map should still exist (always included per implementation)
 	if _, ok := m["tools"]; !ok {
 		t.Error("tools should always be present")
+	}
+}
+
+// ─── Bus Event Simulation ───────────────────────────────────────────────────────
+// These tests replicate the exact marshal/unmarshal path the bus handler uses
+// in serve.go when it receives an agent.capabilities block, ensuring that JSON
+// round-tripping preserves all fields and the cache is correctly populated.
+
+func TestCapCachePopulatedFromBusEvent(t *testing.T) {
+	// Build the payload as an advertiser would.
+	original := AgentCapabilitiesPayload{
+		AgentID:          "lab-agent",
+		AgentType:        "interactive",
+		Endpoint:         "bus_agent_lab",
+		Tools:            CapTools{Allow: []string{"Read", "Grep"}, Deny: []string{"Bash"}},
+		MCPServers:       []string{"memory-server", "search-server"},
+		MemorySectors:    []string{"semantic/insights"},
+		BusSubscriptions: []string{"system.health", "agent.capabilities"},
+		TTL:              "30m",
+		AdvertisedAt:     time.Now().UTC(),
+	}
+
+	// Simulate: block.Payload is an interface{} that gets marshalled then
+	// unmarshalled in the bus handler (serve.go lines 3919-3935).
+	payloadBytes, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var caps AgentCapabilitiesPayload
+	if err := json.Unmarshal(payloadBytes, &caps); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Parse TTL string the same way the handler does.
+	ttl := defaultCapabilityTTL
+	if caps.TTL != "" {
+		if parsed, parseErr := time.ParseDuration(caps.TTL); parseErr == nil {
+			ttl = parsed
+		}
+	}
+
+	cache := NewCapabilityCache()
+	cache.Set(caps.AgentID, caps, ttl)
+
+	// Verify round-trip preserved all fields.
+	got := cache.Get("lab-agent")
+	if got == nil {
+		t.Fatal("Get returned nil after bus-event simulation")
+	}
+	if got.AgentID != "lab-agent" {
+		t.Errorf("AgentID = %q, want %q", got.AgentID, "lab-agent")
+	}
+	if got.AgentType != "interactive" {
+		t.Errorf("AgentType = %q, want %q", got.AgentType, "interactive")
+	}
+	if got.Endpoint != "bus_agent_lab" {
+		t.Errorf("Endpoint = %q, want %q", got.Endpoint, "bus_agent_lab")
+	}
+	if len(got.MCPServers) != 2 {
+		t.Errorf("MCPServers length = %d, want 2", len(got.MCPServers))
+	}
+	if len(got.MemorySectors) != 1 {
+		t.Errorf("MemorySectors length = %d, want 1", len(got.MemorySectors))
+	}
+	if len(got.BusSubscriptions) != 2 {
+		t.Errorf("BusSubscriptions length = %d, want 2", len(got.BusSubscriptions))
+	}
+
+	// Tool policy should survive JSON round-trip.
+	if !cache.HasTool("lab-agent", "Read") {
+		t.Error("HasTool(Read) = false after round-trip, want true")
+	}
+	if !cache.HasTool("lab-agent", "Grep") {
+		t.Error("HasTool(Grep) = false after round-trip, want true")
+	}
+	if cache.HasTool("lab-agent", "Bash") {
+		t.Error("HasTool(Bash) = true after round-trip, want false (denied)")
+	}
+	if cache.HasTool("lab-agent", "Write") {
+		t.Error("HasTool(Write) = true after round-trip, want false (not in allow list)")
+	}
+}
+
+func TestCapCacheBusEventTTLParsing(t *testing.T) {
+	cache := NewCapabilityCache()
+
+	// Simulate a bus event with a very short TTL string.
+	caps := AgentCapabilitiesPayload{
+		AgentID:      "short-lived",
+		AgentType:    "headless",
+		TTL:          "1ms",
+		AdvertisedAt: time.Now().UTC(),
+	}
+
+	ttl := defaultCapabilityTTL
+	if parsed, err := time.ParseDuration(caps.TTL); err == nil {
+		ttl = parsed
+	}
+	cache.Set(caps.AgentID, caps, ttl)
+
+	// Should exist immediately.
+	if cache.Get("short-lived") == nil {
+		t.Fatal("entry should exist immediately after set")
+	}
+
+	// Should expire quickly.
+	time.Sleep(10 * time.Millisecond)
+	if cache.Get("short-lived") != nil {
+		t.Error("entry should have expired after 10ms with TTL=1ms")
+	}
+}
+
+func TestCapCacheBusEventResolverIntegration(t *testing.T) {
+	// Full bus-event-to-resolver pipeline: simulate two agents advertising
+	// via bus events, then query through the resolver.
+	cache := NewCapabilityCache()
+	resolver := NewCapabilityResolver(cache)
+
+	agents := []AgentCapabilitiesPayload{
+		{
+			AgentID:   "alpha",
+			AgentType: "interactive",
+			Endpoint:  "bus_agent_alpha",
+			Tools:     CapTools{Allow: []string{"Read", "Write"}, Deny: []string{"Bash"}},
+		},
+		{
+			AgentID:   "beta",
+			AgentType: "headless",
+			Endpoint:  "bus_agent_beta",
+			Tools:     CapTools{Deny: []string{"Bash"}}, // empty allow = all allowed except Bash
+		},
+	}
+
+	for _, a := range agents {
+		data, _ := json.Marshal(a)
+		var parsed AgentCapabilitiesPayload
+		json.Unmarshal(data, &parsed)
+		cache.Set(parsed.AgentID, parsed, 0)
+	}
+
+	// Both agents resolve.
+	available := resolver.ListAvailableAgents()
+	if len(available) != 2 {
+		t.Fatalf("ListAvailableAgents = %d, want 2", len(available))
+	}
+
+	// Alpha: explicit allow list.
+	if _, ok := resolver.ResolveAgent("alpha"); !ok {
+		t.Error("alpha should resolve")
+	}
+	if !resolver.CanInvokeTool("alpha", "Read") {
+		t.Error("alpha: CanInvokeTool(Read) should be true")
+	}
+	if resolver.CanInvokeTool("alpha", "Grep") {
+		t.Error("alpha: CanInvokeTool(Grep) should be false (not in allow list)")
+	}
+
+	// Beta: empty allow = permissive except deny.
+	if !resolver.CanInvokeTool("beta", "Read") {
+		t.Error("beta: CanInvokeTool(Read) should be true (empty allow)")
+	}
+	if !resolver.CanInvokeTool("beta", "Grep") {
+		t.Error("beta: CanInvokeTool(Grep) should be true (empty allow)")
+	}
+	if resolver.CanInvokeTool("beta", "Bash") {
+		t.Error("beta: CanInvokeTool(Bash) should be false (denied)")
+	}
+
+	// Unknown agent.
+	if _, ok := resolver.ResolveAgent("gamma"); ok {
+		t.Error("gamma should not resolve")
 	}
 }

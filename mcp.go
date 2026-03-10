@@ -338,8 +338,17 @@ func (b *OpenClawBridge) ProbeGateway(ctx context.Context) error {
 	return nil
 }
 
-// ExecuteTool calls a tool on the OpenClaw gateway via POST /tools/invoke
+// ExecuteTool calls a tool on the OpenClaw gateway via POST /tools/invoke.
+// It uses the bridge's default SessionKey for gateway tracking.
 func (b *OpenClawBridge) ExecuteTool(ctx context.Context, name string, args map[string]interface{}) (*MCPToolCallResult, error) {
+	return b.ExecuteToolWithSession(ctx, name, args, b.SessionKey)
+}
+
+// ExecuteToolWithSession calls a tool on the OpenClaw gateway via POST /tools/invoke
+// with an explicit session key for gateway tracking. If sessionKey is empty, no
+// session key is included in the request. This is used by the bus ToolRouter to
+// derive per-call session keys from the bus event context (busID:callerAgent).
+func (b *OpenClawBridge) ExecuteToolWithSession(ctx context.Context, name string, args map[string]interface{}, sessionKey string) (*MCPToolCallResult, error) {
 	ctx, span := tracer.Start(ctx, "openclaw.tool.execute",
 		trace.WithAttributes(
 			attribute.String("tool.name", name),
@@ -352,8 +361,8 @@ func (b *OpenClawBridge) ExecuteTool(ctx context.Context, name string, args map[
 		"tool": name,
 		"args": args,
 	}
-	if b.SessionKey != "" {
-		body["sessionKey"] = b.SessionKey
+	if sessionKey != "" {
+		body["sessionKey"] = sessionKey
 	}
 
 	jsonBody, err := json.Marshal(body)

@@ -12,11 +12,12 @@ import (
 // cmdConstellation handles constellation subcommands
 func cmdConstellation(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("Usage: cog constellation {index|index-bus|search|health|substance}")
+		fmt.Println("Usage: cog constellation {index|index-bus|index-sessions|search|health|substance}")
 		fmt.Println()
 		fmt.Println("Commands:")
-		fmt.Println("  index           Index all cogdocs + bus events in the workspace")
+		fmt.Println("  index           Index all cogdocs + bus events + sessions in the workspace")
 		fmt.Println("  index-bus       Index bus events only (backfill historical chat)")
+		fmt.Println("  index-sessions  Index Claude Code session transcripts")
 		fmt.Println("  search <query>  Search constellation knowledge graph")
 		fmt.Println("  health          Show constellation database stats")
 		fmt.Println("  substance       Analyze document substance vs metadata")
@@ -33,6 +34,8 @@ func cmdConstellation(args []string) error {
 		return constellationIndex(workspaceRoot)
 	case "index-bus":
 		return constellationIndexBus(workspaceRoot)
+	case "index-sessions":
+		return backfillSessionTranscripts(workspaceRoot)
 	case "search":
 		if len(args) < 2 {
 			return fmt.Errorf("search requires a query argument")
@@ -67,6 +70,20 @@ func constellationIndex(workspaceRoot string) error {
 	fmt.Println("Indexing bus events...")
 	if err := backfillBusEvents(workspaceRoot); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: bus event indexing failed: %v\n", err)
+	}
+
+	// Index Claude Code session transcripts
+	fmt.Println("Indexing session transcripts...")
+	if err := backfillSessionTranscripts(workspaceRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: session transcript indexing failed: %v\n", err)
+	}
+
+	// Index operational registries (fleet, research, agents, services, coordination, signals)
+	fmt.Println("Indexing operational registries...")
+	if n, err := indexAllRegistries(c, workspaceRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: registry indexing failed: %v\n", err)
+	} else {
+		fmt.Printf("Indexed %d registry entries\n", n)
 	}
 
 	// Run embedding backfill synchronously (the async goroutine in IndexWorkspace

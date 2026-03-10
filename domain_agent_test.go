@@ -473,8 +473,8 @@ func TestCRDSchemaCompliance(t *testing.T) {
 				t.Error("spec.identity.name is empty")
 			}
 
-			// spec.modelConfig.model should be set
-			if crd.Spec.ModelConfig.Model == "" {
+			// spec.modelConfig.model should be set (except headless agents which don't do inference)
+			if crd.Spec.ModelConfig.Model == "" && crd.Spec.Type != "headless" {
 				t.Error("spec.modelConfig.model is empty")
 			}
 		})

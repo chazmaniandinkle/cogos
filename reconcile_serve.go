@@ -22,10 +22,16 @@ type ServeReconciler struct {
 	interval time.Duration
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
+	bus      *busSessionManager
 
 	// Metrics
 	lastRun    time.Time
 	cycleCount int64
+}
+
+// SetBus attaches a bus session manager for emitting drift events.
+func (sr *ServeReconciler) SetBus(mgr *busSessionManager) {
+	sr.bus = mgr
 }
 
 // NewServeReconciler creates a reconciler for the given workspace.
@@ -138,5 +144,55 @@ func (sr *ServeReconciler) runCycle() {
 			cycle, applied, drifted, failed, duration.Round(time.Millisecond))
 	} else {
 		log.Printf("[reconciler] cycle %d: all synced (%s)", cycle, duration.Round(time.Millisecond))
+	}
+
+	// Emit component.drift bus events for drifted resources.
+	sr.emitDriftEvents(results)
+}
+
+// emitDriftEvents sends component.drift events to the CogBus for each
+// drifted or failed action detected by the reconciler.
+func (sr *ServeReconciler) emitDriftEvents(results []MetaResult) {
+	if sr.bus == nil {
+		return
+	}
+	for _, r := range results {
+		switch r.Status {
+		case "drifted":
+			if r.Plan == nil {
+				continue
+			}
+			for _, action := range r.Plan.Actions {
+				if action.Action == ActionSkip {
+					continue
+				}
+				reason, _ := action.Details["reason"].(string)
+				severity := "info"
+				if action.Action == ActionCreate {
+					severity = "warning"
+				}
+				payload := map[string]interface{}{
+					"component": action.Name,
+					"action":    string(action.Action),
+					"reason":    reason,
+					"severity":  severity,
+					"resource":  r.Resource,
+				}
+				if _, err := sr.bus.appendBusEvent(reconcileBusID, BlockComponentDrift, "kernel:reconciler", payload); err != nil {
+					log.Printf("[reconciler] drift event emit error: %v", err)
+				}
+			}
+		case "failed":
+			payload := map[string]interface{}{
+				"component": r.Resource,
+				"action":    "reconcile",
+				"reason":    r.Error,
+				"severity":  "error",
+				"resource":  r.Resource,
+			}
+			if _, err := sr.bus.appendBusEvent(reconcileBusID, BlockComponentDrift, "kernel:reconciler", payload); err != nil {
+				log.Printf("[reconciler] drift event emit error: %v", err)
+			}
+		}
 	}
 }

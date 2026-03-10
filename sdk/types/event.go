@@ -158,6 +158,7 @@ type EventFilter struct {
 	Before time.Time `json:"before,omitempty"`
 
 	// AfterSeq filters events after this sequence number.
+	// DEPRECATED (ADR-061): Prefer cursor-based consumption with consumer_id.
 	AfterSeq int64 `json:"after_seq,omitempty"`
 
 	// Limit is the maximum number of events to return.

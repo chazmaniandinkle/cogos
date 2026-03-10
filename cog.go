@@ -5630,6 +5630,11 @@ func main() {
 		code = cmdFleet(os.Args[2:])
 	case "research":
 		code = cmdResearch(os.Args[2:])
+	case "registry":
+		if err := cmdRegistry(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			code = 1
+		}
 	case "infer":
 		code = cmdInfer(os.Args[2:])
 	case "inference":
@@ -5722,6 +5727,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			code = 1
 		}
+	case "index":
+		code = cmdIndex(os.Args[2:])
+	case "drift":
+		code = cmdDrift(os.Args[2:])
 	case "bus":
 		code = cmdBus(os.Args[2:])
 	case "channel":

@@ -325,8 +325,16 @@ func QueryConstellationWithIris(workspaceRoot, anchor, goal string, budget int, 
 			}
 		}
 	} else {
-		// Fall back to heuristic-only path
-		return QueryConstellation(workspaceRoot, anchor, goal, budget)
+		// Heuristic fallback — same content, compressed whitespace under pressure
+		result, err := QueryConstellation(workspaceRoot, anchor, goal, budget)
+		if err != nil {
+			return "", err
+		}
+		if irisPressure > 0.05 {
+			pressureScale := 2*irisPressure - irisPressure*irisPressure
+			result = compressWhitespace(result, pressureScale)
+		}
+		return result, nil
 	}
 
 	if len(scoredCandidates) == 0 {
@@ -529,4 +537,34 @@ func splitIntoSections(content string) []string {
 	}
 
 	return sections
+}
+
+// compressWhitespace removes consecutive blank lines and trailing whitespace
+// proportional to intensity (0.0 = no change, 1.0 = maximum compression).
+// Preserves all content text and markdown headers — only removes empty space.
+func compressWhitespace(s string, intensity float64) string {
+	if intensity <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	var result []string
+	consecutiveBlanks := 0
+	// At intensity 0 allow 3 consecutive blanks, at intensity 1 allow 0
+	maxBlanks := int(3.0 * (1.0 - intensity))
+	if maxBlanks < 0 {
+		maxBlanks = 0
+	}
+	for _, line := range lines {
+		trimmed := strings.TrimRight(line, " \t")
+		if trimmed == "" {
+			consecutiveBlanks++
+			if consecutiveBlanks <= maxBlanks {
+				result = append(result, "")
+			}
+		} else {
+			consecutiveBlanks = 0
+			result = append(result, trimmed)
+		}
+	}
+	return strings.Join(result, "\n")
 }

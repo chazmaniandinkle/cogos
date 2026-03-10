@@ -400,7 +400,7 @@ func (m *tuiModel) loadData() {
 }
 
 func (m *tuiModel) loadTAAConfig() {
-	configPath := filepath.Join(m.cogRoot, "conf", "config", "taa.yaml")
+	configPath := filepath.Join(m.cogRoot, "config", "taa.yaml")
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		m.taaConfig = &TAADisplayConfig{TotalTokens: 100000}

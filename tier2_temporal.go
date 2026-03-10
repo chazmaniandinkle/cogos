@@ -415,6 +415,10 @@ func loadWorkingMemory(workspaceRoot string) string {
 	return sections
 }
 
+// Per-section character cap for working memory. Any single section exceeding
+// this limit is truncated to prevent one section from dominating the budget.
+const workingMemorySectionCap = 2000
+
 // parseWorkingMemory extracts relevant sections from working memory markdown.
 func parseWorkingMemory(content string) string {
 	var builder strings.Builder
@@ -434,12 +438,41 @@ func parseWorkingMemory(content string) string {
 	sectionContent := []string{}
 
 	includeSections := map[string]bool{
-		"Current Focus":           true,
-		"Active Artifacts":        true,
-		"Open Questions":          true,
-		"Key Decisions":           true,
-		"Next Actions":            true,
+		"Current Focus":              true,
+		"Active Artifacts":           true,
+		"Open Questions":             true,
+		"Key Decisions":              true,
+		"Next Actions":               true,
 		"Key Decisions This Session": true,
+	}
+
+	// flushSection writes the accumulated section content to the builder,
+	// applying the per-section character cap.
+	flushSection := func(name string, lines []string) {
+		if name == "" || len(lines) == 0 {
+			return
+		}
+		builder.WriteString("### ")
+		builder.WriteString(name)
+		builder.WriteString("\n")
+
+		charCount := 0
+		for _, l := range lines {
+			lineLen := len(l) + 1 // +1 for the newline we append
+			if charCount+lineLen > workingMemorySectionCap {
+				// Write as much of this line as fits
+				remaining := workingMemorySectionCap - charCount
+				if remaining > 0 {
+					builder.WriteString(l[:remaining])
+				}
+				builder.WriteString("\n[... truncated]\n")
+				return
+			}
+			builder.WriteString(l)
+			builder.WriteString("\n")
+			charCount += lineLen
+		}
+		builder.WriteString("\n")
 	}
 
 	for _, line := range lines {
@@ -448,15 +481,8 @@ func parseWorkingMemory(content string) string {
 		// Check if this is a section header
 		if strings.HasPrefix(trimmed, "# ") {
 			// Flush previous section if it was included
-			if currentSection != "" && len(sectionContent) > 0 {
-				builder.WriteString("### ")
-				builder.WriteString(currentSection)
-				builder.WriteString("\n")
-				for _, l := range sectionContent {
-					builder.WriteString(l)
-					builder.WriteString("\n")
-				}
-				builder.WriteString("\n")
+			if includeSections[currentSection] {
+				flushSection(currentSection, sectionContent)
 			}
 
 			currentSection = strings.TrimPrefix(trimmed, "# ")
@@ -471,14 +497,8 @@ func parseWorkingMemory(content string) string {
 	}
 
 	// Flush final section
-	if currentSection != "" && len(sectionContent) > 0 && includeSections[currentSection] {
-		builder.WriteString("### ")
-		builder.WriteString(currentSection)
-		builder.WriteString("\n")
-		for _, l := range sectionContent {
-			builder.WriteString(l)
-			builder.WriteString("\n")
-		}
+	if includeSections[currentSection] {
+		flushSection(currentSection, sectionContent)
 	}
 
 	return builder.String()
@@ -553,16 +573,19 @@ func loadPeripheralContext(workspaceRoot, currentSessionID string) string {
 		if entry.State != "active" || entry.EventCount == 0 {
 			continue
 		}
-		var lastAt time.Time
-		if entry.LastEventAt != "" {
-			parsed, err := time.Parse(time.RFC3339Nano, entry.LastEventAt)
-			if err == nil {
-				if now.Sub(parsed) > maxAge {
-					continue
-				}
-				lastAt = parsed
-			}
+		// TTL check: skip buses whose last activity is older than maxAge (default 24h).
+		// Also skip buses with missing or unparseable timestamps — treat as stale.
+		if entry.LastEventAt == "" {
+			continue
 		}
+		parsed, err := time.Parse(time.RFC3339Nano, entry.LastEventAt)
+		if err != nil {
+			continue // Unparseable timestamp — treat as stale
+		}
+		if now.Sub(parsed) > maxAge {
+			continue
+		}
+		lastAt := parsed
 		candidates = append(candidates, busCandidate{
 			busID:        entry.BusID,
 			participants: entry.Participants,
