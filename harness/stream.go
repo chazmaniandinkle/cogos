@@ -52,9 +52,10 @@ type UsageData struct {
 
 // SessionInfo represents session metadata in streaming
 type SessionInfo struct {
-	SessionID string   `json:"session_id"`
-	Model     string   `json:"model"`
-	Tools     []string `json:"tools,omitempty"`
+	SessionID       string   `json:"session_id"`
+	Model           string   `json:"model"`
+	Tools           []string `json:"tools,omitempty"`
+	ClaudeSessionID string   `json:"claude_session_id,omitempty"` // Claude CLI session for --resume
 }
 
 // ClaudeStreamMessage represents a message from the Claude CLI stream-json output

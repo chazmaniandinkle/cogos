@@ -120,6 +120,12 @@ type InferenceRequest struct {
 	OpenClawToken string // Auth token for OpenClaw
 	SessionID     string // Session context for tool execution
 
+	// Claude CLI session continuity
+	// When set, the harness passes --resume <ClaudeSessionID> instead of
+	// starting a new session. Claude Code loads the prior conversation from
+	// disk and continues where it left off.
+	ClaudeSessionID string
+
 	// Retry configuration
 	MaxRetries int           // Max retry attempts (0 = use default)
 	Timeout    time.Duration // Request timeout (0 = use default)
@@ -145,6 +151,11 @@ type InferenceResponse struct {
 
 	// Error classification (for smart recovery)
 	ErrorType ErrorType `json:"error_type,omitempty"`
+
+	// Claude CLI session ID returned by the process. Callers should store
+	// this and pass it back as ClaudeSessionID on the next request to
+	// enable --resume continuity.
+	ClaudeSessionID string `json:"claude_session_id,omitempty"`
 }
 
 // ChatMessage represents a message in the chat format.

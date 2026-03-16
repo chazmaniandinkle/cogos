@@ -369,6 +369,9 @@ type InferenceRequest struct {
 	OpenClawToken string // Auth token for OpenClaw
 	SessionID     string // Session context for tool execution
 
+	// Claude CLI session continuity
+	ClaudeSessionID string
+
 	// User identity (propagated from UCP or OpenClaw headers)
 	UserID   string // Canonical user ID (e.g., "chaz")
 	UserName string // Display name (e.g., "Chaz")
@@ -401,6 +404,9 @@ type InferenceResponse struct {
 
 	// Error classification (for smart recovery)
 	ErrorType ErrorType `json:"error_type,omitempty"`
+
+	// Claude CLI session ID for --resume continuity
+	ClaudeSessionID string `json:"claude_session_id,omitempty"`
 }
 
 // StreamChunkInference represents a single chunk in a streaming response
@@ -452,9 +458,10 @@ type UsageData struct {
 
 // SessionInfo represents session metadata in streaming
 type SessionInfo struct {
-	SessionID string   `json:"session_id"`
-	Model     string   `json:"model"`
-	Tools     []string `json:"tools,omitempty"`
+	SessionID       string   `json:"session_id"`
+	Model           string   `json:"model"`
+	Tools           []string `json:"tools,omitempty"`
+	ClaudeSessionID string   `json:"claude_session_id,omitempty"`
 }
 
 // === PROVIDER TYPES ===

@@ -245,11 +245,21 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 		_ = rc.SetWriteDeadline(time.Now().Add(sseWriteWindow))
 	}
 
+	// Guard: busBroker initialized asynchronously in serve_daemon.go
+	if s.busBroker == nil {
+		http.Error(w, "Service starting up", http.StatusServiceUnavailable)
+		return
+	}
+
 	// Subscribe for live events. If the bus is at capacity, the broker
 	// evicts the oldest subscriber to make room — new connections always succeed.
 	ch := make(chan *CogBlock, 64)
 	s.busBroker.subscribe(busID, ch, r.Context())
-	defer s.busBroker.unsubscribe(busID, ch)
+	defer func() {
+		s.busBroker.unsubscribe(busID, ch)
+		log.Printf("[bus-stream] SSE client disconnected for bus=%s (active=%d)",
+			busID, s.busBroker.subscriberCount(busID))
+	}()
 
 	// Resolve per-workspace busChat; fall back to server default.
 	busChat := s.busChat
@@ -280,11 +290,16 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 		if err == nil {
 			var startSeq int64
 			if consumerID != "" {
-				// Cursor-based: get or create cursor, replay from cursor position
-				cursor := s.consumerReg.getOrCreate(busID, consumerID)
-				startSeq = cursor.LastAckedSeq
-				log.Printf("[bus-stream] Consumer %s connected to bus=%s, resuming from seq=%d",
-					consumerID, busID, startSeq)
+				// Guard: consumerReg initialized asynchronously in serve_daemon.go
+				if s.consumerReg == nil {
+					log.Printf("[bus-stream] WARN: consumerReg not yet initialized, skipping cursor for consumer=%s bus=%s", consumerID, busID)
+				} else {
+					// Cursor-based: get or create cursor, replay from cursor position
+					cursor := s.consumerReg.getOrCreate(busID, consumerID)
+					startSeq = cursor.LastAckedSeq
+					log.Printf("[bus-stream] Consumer %s connected to bus=%s, resuming from seq=%d",
+						consumerID, busID, startSeq)
+				}
 			}
 
 			extendDeadline()
@@ -312,24 +327,27 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 
 	ctx := r.Context()
 
+	// Guard: busBroker nil-safe for subscriber count in log lines
+	var activeCount int
+	if s.busBroker != nil {
+		activeCount = s.busBroker.subscriberCount(busID)
+	}
 	if consumerID != "" {
 		log.Printf("[bus-stream] SSE consumer=%s connected for bus=%s (active=%d)",
-			consumerID, busID, s.busBroker.subscriberCount(busID))
+			consumerID, busID, activeCount)
 	} else {
 		log.Printf("[bus-stream] SSE client connected for bus=%s (active=%d)",
-			busID, s.busBroker.subscriberCount(busID))
+			busID, activeCount)
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[bus-stream] SSE client disconnected for bus=%s", busID)
 			return
 
 		case evt, ok := <-ch:
 			if !ok {
 				// Channel closed by broker (evicted as stale) — exit gracefully.
-				log.Printf("[bus-stream] SSE channel closed by broker for bus=%s, disconnecting", busID)
 				return
 			}
 			if evt == nil {
@@ -348,7 +366,10 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 			extendDeadline()
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
-			s.busBroker.touchWrite(busID, ch)
+			// Guard: busBroker nil-safe for touchWrite
+			if s.busBroker != nil {
+				s.busBroker.touchWrite(busID, ch)
+			}
 
 		case <-ticker.C:
 			// SSE comment keep-alive — prevents proxy/client timeout without
@@ -356,7 +377,10 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 			extendDeadline()
 			fmt.Fprintf(w, ": keep-alive\n\n")
 			flusher.Flush()
-			s.busBroker.touchWrite(busID, ch)
+			// Guard: busBroker nil-safe for touchWrite
+			if s.busBroker != nil {
+				s.busBroker.touchWrite(busID, ch)
+			}
 		}
 	}
 }

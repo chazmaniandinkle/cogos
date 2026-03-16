@@ -1,0 +1,144 @@
+# CogOS Multi-Node Local Testing
+#
+# This compose file runs two CogOS nodes locally to test:
+#   - Container deployment (kernel + gateway per node)
+#   - Secret resolution via envspec
+#   - Vaultwarden sidecar on the primary node
+#   - Network separation between nodes
+#
+# Usage:
+#   docker compose -f docker-compose.node.yml up -d
+#   docker compose -f docker-compose.node.yml ps
+#   docker compose -f docker-compose.node.yml logs -f
+#   docker compose -f docker-compose.node.yml down -v
+#
+# Prerequisites:
+#   - Build kernel image: docker build -t cogos/kernel:latest .
+#   - Build gateway image: docker build -t cogos/gateway:latest ../moltbot-gateway/
+#   - Or use: ./scripts/build-node-images.sh
+
+# ── Primary Node ─────────────────────────────────────────────────────────────────
+# Full stack: kernel + gateway + vaultwarden
+
+services:
+  # ── Vaultwarden (Primary only) ──────────────────────────────────────────────
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: cogos-primary-vault
+    ports:
+      - "8222:80"
+    volumes:
+      - vw-data:/data
+    environment:
+      - SIGNUPS_ALLOWED=true
+      - WEBSOCKET_ENABLED=true
+    restart: unless-stopped
+    labels:
+      com.cogos.managed: "true"
+      com.cogos.service: vaultwarden
+      com.cogos.node: primary-local
+
+  # ── Primary Kernel ──────────────────────────────────────────────────────────
+  kernel-primary:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cogos-primary-kernel
+    ports:
+      - "5100:5100"
+    volumes:
+      - primary-cog:/workspace/.cog
+      - ../../CLAUDE.md:/workspace/CLAUDE.md:ro
+      - ../../SOUL.md:/workspace/SOUL.md:ro
+      - ../../USER.md:/workspace/USER.md:ro
+      - ../../IDENTITY.md:/workspace/IDENTITY.md:ro
+    environment:
+      - COG_NODE_ID=primary-local
+      - COG_NODE_TIER=primary
+      - COG_WORKSPACE=cog-workspace
+      - VAULTWARDEN_URL=http://vaultwarden:80
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      - vaultwarden
+    restart: unless-stopped
+    labels:
+      com.cogos.managed: "true"
+      com.cogos.service: kernel
+      com.cogos.node: primary-local
+
+  # ── Primary Gateway ─────────────────────────────────────────────────────────
+  gateway-primary:
+    build:
+      context: ../moltbot-gateway
+      dockerfile: Dockerfile
+    container_name: cogos-primary-gateway
+    ports:
+      - "18789:18789"
+      - "18790:18790"
+    volumes:
+      - primary-cog:/workspace/.cog
+    environment:
+      - COG_NODE_ID=primary-local
+      - COG_KERNEL_URL=http://kernel-primary:5100
+      - DISCORD_TOKEN=${DISCORD_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      - kernel-primary
+    restart: unless-stopped
+    labels:
+      com.cogos.managed: "true"
+      com.cogos.service: gateway
+      com.cogos.node: primary-local
+
+  # ── Secondary Node ─────────────────────────────────────────────────────────────
+  # Standard tier: kernel + gateway (no vaultwarden)
+
+  # ── Secondary Kernel ────────────────────────────────────────────────────────
+  kernel-secondary:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cogos-secondary-kernel
+    ports:
+      - "5101:5100"
+    volumes:
+      - secondary-cog:/workspace/.cog
+      - ../../CLAUDE.md:/workspace/CLAUDE.md:ro
+      - ../../SOUL.md:/workspace/SOUL.md:ro
+    environment:
+      - COG_NODE_ID=secondary-local
+      - COG_NODE_TIER=standard
+      - COG_WORKSPACE=cog-workspace
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    restart: unless-stopped
+    labels:
+      com.cogos.managed: "true"
+      com.cogos.service: kernel
+      com.cogos.node: secondary-local
+
+  # ── Secondary Gateway ───────────────────────────────────────────────────────
+  gateway-secondary:
+    build:
+      context: ../moltbot-gateway
+      dockerfile: Dockerfile
+    container_name: cogos-secondary-gateway
+    ports:
+      - "18791:18789"
+    volumes:
+      - secondary-cog:/workspace/.cog
+    environment:
+      - COG_NODE_ID=secondary-local
+      - COG_KERNEL_URL=http://kernel-secondary:5100
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      - kernel-secondary
+    restart: unless-stopped
+    labels:
+      com.cogos.managed: "true"
+      com.cogos.service: gateway
+      com.cogos.node: secondary-local
+
+volumes:
+  vw-data:
+  primary-cog:
+  secondary-cog:

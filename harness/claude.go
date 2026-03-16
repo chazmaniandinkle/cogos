@@ -52,6 +52,12 @@ func BuildClaudeArgs(req *InferenceRequest) []string {
 		"--verbose",
 	}
 
+	// Session continuity: --resume reloads a prior Claude Code session from
+	// disk, so Claude sees the full conversation history without re-injection.
+	if req.ClaudeSessionID != "" {
+		args = append(args, "--resume", req.ClaudeSessionID)
+	}
+
 	// Always skip permissions in harness mode — the subprocess has no TTY
 	// to prompt for approval. Tool restriction is enforced via --allowed-tools.
 	// (The CRD's dangerouslySkipPermissions field is for direct Claude Code

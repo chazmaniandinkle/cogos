@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/coder/websocket v1.8.14
+	github.com/cogos-dev/cogos/envspec v0.0.0
 	github.com/cogos-dev/cogos/harness v0.0.0
 	github.com/cogos-dev/cogos/sdk v0.0.0
 	github.com/fsnotify/fsnotify v1.7.0
@@ -89,3 +90,5 @@ require (
 replace github.com/cogos-dev/cogos/sdk => ./sdk
 
 replace github.com/cogos-dev/cogos/harness => ./harness
+
+replace github.com/cogos-dev/cogos/envspec => ./envspec

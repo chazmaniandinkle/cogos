@@ -30,9 +30,9 @@ PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64
 # Default: build for current platform
 build: $(BINARY)
 
-GO_SOURCES := $(wildcard *.go)
+GO_SOURCES := $(wildcard *.go) $(wildcard harness/*.go)
 
-$(BINARY): $(GO_SOURCES) go.mod
+$(BINARY): $(GO_SOURCES) go.mod harness/go.mod
 	$(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) .
 
 # Build for all platforms

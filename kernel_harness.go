@@ -189,26 +189,27 @@ func toHarnessContextState(cs *ContextState) *harness.ContextState {
 // toHarnessRequest converts kernel InferenceRequest to harness InferenceRequest
 func toHarnessRequest(req *InferenceRequest) *harness.InferenceRequest {
 	return &harness.InferenceRequest{
-		ID:            req.ID,
-		Prompt:        req.Prompt,
-		SystemPrompt:  req.SystemPrompt,
-		Model:         req.Model,
-		Schema:        req.Schema,
-		MaxTokens:     req.MaxTokens,
-		Origin:        req.Origin,
-		Stream:        req.Stream,
-		Context:       req.Context,
-		ContextState:  toHarnessContextState(req.ContextState),
+		ID:              req.ID,
+		Prompt:          req.Prompt,
+		SystemPrompt:    req.SystemPrompt,
+		Model:           req.Model,
+		Schema:          req.Schema,
+		MaxTokens:       req.MaxTokens,
+		Origin:          req.Origin,
+		Stream:          req.Stream,
+		Context:         req.Context,
+		ContextState:    toHarnessContextState(req.ContextState),
 		Tools:           req.Tools,
 		AllowedTools:    req.AllowedTools,
 		SkipPermissions: req.SkipPermissions,
-		WorkspaceRoot: req.WorkspaceRoot,
-		MCPConfig:     req.MCPConfig,
-		OpenClawURL:   req.OpenClawURL,
-		OpenClawToken: req.OpenClawToken,
-		SessionID:     req.SessionID,
-		MaxRetries:    req.MaxRetries,
-		Timeout:       req.Timeout,
+		WorkspaceRoot:   req.WorkspaceRoot,
+		MCPConfig:       req.MCPConfig,
+		OpenClawURL:     req.OpenClawURL,
+		OpenClawToken:   req.OpenClawToken,
+		SessionID:       req.SessionID,
+		ClaudeSessionID: req.ClaudeSessionID,
+		MaxRetries:      req.MaxRetries,
+		Timeout:         req.Timeout,
 	}
 }
 
@@ -229,6 +230,7 @@ func fromHarnessResponse(resp *harness.InferenceResponse) *InferenceResponse {
 		Error:             resp.Error,
 		ErrorMessage:      resp.ErrorMessage,
 		ErrorType:         ErrorType(resp.ErrorType),
+		ClaudeSessionID:   resp.ClaudeSessionID,
 	}
 	if resp.ContextMetrics != nil {
 		kr.ContextMetrics = &ContextMetrics{
@@ -276,9 +278,10 @@ func fromHarnessStreamChunk(chunk harness.StreamChunkInference) StreamChunkInfer
 	}
 	if chunk.SessionInfo != nil {
 		sc.SessionInfo = &SessionInfo{
-			SessionID: chunk.SessionInfo.SessionID,
-			Model:     chunk.SessionInfo.Model,
-			Tools:     chunk.SessionInfo.Tools,
+			SessionID:       chunk.SessionInfo.SessionID,
+			Model:           chunk.SessionInfo.Model,
+			Tools:           chunk.SessionInfo.Tools,
+			ClaudeSessionID: chunk.SessionInfo.ClaudeSessionID,
 		}
 	}
 	return sc

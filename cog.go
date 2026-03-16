@@ -5692,11 +5692,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			code = 1
 		}
-	case "loop":
-		if err := cmdLoop(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			code = 1
-		}
 	case "workspace", "ws":
 		if err := cmdWorkspace(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

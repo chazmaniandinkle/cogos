@@ -362,23 +362,17 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 	cmd.Env = filteredEnviron()
 	cmd.Dir = h.kernel.ResolveWorkDir(req.WorkspaceRoot)
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		h.registry.Complete(req.ID, "failed")
-		h.emitInferenceError(req.ID, "failed to create stdout pipe: "+err.Error())
-		h.clearInferenceActiveSignal()
-		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
+	// Use Output() instead of StdoutPipe to avoid pipe inheritance issues
+	// where child processes (MCP servers) inherit the pipe FD and keep it open,
+	// causing bufio.Scanner to block forever waiting for EOF.
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
-	if err := cmd.Start(); err != nil {
-		stdout.Close()
-		h.registry.Complete(req.ID, "failed")
-		h.emitInferenceError(req.ID, "failed to start Claude: "+err.Error())
-		h.clearInferenceActiveSignal()
-		return nil, fmt.Errorf("failed to start Claude: %w", err)
+	outputBytes, waitErr := cmd.Output()
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			log.Printf("[harness] Claude CLI failed (exit %d), stderr: %s", exitErr.ExitCode(), stderrBuf.String())
+		}
 	}
 
 	// Collect output
@@ -387,6 +381,7 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 	var cacheReadTokens, cacheCreateTokens int
 	var costUSD float64
 	var finishReason string
+	var claudeSessionID string
 
 	// Debug: capture raw stream if COG_DEBUG_INFERENCE is set
 	debugFile := os.Getenv("COG_DEBUG_INFERENCE")
@@ -399,7 +394,7 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 		}
 	}
 
-	scanner := bufio.NewScanner(stdout)
+	scanner := bufio.NewScanner(bytes.NewReader(outputBytes))
 	buf := make([]byte, 0, 1024*1024)
 	scanner.Buffer(buf, 1024*1024)
 	for scanner.Scan() {
@@ -418,6 +413,18 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 		}
 
 		switch claudeMsg.Type {
+		case "system":
+			// Extract Claude CLI session ID from the init event.
+			// Wire format: {"type":"system","subtype":"init","session_id":"<uuid>",...}
+			var sysMsg struct {
+				Subtype   string `json:"subtype"`
+				SessionID string `json:"session_id,omitempty"`
+			}
+			if err := json.Unmarshal([]byte(line), &sysMsg); err == nil {
+				if sysMsg.Subtype == "init" && sysMsg.SessionID != "" {
+					claudeSessionID = sysMsg.SessionID
+				}
+			}
 		case "assistant":
 			if claudeMsg.Message != nil {
 				for _, c := range claudeMsg.Message.Content {
@@ -481,7 +488,7 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 		}
 	}
 
-	waitErr := cmd.Wait()
+	// cmd.Output() already waits for the process — no separate cmd.Wait() needed
 
 	// OTEL: end CLI span with exit code
 	if waitErr != nil {
@@ -514,6 +521,7 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 		CostUSD:           costUSD,
 		FinishReason:      finishReason,
 		ContextMetrics:    BuildContextMetrics(req.ContextState),
+		ClaudeSessionID:   claudeSessionID,
 	}
 
 	if waitErr != nil {
@@ -993,7 +1001,13 @@ func (h *Harness) RunInferenceStream(req *InferenceRequest) (<-chan StreamChunkI
 							} `json:"usage,omitempty"`
 						}
 						if err := json.Unmarshal(eventData.Message, &msgStart); err == nil {
-							sessionID = msgStart.ID
+							// Only use message ID as session ID if we don't already have a
+							// proper session UUID from the system/init event. message_start IDs
+							// are message IDs (msg_...), not session UUIDs, and can't be used
+							// with --resume.
+							if sessionID == "" {
+								sessionID = msgStart.ID
+							}
 							sessionModel = msgStart.Model
 							if msgStart.Usage != nil {
 								promptTokens = msgStart.Usage.InputTokens
@@ -1029,19 +1043,17 @@ func (h *Harness) RunInferenceStream(req *InferenceRequest) (<-chan StreamChunkI
 			// Handle system/init for session metadata
 			if msgType.Type == "system" {
 				var sysMsg struct {
-					Type    string `json:"type"`
-					Subtype string `json:"subtype,omitempty"`
-					Session *struct {
-						ID    string   `json:"id"`
-						Model string   `json:"model"`
-						Tools []string `json:"tools,omitempty"`
-					} `json:"session,omitempty"`
+					Type      string   `json:"type"`
+					Subtype   string   `json:"subtype,omitempty"`
+					SessionID string   `json:"session_id,omitempty"`
+					Model     string   `json:"model,omitempty"`
+					Tools     []string `json:"tools,omitempty"`
 				}
 				if err := json.Unmarshal([]byte(line), &sysMsg); err == nil {
-					if sysMsg.Subtype == "init" && sysMsg.Session != nil {
-						sessionID = sysMsg.Session.ID
-						sessionModel = sysMsg.Session.Model
-						sessionTools = sysMsg.Session.Tools
+					if sysMsg.Subtype == "init" && sysMsg.SessionID != "" {
+						sessionID = sysMsg.SessionID
+						sessionModel = sysMsg.Model
+						sessionTools = sysMsg.Tools
 						if !safeSend(StreamChunkInference{
 							ID:        req.ID,
 							EventType: "session_info",
@@ -1269,6 +1281,9 @@ func (h *Harness) RunInferenceStream(req *InferenceRequest) (<-chan StreamChunkI
 					CacheReadTokens:   cacheReadTokens,
 					CacheCreateTokens: cacheCreateTokens,
 					CostUSD:           costUSD,
+				},
+				SessionInfo: &SessionInfo{
+					ClaudeSessionID: sessionID, // Return Claude CLI session for --resume on next call
 				},
 			})
 
