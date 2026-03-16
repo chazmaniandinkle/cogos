@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"regexp"
 	"strings"
 )
@@ -35,11 +36,12 @@ func (tp *ThreadParser) Parse(messages []ChatMessage, headers RequestHeaders) (*
 	seenHashes := make(map[string]bool)
 	seenContent := make(map[string]bool) // for starter echo dedup
 
-	for _, msg := range messages {
+	for i, msg := range messages {
 		rawContent := msg.GetContent()
 
 		// System messages get concatenated into SystemPrompt.
 		if msg.Role == "system" {
+			log.Printf("[thread-parser] msg[%d] role=system len=%d (extracted to SystemPrompt)", i, len(rawContent))
 			systemParts = append(systemParts, rawContent)
 			continue
 		}
@@ -47,9 +49,17 @@ func (tp *ThreadParser) Parse(messages []ChatMessage, headers RequestHeaders) (*
 		// Parse the message into a ThreadMessage.
 		tm := tp.parseMessage(msg, rawContent)
 
+		contentPreview := tm.Content
+		if len(contentPreview) > 100 {
+			contentPreview = contentPreview[:100]
+		}
+		log.Printf("[thread-parser] msg[%d] role=%s id=%q starter=%v content_len=%d preview=%q",
+			i, tm.Role, tm.ID, tm.IsStarter, len(tm.Content), contentPreview)
+
 		// Dedup by message ID.
 		if tm.ID != "" {
 			if seenIDs[tm.ID] {
+				log.Printf("[thread-parser] msg[%d] DEDUP by ID %q — skipping", i, tm.ID)
 				continue
 			}
 			seenIDs[tm.ID] = true
@@ -59,6 +69,7 @@ func (tp *ThreadParser) Parse(messages []ChatMessage, headers RequestHeaders) (*
 		if tm.ID == "" && tm.Content != "" {
 			h := contentHash(tm.Content)
 			if seenHashes[h] {
+				log.Printf("[thread-parser] msg[%d] DEDUP by content hash — skipping", i)
 				continue
 			}
 			seenHashes[h] = true
@@ -67,6 +78,7 @@ func (tp *ThreadParser) Parse(messages []ChatMessage, headers RequestHeaders) (*
 		// Thread starter echo dedup: if a starter duplicates earlier content, drop it.
 		if tm.IsStarter {
 			if seenContent[tm.Content] {
+				log.Printf("[thread-parser] msg[%d] DEDUP starter echo — skipping", i)
 				continue
 			}
 		}
@@ -120,6 +132,10 @@ var (
 	// Matches the thread starter prefix
 	reThreadStarter = regexp.MustCompile(`^\[Thread starter - for context\]\s*`)
 
+	// Matches the separator between starter context and a new user message.
+	// The Pi SDK separates them with 3+ blank lines (4+ consecutive newlines).
+	reStarterSeparator = regexp.MustCompile(`\n{4,}`)
+
 	// Matches [[reply_to_current]] prefix in assistant messages
 	reReplyPrefix = regexp.MustCompile(`^\[\[reply_to_current\]\]\s*`)
 )
@@ -151,11 +167,9 @@ func (tp *ThreadParser) parseMessage(msg ChatMessage, rawContent string) ThreadM
 
 	content := rawContent
 
-	// Detect thread starter.
-	if reThreadStarter.MatchString(content) {
-		tm.IsStarter = true
-		content = reThreadStarter.ReplaceAllString(content, "")
-	}
+	// Extract metadata BEFORE thread starter detection, because the Pi SDK
+	// prepends "Conversation info" blocks before the [Thread starter] prefix.
+	// Without stripping metadata first, the ^ anchor in reThreadStarter fails.
 
 	// Extract conversation info metadata.
 	if match := reConversationInfo.FindStringSubmatch(content); len(match) > 1 {
@@ -193,6 +207,29 @@ func (tp *ThreadParser) parseMessage(msg ChatMessage, rawContent string) ThreadM
 
 	// Strip <<<EXTERNAL_UNTRUSTED_CONTENT>>> blocks.
 	content = reExternalBlock.ReplaceAllString(content, "")
+
+	// Trim before thread starter check so the ^ anchor works after metadata removal.
+	content = strings.TrimSpace(content)
+
+	// Detect thread starter (now that metadata is stripped).
+	// The Pi SDK/OpenClaw sends compound messages like:
+	//   [Thread starter - for context]\n<original topic>\n\n\n\n\n\n<actual new message>
+	// When there's a new message after the starter content, extract it as the
+	// primary content and demote the starter portion to metadata.
+	if reThreadStarter.MatchString(content) {
+		content = reThreadStarter.ReplaceAllString(content, "")
+		// Check for compound format: starter content + blank lines + new message.
+		if parts := reStarterSeparator.Split(content, 2); len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+			// Compound message: store starter context, use new message as content.
+			tm.Metadata["thread_starter_context"] = strings.TrimSpace(parts[0])
+			content = parts[1]
+			log.Printf("[thread-parser] split compound starter: starter_ctx=%d bytes, new_msg=%d bytes",
+				len(parts[0]), len(parts[1]))
+		} else {
+			// Pure starter with no new message appended.
+			tm.IsStarter = true
+		}
+	}
 
 	// Strip [[reply_to_current]] prefix from assistant messages.
 	if msg.Role == "assistant" {

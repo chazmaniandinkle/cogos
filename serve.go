@@ -301,6 +301,11 @@ func (s *serveServer) Start() error {
 		WriteTimeout: 5 * time.Minute, // Long timeout for streaming
 	}
 
+	// Start SSE connection reaper (belt: sweeps stale connections every 30s)
+	reaperCtx, reaperCancel := context.WithCancel(context.Background())
+	defer reaperCancel()
+	s.busBroker.startReaper(reaperCtx)
+
 	// Graceful shutdown / OCI re-exec
 	done := make(chan bool, 1)
 	quit := make(chan os.Signal, 1)

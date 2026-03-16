@@ -122,38 +122,52 @@ func TestExtractGoalEmpty(t *testing.T) {
 func TestLoadWorkingMemory(t *testing.T) {
 	root := t.TempDir()
 
-	// Create working memory at the correct path
-	memDir := filepath.Join(root, ".cog", "mem")
-	os.MkdirAll(memDir, 0o755)
-	os.WriteFile(filepath.Join(memDir, "working.cog.md"), []byte(`---
-title: Working Memory
+	// Create session-scoped working memory
+	sessDir := filepath.Join(root, ".cog", "mem", "episodic", "sessions", "test-session")
+	os.MkdirAll(sessDir, 0o755)
+	os.WriteFile(filepath.Join(sessDir, "working.cog.md"), []byte(`---
+type: working-memory
 ---
 # Current Focus
-Testing the pipeline
+Session-scoped test
 
 # Next Actions
 - Write more tests
 `), 0o644)
 
-	result := loadWorkingMemory(root)
-
+	result := loadWorkingMemory(root, "test-session")
 	if result == "" {
 		t.Fatal("loadWorkingMemory returned empty")
 	}
-	if !containsCI(result, "Testing the pipeline") {
+	if !containsCI(result, "Session-scoped test") {
 		t.Errorf("loadWorkingMemory missing expected content, got: %s", result)
+	}
+
+	// Default session fallback
+	defaultDir := filepath.Join(root, ".cog", "mem", "episodic", "sessions", "_default")
+	os.MkdirAll(defaultDir, 0o755)
+	os.WriteFile(filepath.Join(defaultDir, "working.cog.md"), []byte(`---
+type: working-memory
+---
+# Current Focus
+Default session test
+`), 0o644)
+
+	defaultResult := loadWorkingMemory(root, "")
+	if !containsCI(defaultResult, "Default session test") {
+		t.Errorf("default session loadWorkingMemory missing content, got: %s", defaultResult)
 	}
 }
 
 func TestLoadWorkingMemoryMissing(t *testing.T) {
-	result := loadWorkingMemory("/nonexistent/workspace")
+	result := loadWorkingMemory("/nonexistent/workspace", "some-session")
 	if result != "" {
 		t.Errorf("loadWorkingMemory for missing file should return empty, got: %q", result)
 	}
 }
 
 func TestLoadWorkingMemoryEmptyRoot(t *testing.T) {
-	result := loadWorkingMemory("")
+	result := loadWorkingMemory("", "")
 	if result != "" {
 		t.Errorf("loadWorkingMemory('') should return empty, got: %q", result)
 	}

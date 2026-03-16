@@ -228,8 +228,8 @@ func getStartTimeFromPID(pid int) (time.Time, error) {
 	if timeStr == "" {
 		return time.Time{}, fmt.Errorf("empty output")
 	}
-	// Try parsing with standard format
-	t, err := time.Parse("Mon Jan _2 15:04:05 2006", timeStr)
+	// Parse in local timezone — ps lstart returns local time
+	t, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", timeStr, time.Local)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -675,6 +675,16 @@ func cmdServeForeground(port int) int {
 	stopOCIWatch := server.startOCIWatcher()
 	defer stopOCIWatch()
 
+	// Write PID file so `cog serve status` works regardless of how the
+	// server was launched (foreground, `cog serve start`, or launchd).
+	if pidFile, _, _, pidErr := getDaemonPaths(); pidErr == nil {
+		if writeErr := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0644); writeErr != nil {
+			log.Printf("[serve] warning: failed to write PID file: %v", writeErr)
+		} else {
+			defer os.Remove(pidFile)
+		}
+	}
+
 	if err := server.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
@@ -827,6 +837,7 @@ func cmdServeStatus(port int) int {
 
 	if running {
 		fmt.Printf("Status:      \033[32mRUNNING\033[0m\n")
+		fmt.Printf("Version:     %s\n", Version)
 		fmt.Printf("PID:         %d\n", pid)
 		fmt.Printf("Port:        %d\n", port)
 

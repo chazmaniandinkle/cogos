@@ -116,8 +116,8 @@ func RetrieveTemporalContext(messages []ChatMessage, sessionID string, workspace
 	// Extract goal from recent user messages
 	goal = extractGoal(messages, cfg.Temporal.GoalKeywords)
 
-	// Load working memory
-	workingMemory := loadWorkingMemory(workspaceRoot)
+	// Load working memory (session-scoped)
+	workingMemory := loadWorkingMemory(workspaceRoot, sessionID)
 
 	// Build temporal context
 	var builder strings.Builder
@@ -392,14 +392,20 @@ func extractQuestionGoal(question string) string {
 	return "understand: " + question
 }
 
-// loadWorkingMemory loads the current working memory file if it exists.
-func loadWorkingMemory(workspaceRoot string) string {
+// loadWorkingMemory loads the session-scoped working memory file if it exists.
+// Falls back to the global path during transition period.
+func loadWorkingMemory(workspaceRoot, sessionID string) string {
 	if workspaceRoot == "" {
 		return ""
 	}
 
-	// Try primary location
-	workingPath := filepath.Join(workspaceRoot, ".cog", "mem", "working.cog.md")
+	// Session-scoped path (primary)
+	if sessionID == "" {
+		sessionID = "_default"
+	}
+	workingPath := filepath.Join(workspaceRoot, ".cog", "mem", "episodic", "sessions", sessionID, "working.cog.md")
+
+	// Legacy global path removed — session-scoped is now canonical.
 
 	data, err := os.ReadFile(workingPath)
 	if err != nil {

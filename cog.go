@@ -33,7 +33,7 @@ import (
 
 // === VERSION & BUILD INFO ===
 
-const Version = "2.1.1"
+const Version = "2.3.2"
 
 var BuildTime = "unknown" // Injected at build time
 

@@ -29,23 +29,25 @@ type busEventEnvelope struct {
 	Data      *CogBlock `json:"data"`
 }
 
-// maxSSEPerBus limits the number of concurrent SSE subscribers per bus.
-// The openclaw-gateway opens many concurrent EventSource connections
-// (one per UI component, reconnection storm after kernel re-exec), so
-// this must be generous. Localhost-only, no external risk.
-const maxSSEPerBus = 50
+// maxSSEPerBus is the hard cap on concurrent SSE subscribers per bus.
+// New connections are rejected (HTTP 429) when at capacity — no eviction cascade.
+const maxSSEPerBus = 25
 
 // sseIdleTimeout is the maximum duration a subscriber can go without a
-// successful write before it is considered stale and eligible for eviction.
-// Short timeout helps recover from reconnection storms where old
-// EventSource instances are abandoned without closing.
+// successful write before the reaper closes it. The reaper runs every
+// sseReaperInterval and sweeps all buses.
 const sseIdleTimeout = 2 * time.Minute
+
+// sseReaperInterval is how often the background reaper sweeps for stale
+// SSE connections across all buses.
+const sseReaperInterval = 30 * time.Second
 
 // sseSubscriber tracks per-connection metadata for liveness detection.
 type sseSubscriber struct {
-	ch        chan *CogBlock
-	ctx       context.Context // request context — Done() when client disconnects
-	lastWrite time.Time       // last successful event/heartbeat write
+	ch         chan *CogBlock
+	ctx        context.Context // request context — Done() when client disconnects
+	lastWrite  time.Time       // last successful event/heartbeat write
+	consumerID string          // optional consumer identity for dedup
 }
 
 // busEventBroker manages SSE subscribers for real-time bus event delivery.
@@ -60,30 +62,99 @@ func newBusEventBroker() *busEventBroker {
 	}
 }
 
+// startReaper launches a background goroutine that periodically sweeps stale
+// SSE connections across all buses. This is the "belt" — catches abandoned
+// connections regardless of whether new ones are arriving.
+func (b *busEventBroker) startReaper(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(sseReaperInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reaped := b.sweepAll()
+				if reaped > 0 {
+					log.Printf("[bus-stream] reaper: closed %d stale connections", reaped)
+				}
+			}
+		}
+	}()
+}
+
+// sweepAll sweeps stale/dead subscribers across ALL buses.
+func (b *busEventBroker) sweepAll() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	total := 0
+	for busID := range b.subscribers {
+		now := time.Now()
+		subs := b.subscribers[busID]
+		for ch, sub := range subs {
+			dead := false
+			select {
+			case <-sub.ctx.Done():
+				dead = true
+			default:
+			}
+			if !dead && now.Sub(sub.lastWrite) > sseIdleTimeout {
+				dead = true
+			}
+			if dead {
+				delete(subs, ch)
+				close(ch)
+				total++
+			}
+		}
+		if len(subs) == 0 {
+			delete(b.subscribers, busID)
+		}
+	}
+	return total
+}
+
 // subscribe registers a channel to receive events for a given bus.
-// If the bus is at the connection limit, it sweeps stale/dead subscribers
-// first, then evicts the oldest subscriber to make room. New connections
-// always succeed — this prevents any single client from monopolizing all slots.
-func (b *busEventBroker) subscribe(busID string, ch chan *CogBlock, ctx context.Context) bool {
+// If consumerID is non-empty, any existing subscription with the same
+// consumer identity is evicted first (prevents reconnection storms from
+// accumulating zombie connections). If the bus is at the connection limit,
+// it sweeps stale/dead subscribers first, then evicts the oldest to make room.
+func (b *busEventBroker) subscribe(busID string, ch chan *CogBlock, ctx context.Context, consumerID string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.subscribers[busID] == nil {
 		b.subscribers[busID] = make(map[chan *CogBlock]*sseSubscriber)
 	}
 
+	// Consumer-identity dedup: close previous connection from same consumer.
+	if consumerID != "" {
+		for oldCh, sub := range b.subscribers[busID] {
+			if sub.consumerID == consumerID {
+				delete(b.subscribers[busID], oldCh)
+				close(oldCh)
+				log.Printf("[bus-stream] replaced previous connection for consumer=%s bus=%s",
+					consumerID, busID)
+				break
+			}
+		}
+	}
+
+	// At capacity? Sweep stale connections first.
 	if len(b.subscribers[busID]) >= maxSSEPerBus {
 		b.sweepLocked(busID)
 	}
 
-	// If still at limit after sweep, evict the oldest subscriber
+	// Hard cap: reject if still at capacity after sweep (suspenders).
 	if len(b.subscribers[busID]) >= maxSSEPerBus {
-		b.evictOldestLocked(busID)
+		log.Printf("[bus-stream] REJECT: bus=%s at capacity (%d), new connection refused", busID, maxSSEPerBus)
+		return false
 	}
 
 	b.subscribers[busID][ch] = &sseSubscriber{
-		ch:        ch,
-		ctx:       ctx,
-		lastWrite: time.Now(),
+		ch:         ch,
+		ctx:        ctx,
+		lastWrite:  time.Now(),
+		consumerID: consumerID,
 	}
 	return true
 }
@@ -117,32 +188,6 @@ func (b *busEventBroker) sweepLocked(busID string) {
 	}
 	if len(subs) == 0 {
 		delete(b.subscribers, busID)
-	}
-}
-
-// evictOldestLocked removes the subscriber with the oldest lastWrite time.
-// Caller must hold b.mu (write lock).
-func (b *busEventBroker) evictOldestLocked(busID string) {
-	subs, ok := b.subscribers[busID]
-	if !ok || len(subs) == 0 {
-		return
-	}
-
-	var oldestCh chan *CogBlock
-	var oldestTime time.Time
-	first := true
-	for ch, sub := range subs {
-		if first || sub.lastWrite.Before(oldestTime) {
-			oldestCh = ch
-			oldestTime = sub.lastWrite
-			first = false
-		}
-	}
-	if oldestCh != nil {
-		delete(subs, oldestCh)
-		close(oldestCh)
-		log.Printf("[bus-stream] evicted oldest SSE subscriber for bus=%s (age=%s)",
-			busID, time.Since(oldestTime).Round(time.Second))
 	}
 }
 
@@ -251,10 +296,12 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Subscribe for live events. If the bus is at capacity, the broker
-	// evicts the oldest subscriber to make room — new connections always succeed.
+	// Subscribe for live events. Rejected with 429 if at hard cap.
 	ch := make(chan *CogBlock, 64)
-	s.busBroker.subscribe(busID, ch, r.Context())
+	if !s.busBroker.subscribe(busID, ch, r.Context(), consumerID) {
+		http.Error(w, "Too many SSE connections for this bus", http.StatusTooManyRequests)
+		return
+	}
 	defer func() {
 		s.busBroker.unsubscribe(busID, ch)
 		log.Printf("[bus-stream] SSE client disconnected for bus=%s (active=%d)",
