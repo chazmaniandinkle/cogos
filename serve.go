@@ -80,6 +80,10 @@ type serveServer struct {
 	claudeSessionStore   map[string]string
 	claudeSessionStoreMu sync.RWMutex
 
+	// Lifecycle manager: tracks inference sessions for hook dispatch (identity
+	// injection on first turn, working memory updates after each turn).
+	lifecycle *LifecycleManager
+
 	// OCI auto-reload: kernel watches .cog/oci/index.json for new digests
 	ociStore  *OCIStore  // nil if no OCI layout exists
 	ociDigest string     // manifest digest at startup (for comparison)
@@ -95,6 +99,7 @@ func newServeServer(port int, kernel *sdk.Kernel) *serveServer {
 		toolBridge:         NewToolBridge(),
 		contextEngine:      NewContextEngine(root),
 		claudeSessionStore: make(map[string]string),
+		lifecycle:          NewLifecycleManager(),
 	}
 }
 

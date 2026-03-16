@@ -77,13 +77,16 @@ import (
 // CLI from within a Claude Code session (e.g. during development/testing).
 func filteredEnviron() []string {
 	env := os.Environ()
-	out := make([]string, 0, len(env))
+	out := make([]string, 0, len(env)+1)
 	for _, e := range env {
 		if strings.HasPrefix(e, "CLAUDECODE=") {
 			continue
 		}
 		out = append(out, e)
 	}
+	// Signal to Python hooks that they're running under the CogOS kernel,
+	// so they can skip context injection (the kernel handles it natively).
+	out = append(out, "COGOS_HARNESS=1")
 	return out
 }
 

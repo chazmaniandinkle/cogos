@@ -11,7 +11,7 @@
 #   make install  - Install to ~/.cog/bin/cogos
 #   make push     - Build + push to OCI layout (triggers kernel auto-reload)
 
-VERSION := 2.3.2
+VERSION := 2.4.0
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w -X main.BuildTime=$(BUILD_TIME)
 BUILD_TAGS := fts5

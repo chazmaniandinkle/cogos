@@ -139,15 +139,46 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		sessionID = r.Header.Get("X-Eidolon-ID")
 	}
 
-	// Auto-derive session from origin when no explicit session provided.
-	// This enables bus event emission for gateway-routed requests (e.g. OpenClaw→Discord)
-	// that don't send X-Session-ID. All requests from the same origin share one bus.
+	// Auto-derive session from origin + agent identity when no explicit session provided.
+	// Different agents (e.g., Cog vs Whirl) get separate Claude sessions even when
+	// both route through the same OpenClaw gateway with the same origin.
 	if sessionID == "" {
 		origin := r.Header.Get("X-Origin")
 		if origin == "" {
 			origin = "http"
 		}
-		sessionID = origin
+		// Include agent name in session key so different agents don't share sessions
+		if ucpContext != nil && ucpContext.Identity != nil && ucpContext.Identity.Name != "" {
+			sessionID = origin + ":" + strings.ToLower(ucpContext.Identity.Name)
+		} else {
+			sessionID = origin
+		}
+	}
+
+	// === LIFECYCLE: track session and inject first-turn context ===
+	lcOrigin := r.Header.Get("X-Origin")
+	if lcOrigin == "" {
+		lcOrigin = "http"
+	}
+	lcAgentName := ""
+	if ucpContext != nil && ucpContext.Identity != nil {
+		lcAgentName = strings.ToLower(ucpContext.Identity.Name)
+	}
+
+	lcSession, isFirstTurn := s.lifecycle.GetOrCreate(sessionID, lcOrigin, lcAgentName)
+
+	if isFirstTurn {
+		sessionCtx := LoadSessionContext(workspaceRoot, lcSession)
+		if sessionCtx != "" {
+			if systemPrompt == "" {
+				systemPrompt = sessionCtx
+			} else {
+				systemPrompt = sessionCtx + "\n\n---\n\n" + systemPrompt
+			}
+		}
+		if err := CreateWorkingMemory(workspaceRoot, sessionID); err != nil {
+			log.Printf("[lifecycle] Failed to create working memory: %v", err)
+		}
 	}
 
 	// Persist user message to thread (substrate-based memory)
@@ -850,6 +881,18 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 				s.checkSummarization(sessionID)
 			}
 
+			// Lifecycle: record turn and update working memory
+			claudeSessionForLC := ""
+			if chunk.SessionInfo != nil {
+				claudeSessionForLC = chunk.SessionInfo.ClaudeSessionID
+			}
+			s.lifecycle.RecordTurn(sessionID, claudeSessionForLC)
+			if accumulatedContent.Len() > 0 {
+				if err := UpdateWorkingMemory(s.kernel.Root(), sessionID, accumulatedContent.String()); err != nil {
+					log.Printf("[lifecycle] Failed to update working memory: %v", err)
+				}
+			}
+
 			// Build usage info if available
 			var usageInfo *UsageInfo
 			if chunk.Usage != nil {
@@ -1025,6 +1068,14 @@ func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq
 
 	// Check if thread needs summarization
 	s.checkSummarization(sessionID)
+
+	// Lifecycle: record turn and update working memory
+	s.lifecycle.RecordTurn(sessionID, resp.ClaudeSessionID)
+	if resp.Content != "" {
+		if err := UpdateWorkingMemory(s.kernel.Root(), sessionID, resp.Content); err != nil {
+			log.Printf("[lifecycle] Failed to update working memory: %v", err)
+		}
+	}
 
 	model := inferReq.Model
 	if model == "" {
