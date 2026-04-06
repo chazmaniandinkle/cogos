@@ -47,33 +47,40 @@ func TestLoadNucleusIdentityName(t *testing.T) {
 	}
 }
 
-func TestLoadNucleusMissingIdentityConfig(t *testing.T) {
+func TestLoadNucleusFallsBackToDefault(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	// No .cog/config/identity.yaml.
+	// No .cog/config/identity.yaml — should fall back to embedded default.
 	cfg := &Config{
 		WorkspaceRoot: root,
 		CogDir:        filepath.Join(root, ".cog"),
 	}
-	_, err := LoadNucleus(cfg)
-	if err == nil {
-		t.Error("expected error for missing identity config")
+	n, err := LoadNucleus(cfg)
+	if err != nil {
+		t.Fatalf("expected fallback to embedded default, got error: %v", err)
+	}
+	if n.Name != "CogOS" {
+		t.Errorf("expected default identity name 'CogOS', got %q", n.Name)
 	}
 }
 
-func TestLoadNucleusMissingIdentityCard(t *testing.T) {
+func TestLoadNucleusMissingCardFallsBack(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".cog", "config"), 0755); err != nil {
 		t.Fatal(err)
 	}
+	// Config points to a nonexistent identity — should fall back to embedded default.
 	writeTestFile(t, filepath.Join(root, ".cog", "config", "identity.yaml"),
 		"default_identity: nobody\nidentity_directory: identities\n")
 
 	cfg := &Config{WorkspaceRoot: root, CogDir: filepath.Join(root, ".cog")}
-	_, err := LoadNucleus(cfg)
-	if err == nil {
-		t.Error("expected error for missing identity card")
+	n, err := LoadNucleus(cfg)
+	if err != nil {
+		t.Fatalf("expected fallback to embedded default, got error: %v", err)
+	}
+	if n.Name != "CogOS" {
+		t.Errorf("expected fallback name 'CogOS', got %q", n.Name)
 	}
 }
 
