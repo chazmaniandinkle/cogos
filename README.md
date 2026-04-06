@@ -191,7 +191,7 @@ v3 kernel — ground-up rewrite after a year of daily use across multiple agent 
 
 Working: continuous process, foveated context, hash-chained ledger, multi-provider routing, MCP server, blob store, salience scoring, OpenAI/Anthropic compatibility, workspace scaffolding, e2e testing, web dashboard, OpenTelemetry.
 
-Next: memory consolidation loop, multi-agent process management, Constellation integration for cross-node trust, `cog` CLI.
+Next: Constellation protocol integration with kernel, memory consolidation loop, multi-agent process management, `cog` CLI.
 
 ## Deeper
 

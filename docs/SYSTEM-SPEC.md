@@ -71,9 +71,9 @@ The substrate provides what transient sessions do not: persistent memory, verifi
 
 Append-only, hash-chained (SHA-256, RFC 8785), and complete. The historical record of what occurred. Optimized for append, replay, and integrity verification. Each ledger entry is a CogBlock. Each CogBlock is a BEP block — the same hash, the same content, replicable across nodes.
 
-### Memory
+### Memory (HMD — Hierarchical Memory Domains)
 
-A materialized, indexed, salience-weighted view over accumulated substrate knowledge. Optimized for retrieval and read-time decay, not historical completeness. Consolidation is the ETL bridge between ledger and memory.
+A materialized, indexed, salience-weighted view over accumulated substrate knowledge, organized into four sectors: semantic, episodic, procedural, and reflective. Optimized for retrieval and read-time decay, not historical completeness. Consolidation is the ETL bridge between ledger and memory.
 
 ### Context engine
 
