@@ -49,27 +49,74 @@ CogOS fixes this by running as a background daemon that maintains continuous cog
 │                                                          │
 │  ┌──────────────────────────────────────────────────┐    │
 │  │              Inference Providers                   │    │
-│  │   Anthropic · Ollama · Claude Code · OpenRouter   │    │
+│  │   Anthropic · Ollama · Claude Code · Codex        │    │
 │  └──────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────┘
 ```
 
+## Project Layout
+
+```
+cmd/cogos/              Entry point
+internal/engine/        Kernel implementation
+  process.go            Four-state cognitive loop
+  nucleus.go            Always-loaded identity context
+  context_assembly.go   Foveated context engine
+  serve.go              HTTP API server
+  ledger.go             Hash-chained event log
+  router.go             Multi-provider inference routing
+  provider.go           Provider interface
+  provider_anthropic.go Anthropic API provider
+  provider_ollama.go    Ollama local inference provider
+  provider_claudecode.go Claude Code agentic provider
+  provider_codex.go     OpenAI Codex provider
+  mcp_server.go         MCP Streamable HTTP server
+  salience.go           Git-derived attention scoring
+  coherence.go          4-layer validation stack
+  blobstore.go          Content-addressed storage
+  field.go              Continuous salience map
+  gate.go               Event routing into fovea
+  web/                  Embedded dashboard HTML
+docs/
+  MCP-SPEC.md           MCP server specification
+  PROVIDER-SPEC.md      Provider contract specification
+  writing-a-provider.md Guide for writing custom providers
+```
+
 ## Key Components
 
-| Component | File(s) | What it does |
-|-----------|---------|-------------|
-| **Nucleus** | `nucleus.go` | Always-loaded identity context that is never evicted from the context window |
-| **Process** | `process.go` | Four-state cognitive loop (Active → Receptive → Consolidating → Dormant) that runs independently of requests |
-| **Context Assembly** | `context_assembly.go` | Foveated context engine that scores and ranks CogDocs and conversation history into stability-ordered zones within a token budget |
-| **Ledger** | `ledger.go` | Append-only, hash-chained (SHA-256) event log for tamper-evident decision auditing |
-| **Router** | `router.go` | Multi-provider inference routing with local-first sovereignty gradient and capability-based selection |
-| **Salience** | `salience.go` | Git-derived attention scoring — uses commit frequency, recency, and file topology to score what matters |
-| **Coherence** | `coherence.go` | Four-layer validation stack for internal consistency checking |
-| **Blob Store** | `blobstore.go` | Content-addressed storage for ingested documents and artifacts |
-| **MCP Server** | `mcp_server.go` | Streamable HTTP MCP endpoint using the official Go SDK, exposing memory, context, and tool operations |
-| **Providers** | `provider_*.go` | Anthropic, Ollama, Claude Code, and Codex provider implementations with streaming support |
-| **Field** | `field.go` | Continuous salience map over the memory corpus |
-| **Gate** | `gate.go` | Event routing into the attentional fovea |
+| Component | What it does |
+|-----------|-------------|
+| **Nucleus** | Always-loaded identity context that is never evicted from the context window |
+| **Process** | Four-state cognitive loop (Active / Receptive / Consolidating / Dormant) that runs independently of requests |
+| **Context Assembly** | Foveated context engine that scores and ranks CogDocs and conversation history into stability-ordered zones within a token budget |
+| **Ledger** | Append-only, hash-chained (SHA-256) event log for tamper-evident decision auditing |
+| **Router** | Multi-provider inference routing with local-first sovereignty gradient and capability-based selection |
+| **Salience** | Git-derived attention scoring — uses commit frequency, recency, and file topology to score what matters |
+| **Coherence** | Four-layer validation stack for internal consistency checking |
+| **Blob Store** | Content-addressed storage for ingested documents and artifacts |
+| **MCP Server** | Streamable HTTP MCP endpoint using the official Go SDK, exposing memory, context, and tool operations |
+| **Field** | Continuous salience map over the memory corpus |
+| **Gate** | Event routing into the attentional fovea |
+
+## Providers
+
+CogOS ships with four inference providers:
+
+| Provider | Backend | Notes |
+|----------|---------|-------|
+| **Anthropic** | Claude API | Direct API calls, streaming SSE, prompt caching |
+| **Ollama** | Local models | On-device inference via OpenAI-compatible endpoint |
+| **Claude Code** | Claude CLI | Agentic — spawns subprocesses with their own tool loop |
+| **Codex** | OpenAI Codex CLI | Code-focused agentic provider |
+
+The provider interface is designed for extensibility. Writing a new provider (Gemini, vLLM, MLX, etc.) means implementing six methods. See [docs/writing-a-provider.md](docs/writing-a-provider.md) for the full guide.
+
+The router handles provider selection automatically:
+- **Sovereignty gradient** — local providers are scored higher than cloud by default
+- **Capability filtering** — only routes to providers that support what the request needs (streaming, tool use, vision, etc.)
+- **Cost-aware routing** — factors in per-token cost when selecting providers
+- **Fallback chains** — tries the next provider if the preferred one fails
 
 ## API
 
@@ -120,11 +167,11 @@ make run
 
 - **Foveated context assembly.** Instead of naively stuffing the context window, the engine scores every piece of available context (CogDocs, conversation history, identity) and renders them into stability-ordered zones optimized for KV cache reuse.
 
-- **Provider-agnostic.** The same daemon can route to Anthropic, Ollama, Claude Code's built-in model, or OpenRouter — selected per-request based on task requirements and provider capabilities.
+- **Provider-agnostic.** The same daemon can route to Anthropic, Ollama, Claude Code, or Codex — selected per-request based on task requirements and provider capabilities. New providers can be added by implementing the `Provider` interface.
 
 ## Project Status
 
-CogOS is in active development. The v3 kernel (this repo) is the current architecture — a ground-up rewrite focused on the continuous process model.
+CogOS is in active development. The kernel (this repo) is the current architecture — a ground-up rewrite focused on the continuous process model.
 
 - [x] Continuous process state machine with four operational states
 - [x] Foveated context assembly with stability zones
@@ -136,6 +183,7 @@ CogOS is in active development. The v3 kernel (this repo) is the current archite
 - [x] OpenAI and Anthropic API compatibility
 - [x] Embedded web dashboard
 - [x] OpenTelemetry instrumentation
+- [ ] `cog init` — workspace scaffolding and onboarding
 - [ ] Persistent memory consolidation loop
 - [ ] Multi-agent process management
 - [ ] Sentinel (routing feedback) training pipeline
