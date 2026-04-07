@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -181,4 +183,80 @@ func TestProcessEmitsStartEvent(t *testing.T) {
 	if events[0].HashedPayload.Type != "process.start" {
 		t.Errorf("first event type = %q; want process.start", events[0].HashedPayload.Type)
 	}
+}
+
+func TestProcessIngestsTailerBlockIntoLedger(t *testing.T) {
+	t.Parallel()
+
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	p := NewProcess(cfg, makeNucleus("T", "r"))
+
+	tailerOut := make(chan CogBlock, 1)
+	manager := NewTailerManager(tailerOut)
+	if err := manager.Register(&singleBlockTailer{block: CogBlock{
+		ID:            "mock-block-1",
+		Kind:          BlockMessage,
+		SourceChannel: "mock",
+		Timestamp:     time.Now().UTC(),
+	}}, "/tmp/mock.jsonl"); err != nil {
+		t.Fatalf("Register mock tailer: %v", err)
+	}
+	p.tailerManager = manager
+	p.tailerCh = tailerOut
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+
+	eventsPath := filepath.Join(root, ".cog", "ledger", p.SessionID(), "events.jsonl")
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+
+	found := false
+	for !found {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("timed out waiting for tailer ingestion event")
+		case <-tick.C:
+			if _, err := os.Stat(eventsPath); err != nil {
+				continue
+			}
+			events := mustReadAllEvents(t, root, p.SessionID())
+			for _, event := range events {
+				if event.HashedPayload.Type == "cogblock.ingest" && event.HashedPayload.Data["block_id"] == "mock-block-1" {
+					found = true
+					break
+				}
+			}
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error on cancel: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not stop after context cancellation")
+	}
+}
+
+type singleBlockTailer struct {
+	block CogBlock
+}
+
+func (s *singleBlockTailer) Name() string { return "mock" }
+
+func (s *singleBlockTailer) Tail(ctx context.Context, path string, out chan<- CogBlock) error {
+	select {
+	case out <- s.block:
+	case <-ctx.Done():
+		return nil
+	}
+	<-ctx.Done()
+	return nil
 }

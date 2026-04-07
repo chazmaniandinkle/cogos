@@ -7,7 +7,7 @@ providers:
     type: ollama
     enabled: true
     endpoint: "http://localhost:11434"
-    model: "llama3.2"
+    model: "gemma4:e4b"
     timeout: 120
     context_window: 128000
 

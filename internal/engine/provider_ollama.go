@@ -18,6 +18,41 @@ import (
 	"time"
 )
 
+const defaultOllamaModel = "gemma4:e4b"
+
+type ollamaModelProfile struct {
+	Capabilities     []Capability
+	MaxContextTokens int
+	MaxOutputTokens  int
+}
+
+var ollamaModelProfiles = map[string]ollamaModelProfile{
+	"gemma4:e4b": {
+		Capabilities:     []Capability{CapStreaming, CapJSON, CapToolCallValidation},
+		MaxContextTokens: 128000,
+		MaxOutputTokens:  4096,
+	},
+	"gemma4:e2b": {
+		Capabilities:     []Capability{CapStreaming, CapJSON, CapToolCallValidation},
+		MaxContextTokens: 128000,
+		MaxOutputTokens:  4096,
+	},
+	"qwen3.5:9b": {
+		Capabilities:    []Capability{CapStreaming, CapJSON},
+		MaxOutputTokens: 4096,
+	},
+}
+
+func lookupOllamaModelProfile(model string) ollamaModelProfile {
+	if profile, ok := ollamaModelProfiles[model]; ok {
+		return profile
+	}
+	return ollamaModelProfile{
+		Capabilities:    []Capability{CapStreaming, CapJSON},
+		MaxOutputTokens: 4096,
+	}
+}
+
 // OllamaProvider implements Provider against a local Ollama server.
 type OllamaProvider struct {
 	name          string
@@ -84,14 +119,22 @@ func (p *OllamaProvider) Available(ctx context.Context) bool {
 
 // Capabilities returns what Ollama supports.
 func (p *OllamaProvider) Capabilities() ProviderCapabilities {
+	profile := lookupOllamaModelProfile(p.model)
 	ctxTokens := p.contextWindow
 	if ctxTokens <= 0 {
-		ctxTokens = 4096 // Ollama default when num_ctx not set
+		ctxTokens = profile.MaxContextTokens
+	}
+	if ctxTokens <= 0 {
+		ctxTokens = 4096
+	}
+	maxOutputTokens := profile.MaxOutputTokens
+	if maxOutputTokens <= 0 {
+		maxOutputTokens = 4096
 	}
 	return ProviderCapabilities{
-		Capabilities:       []Capability{CapStreaming, CapJSON},
+		Capabilities:       append([]Capability(nil), profile.Capabilities...),
 		MaxContextTokens:   ctxTokens,
-		MaxOutputTokens:    4096,
+		MaxOutputTokens:    maxOutputTokens,
 		ModelsAvailable:    []string{p.model},
 		IsLocal:            true,
 		AgenticHarness:     false,

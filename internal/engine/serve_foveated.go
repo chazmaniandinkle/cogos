@@ -298,25 +298,35 @@ func extractAnchor(prompt string) string {
 func extractGoal(prompt string) string {
 	lower := strings.ToLower(strings.TrimSpace(prompt))
 
-	// Question patterns.
-	questionStarts := []string{"what", "how", "why", "where", "when", "who", "which", "can", "could", "would", "is", "are", "does", "do"}
-	for _, q := range questionStarts {
-		if strings.HasPrefix(lower, q+" ") || strings.HasPrefix(lower, q+"'") {
+	actionVerbs := []string{"build", "create", "implement", "write", "add", "fix", "update", "refactor", "delete", "remove", "move", "rename"}
+	for _, verb := range actionVerbs {
+		if strings.Contains(lower, verb) {
+			return "action: " + verb + " " + truncateGoal(prompt)
+		}
+	}
+
+	questionVerbs := []string{"explain", "describe", "analyze", "review", "document"}
+	for _, verb := range questionVerbs {
+		if strings.Contains(lower, verb) {
 			return "understand: " + truncateGoal(prompt)
 		}
 	}
 
-	// Action patterns.
-	actionStarts := []string{"build", "create", "add", "implement", "fix", "write", "make", "set up", "wire", "connect", "run", "start", "deploy", "update", "remove", "delete", "refactor", "test"}
-	for _, a := range actionStarts {
-		if strings.HasPrefix(lower, a+" ") || strings.HasPrefix(lower, a+".") {
-			return truncateGoal(prompt)
+	opsVerbs := []string{"deploy", "configure", "install", "setup", "set up", "migrate", "optimize", "test", "debug"}
+	for _, verb := range opsVerbs {
+		if strings.Contains(lower, verb) {
+			return "operate: " + verb + " " + truncateGoal(prompt)
 		}
 	}
 
 	// Imperative patterns (let's, lets).
 	if strings.HasPrefix(lower, "let") {
-		return truncateGoal(prompt)
+		return "action: let " + truncateGoal(prompt)
+	}
+
+	// Question-mark fallback.
+	if strings.Contains(lower, "?") {
+		return "understand: " + truncateGoal(prompt)
 	}
 
 	// Default: exploration.

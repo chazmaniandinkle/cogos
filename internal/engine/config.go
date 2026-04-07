@@ -57,20 +57,35 @@ type Config struct {
 	// OllamaEmbedModel is the embedding model name for Ollama.
 	// Default: nomic-embed-text
 	OllamaEmbedModel string
+
+	// ToolCallValidationEnabled gates runtime validation for model-emitted tool calls.
+	// Providers that advertise CapToolUse are trusted and skip this guardrail.
+	ToolCallValidationEnabled bool
+
+	// DigestPaths maps stream tailer adapter names to JSONL file/directory paths.
+	// Empty map means external digestion is disabled.
+	DigestPaths map[string]string
+
+	LocalModel string
+
+	localModelConfigured bool
 }
 
 // kernelConfigSection holds settings that can appear at the top level or inside v3:.
 type kernelConfigSection struct {
-	Port                  int    `yaml:"port"`
-	ConsolidationInterval int    `yaml:"consolidation_interval"`
-	HeartbeatInterval     int    `yaml:"heartbeat_interval"`
-	SalienceDaysWindow    int    `yaml:"salience_days_window"`
-	OutputReserve         int    `yaml:"output_reserve"`
-	TRMWeightsPath        string `yaml:"trm_weights_path"`
-	TRMEmbeddingsPath     string `yaml:"trm_embeddings_path"`
-	TRMChunksPath         string `yaml:"trm_chunks_path"`
-	OllamaEmbedEndpoint   string `yaml:"ollama_embed_endpoint"`
-	OllamaEmbedModel      string `yaml:"ollama_embed_model"`
+	Port                  int               `yaml:"port"`
+	ConsolidationInterval int               `yaml:"consolidation_interval"`
+	HeartbeatInterval     int               `yaml:"heartbeat_interval"`
+	SalienceDaysWindow    int               `yaml:"salience_days_window"`
+	OutputReserve         int               `yaml:"output_reserve"`
+	TRMWeightsPath        string            `yaml:"trm_weights_path"`
+	TRMEmbeddingsPath     string            `yaml:"trm_embeddings_path"`
+	TRMChunksPath         string            `yaml:"trm_chunks_path"`
+	OllamaEmbedEndpoint   string            `yaml:"ollama_embed_endpoint"`
+	OllamaEmbedModel      string            `yaml:"ollama_embed_model"`
+	ToolCallValidation    *bool             `yaml:"tool_call_validation_enabled"`
+	LocalModel            string            `yaml:"local_model"`
+	DigestPaths           map[string]string `yaml:"digest_paths"`
 }
 
 // kernelConfig is the on-disk YAML shape of .cog/config/kernel.yaml.
@@ -98,13 +113,16 @@ func LoadConfig(workspaceRoot string, port int) (*Config, error) {
 	}
 
 	cfg := &Config{
-		WorkspaceRoot:         workspaceRoot,
-		CogDir:                filepath.Join(workspaceRoot, ".cog"),
-		Port:                  6931,
-		ConsolidationInterval: 900,
-		HeartbeatInterval:     60,
-		SalienceDaysWindow:    90,
-		OutputReserve:         4096,
+		WorkspaceRoot:             workspaceRoot,
+		CogDir:                    filepath.Join(workspaceRoot, ".cog"),
+		Port:                      6931,
+		ConsolidationInterval:     3600,
+		HeartbeatInterval:         60,
+		SalienceDaysWindow:        90,
+		OutputReserve:             4096,
+		ToolCallValidationEnabled: true,
+		LocalModel:                defaultOllamaModel,
+		DigestPaths:               make(map[string]string),
 	}
 
 	// Load from file if present.
@@ -157,6 +175,21 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	}
 	if s.OllamaEmbedModel != "" {
 		cfg.OllamaEmbedModel = s.OllamaEmbedModel
+	}
+	if s.ToolCallValidation != nil {
+		cfg.ToolCallValidationEnabled = *s.ToolCallValidation
+	}
+	if s.LocalModel != "" {
+		cfg.LocalModel = s.LocalModel
+		cfg.localModelConfigured = true
+	}
+	if len(s.DigestPaths) > 0 {
+		if cfg.DigestPaths == nil {
+			cfg.DigestPaths = make(map[string]string, len(s.DigestPaths))
+		}
+		for name, path := range s.DigestPaths {
+			cfg.DigestPaths[name] = path
+		}
 	}
 }
 

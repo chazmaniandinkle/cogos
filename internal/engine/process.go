@@ -71,6 +71,7 @@ type Process struct {
 	nucleus *Nucleus
 	field   *AttentionalField
 	gate    *Gate
+	bridge  ConstellationBridge
 	cfg     *Config
 
 	// sessionID is the persistent process session identifier.
@@ -87,6 +88,12 @@ type Process struct {
 
 	// externalCh receives events from the HTTP serve layer.
 	externalCh chan *GateEvent
+
+	// tailerCh receives normalized CogBlocks from StreamTailer adapters.
+	tailerCh chan CogBlock
+
+	// tailerManager coordinates configured digestion stream tailers.
+	tailerManager *TailerManager
 
 	// index is the CogDoc index, rebuilt on each consolidation.
 	indexMu sync.RWMutex
@@ -105,9 +112,10 @@ type Process struct {
 	// lightCones manages per-conversation SSM hidden states.
 	lightCones *LightConeManager
 
-	// lastConsolidation records when the previous consolidation ran, so the
-	// observer can filter the attention log to the current tick window.
+	// lastConsolidation records the last dormant memory consolidation pass.
 	lastConsolidation time.Time
+
+	lastMaintenanceTick time.Time
 
 	// lastCoherenceReport caches the most recent coherence result so the
 	// heartbeat can reuse it instead of recomputing.
@@ -128,6 +136,7 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 		nucleus:   nucleus,
 		field:     field,
 		gate:      gate,
+		bridge:    NilBridge{},
 		cfg:       cfg,
 		sessionID: uuid.New().String(),
 		startedAt: now,
@@ -136,9 +145,11 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 			LocalScore:           1.0,
 			CoherenceFingerprint: "sha256:" + sha256Hex("coherence:unknown"),
 		},
-		externalCh:        make(chan *GateEvent, 64),
-		observer:          NewTrajectoryModel(),
-		lastConsolidation: now,
+		externalCh:          make(chan *GateEvent, 64),
+		tailerCh:            make(chan CogBlock, 64),
+		observer:            NewTrajectoryModel(),
+		lastConsolidation:   now,
+		lastMaintenanceTick: now,
 	}
 }
 
@@ -253,6 +264,7 @@ func (p *Process) Run(ctx context.Context) error {
 		p.indexMu.Unlock()
 		slog.Info("process: index built", "docs", len(idx.ByURI))
 	}
+	p.initTailers(ctx)
 
 	// Update attentional field (slow — git log per file, runs in background).
 	go func() {
@@ -290,6 +302,9 @@ func (p *Process) Run(ctx context.Context) error {
 		case evt := <-p.externalCh:
 			p.handleExternal(evt)
 
+		case block := <-p.tailerCh:
+			p.handleTailerBlock(block)
+
 		case <-consolidationTicker.C:
 			p.runConsolidation()
 
@@ -297,6 +312,86 @@ func (p *Process) Run(ctx context.Context) error {
 			p.emitHeartbeat()
 		}
 	}
+}
+
+func (p *Process) initTailers(ctx context.Context) {
+	if p.tailerManager == nil {
+		p.tailerManager = NewTailerManager(p.tailerCh)
+		p.registerConfiguredTailers(p.tailerManager)
+	}
+
+	if p.tailerManager == nil {
+		return
+	}
+
+	go func() {
+		if err := p.tailerManager.Run(ctx); err != nil {
+			slog.Warn("process: tailer manager stopped with error", "err", err)
+		}
+	}()
+}
+
+func (p *Process) registerConfiguredTailers(manager *TailerManager) {
+	if p == nil || p.cfg == nil || manager == nil || len(p.cfg.DigestPaths) == 0 {
+		return
+	}
+
+	for adapterName, configuredPath := range p.cfg.DigestPaths {
+		path := strings.TrimSpace(configuredPath)
+		switch adapterName {
+		case claudeCodeSourceChannel:
+			if path == "" {
+				path = "~/.claude/"
+			}
+			path = expandDigestPath(path)
+			if err := manager.Register(&ClaudeCodeTailer{}, path); err != nil {
+				slog.Warn("process: digest tailer register failed", "adapter", adapterName, "path", path, "err", err)
+				continue
+			}
+			slog.Info("process: digest tailer registered", "adapter", adapterName, "path", path)
+
+		case "openclaw":
+			if path == "" {
+				slog.Warn("process: digest tailer path empty", "adapter", adapterName)
+				continue
+			}
+			path = expandDigestPath(path)
+			if err := manager.Register(&OpenClawTailer{}, path); err != nil {
+				slog.Warn("process: digest tailer register failed", "adapter", adapterName, "path", path, "err", err)
+				continue
+			}
+			slog.Info("process: digest tailer registered", "adapter", adapterName, "path", path)
+
+		default:
+			slog.Warn("process: unknown digest adapter", "adapter", adapterName)
+		}
+	}
+}
+
+func expandDigestPath(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+		}
+	}
+	return path
+}
+
+func (p *Process) handleTailerBlock(block CogBlock) {
+	state := p.State()
+	if state != StateReceptive && state != StateActive {
+		slog.Debug("process: dropping tailer block outside receptive states", "state", state.String(), "source_channel", block.SourceChannel, "kind", block.Kind)
+		return
+	}
+
+	b := block
+	if b.Timestamp.IsZero() {
+		b.Timestamp = time.Now().UTC()
+	}
+
+	ref := p.RecordBlock(&b)
+	slog.Info("process: tailer block ingested", "source_channel", b.SourceChannel, "kind", b.Kind, "ledger_ref", ref)
 }
 
 // handleExternal processes an external perturbation.
@@ -319,10 +414,10 @@ func (p *Process) handleExternal(evt *GateEvent) {
 func (p *Process) runConsolidation() {
 	p.transition(StateConsolidating)
 
-	// Record the current tick window before updating lastConsolidation.
+	// Record the current tick window before updating the maintenance watermark.
 	now := time.Now()
-	tickStart := p.lastConsolidation
-	p.lastConsolidation = now
+	tickStart := p.lastMaintenanceTick
+	p.lastMaintenanceTick = now
 
 	slog.Debug("process: consolidating", "window_since", tickStart.Format(time.RFC3339))
 
@@ -448,13 +543,34 @@ func (p *Process) emitHeartbeat() {
 	p.mu.Unlock()
 
 	p.transition(StateDormant)
+	state := p.State().String()
+	fieldSize := p.field.Len()
+	fingerprint := p.Fingerprint()
+	receipt, err := p.constellationBridge().EmitHeartbeat(KernelHeartbeatPayload{
+		ProcessState:         state,
+		FieldSize:            fieldSize,
+		CoherenceFingerprint: coherenceHash,
+		NucleusFingerprint:   p.nucleusDigest(),
+		LedgerHead:           p.currentLedgerHead(),
+		Timestamp:            now,
+	})
+	if err != nil {
+		slog.Warn("process: constellation heartbeat failed", "err", err)
+		receipt = HeartbeatReceipt{}
+	}
+
 	heartbeat := map[string]interface{}{
-		"state":          p.State().String(),
-		"field_size":     p.field.Len(),
-		"node_id":        p.NodeID,
-		"fingerprint":    p.Fingerprint(),
-		"timestamp":      now.Format(time.RFC3339),
-		"coherence_hash": coherenceHash,
+		"state":                      state,
+		"field_size":                 fieldSize,
+		"node_id":                    p.NodeID,
+		"fingerprint":                fingerprint,
+		"timestamp":                  now.Format(time.RFC3339),
+		"coherence_hash":             coherenceHash,
+		"constellation_receipt_hash": receipt.Hash,
+		"constellation_peers_sent":   receipt.PeersSent,
+	}
+	if !receipt.Timestamp.IsZero() {
+		heartbeat["constellation_receipt_at"] = receipt.Timestamp.Format(time.RFC3339)
 	}
 	p.emitEvent("heartbeat", heartbeat)
 
@@ -486,12 +602,33 @@ func (p *Process) emitHeartbeat() {
 	if p.nucleus != nil {
 		block.TargetIdentity = p.nucleus.Name
 	}
+	if receipt.Hash != "" {
+		block.Artifacts = append(block.Artifacts, BlockArtifact{
+			Kind: "constellation_receipt",
+			Ref:  receipt.Hash,
+		})
+	}
 	ref := p.RecordBlock(block)
 
 	p.mu.Lock()
 	p.TrustState.LastHeartbeatHash = ref
 	p.TrustState.LastHeartbeatAt = now
 	p.mu.Unlock()
+
+	interval := time.Duration(p.cfg.ConsolidationInterval) * time.Second
+	if interval <= 0 || now.Sub(p.lastConsolidation) < interval {
+		return
+	}
+
+	action := ConsolidationAction{WorkspaceRoot: p.cfg.WorkspaceRoot}
+	count, err := action.Run()
+	if err != nil {
+		slog.Warn("process: memory consolidation failed", "err", err)
+		return
+	}
+
+	p.lastConsolidation = now
+	slog.Info("process: memory consolidated", "sessions", count)
 }
 
 // transition moves the process to a new state (with logging).
