@@ -1,8 +1,10 @@
 # CogOS
 
-**Cognitive infrastructure for AI agents.** Memory, context, identity, and trust — as a daemon.
+**Externalized attention and executive function modulation for intelligent systems.**
 
-CogOS is a background kernel that gives AI agents the things they can't give themselves: persistent memory that survives across sessions, context assembly that knows what matters right now, multi-provider inference routing that keeps data local, and a tamper-evident ledger that records every decision. It runs on your hardware, it works with any agent, and everything it knows stays yours.
+CogOS is the substrate between observers and generators. It externalizes the cognitive functions that models do poorly and expensively — deciding what's relevant, managing working memory, routing between providers, validating tool calls, maintaining identity across sessions — so that any model, on any device, can generate effectively from pre-digested context.
+
+The model doesn't think. The substrate thinks. The model generates.
 
 ```sh
 make build
@@ -78,17 +80,27 @@ Organelles don't communicate directly. They read from and write to the substrate
 
 ## Ecosystem
 
-CogOS is not a monolith. Each subsystem is its own repo, its own release cycle, its own organelle:
+CogOS is not a monolith. It's a cell. Each subsystem is its own repo, its own release cycle, its own organelle:
 
-| Repo | Role | What it does |
+| Repo | Verb | What it does |
 |------|------|-------------|
-| [cogos-dev/cogos](https://github.com/cogos-dev/cogos) | Kernel | Continuous process daemon — context, memory, ledger, routing |
-| [cogos-dev/constellation](https://github.com/cogos-dev/constellation) | Identity & Trust | Distributed identity where trust is earned through temporal consistency |
-| [cogos-dev/mod3](https://github.com/cogos-dev/mod3) | Modality | Multi-model TTS with adaptive playback, VAD, and speech queuing |
+| [cogos](https://github.com/cogos-dev/cogos) | **IS** | The cell — nucleus, substrate, membrane as a continuous process daemon |
+| [constellation](https://github.com/cogos-dev/constellation) | **TRUSTS** | Distributed identity where trust is earned through temporal coherence |
+| [mod3](https://github.com/cogos-dev/mod3) | **ACTS** | Modality bus — translates between thinking and acting across any modality |
+| [charts](https://github.com/cogos-dev/charts) | **DEPLOYS** | Helm charts + Docker Compose for single-node through multi-node topologies |
+| [desktop](https://github.com/cogos-dev/desktop) | **PRESENTS** | Native macOS app — kernel management, terminal, dashboard |
 
 Each organelle is independently deployable. They coordinate through the substrate, not through imports. The workspace discovers available organelles at runtime through capability scanning — like a cell discovering what enzymes are available in the cytoplasm.
 
 ## Core ideas
+
+### The model generates. The substrate thinks.
+
+Every other approach says "make the model smarter." CogOS says: make the environment more structured so that any intelligence — human or machine — can operate more effectively within it. The substrate provides two things models do poorly:
+
+**Externalized Attention** — deciding what information is relevant *before* the model sees it. The foveated context engine, TRM, salience scoring, and zone ordering ensure the model never attends to irrelevant information.
+
+**Executive Function Modulation** — deciding how the model should behave *before* it generates. The process state machine, sovereignty gradient, tool-call validation gate, and consolidation policy shape behavior through conditioning signals, not English prompts.
 
 ### Your workspace is the cognitive object, not the model
 
@@ -189,9 +201,9 @@ make e2e          # Containerized e2e
 
 v3 kernel — ground-up rewrite after a year of daily use across multiple agent harnesses.
 
-Working: continuous process, foveated context, hash-chained ledger, multi-provider routing, MCP server, blob store, salience scoring, OpenAI/Anthropic compatibility, workspace scaffolding, e2e testing, web dashboard, OpenTelemetry.
+Working: continuous process, foveated context with Mamba TRM, hash-chained ledger, multi-provider routing (Gemma 4 E4B default), MCP server, blob store, salience scoring, tool-call hallucination gate, digestion pipeline (Claude Code + OpenClaw adapters), memory consolidation, constellation bridge interface, OpenAI/Anthropic compatibility, workspace scaffolding, e2e testing, web dashboard, OpenTelemetry.
 
-Next: Constellation protocol integration with kernel, memory consolidation loop, multi-agent process management, `cog` CLI.
+Next: wire digestion tailers into process loop, constellation library integration, multi-agent process management, `cog` CLI, README updates across ecosystem.
 
 ## Deeper
 
