@@ -3,6 +3,7 @@ package engine
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 )
 
@@ -237,11 +238,47 @@ func TestMakeProviderInfersTypeFromName(t *testing.T) {
 
 func TestDefaultProvidersConfig(t *testing.T) {
 	t.Parallel()
-	pcfg := defaultProvidersConfig()
+	pcfg := defaultProvidersConfig(defaultOllamaModel)
 	if _, ok := pcfg.Providers["ollama"]; !ok {
 		t.Error("default config should have ollama provider")
 	}
 	if pcfg.Routing.Default != "ollama" {
 		t.Errorf("default routing = %q; want ollama", pcfg.Routing.Default)
+	}
+	if pcfg.Providers["ollama"].Model != defaultOllamaModel {
+		t.Errorf("default ollama model = %q; want %q", pcfg.Providers["ollama"].Model, defaultOllamaModel)
+	}
+}
+
+func TestLoadProvidersConfigAppliesExplicitLocalModel(t *testing.T) {
+	t.Parallel()
+
+	root := makeWorkspace(t)
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "kernel.yaml"), "local_model: gemma4:e2b\n")
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  ollama:
+    type: ollama
+    enabled: true
+    endpoint: "http://localhost:11434"
+    model: "qwen3.5:9b"
+    timeout: 60
+routing:
+  default: ollama
+  fallback_chain:
+    - ollama
+`)
+
+	cfg, err := LoadConfig(root, 0)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	pcfg, err := loadProvidersConfig(cfg)
+	if err != nil {
+		t.Fatalf("loadProvidersConfig: %v", err)
+	}
+
+	if pcfg.Providers["ollama"].Model != "gemma4:e2b" {
+		t.Errorf("ollama model = %q; want gemma4:e2b", pcfg.Providers["ollama"].Model)
 	}
 }

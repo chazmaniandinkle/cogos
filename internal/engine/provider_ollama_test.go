@@ -346,3 +346,50 @@ func TestOllamaCapabilities(t *testing.T) {
 	}
 }
 
+func TestLookupOllamaModelProfileGemma4E4B(t *testing.T) {
+	t.Parallel()
+
+	profile := lookupOllamaModelProfile("gemma4:e4b")
+
+	if !containsCapability(profile.Capabilities, CapStreaming) {
+		t.Error("gemma4:e4b should support streaming")
+	}
+	if !containsCapability(profile.Capabilities, CapJSON) {
+		t.Error("gemma4:e4b should support json output")
+	}
+	if !containsCapability(profile.Capabilities, CapToolCallValidation) {
+		t.Error("gemma4:e4b should require tool call validation")
+	}
+	if containsCapability(profile.Capabilities, CapToolUse) {
+		t.Error("gemma4:e4b should not advertise reliable tool use")
+	}
+	if profile.MaxContextTokens != 128000 {
+		t.Errorf("MaxContextTokens = %d; want 128000", profile.MaxContextTokens)
+	}
+}
+
+func TestOllamaCapabilitiesUseKnownModelProfile(t *testing.T) {
+	t.Parallel()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Model: "gemma4:e4b"})
+	caps := p.Capabilities()
+
+	if !caps.HasCapability(CapToolCallValidation) {
+		t.Error("gemma4:e4b should advertise tool_call_validation")
+	}
+	if caps.HasCapability(CapToolUse) {
+		t.Error("gemma4:e4b should not advertise tool_use")
+	}
+	if caps.MaxContextTokens != 128000 {
+		t.Errorf("MaxContextTokens = %d; want 128000", caps.MaxContextTokens)
+	}
+}
+
+func containsCapability(caps []Capability, want Capability) bool {
+	for _, cap := range caps {
+		if cap == want {
+			return true
+		}
+	}
+	return false
+}

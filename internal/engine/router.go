@@ -1,11 +1,11 @@
 // router.go — SimpleRouter + BuildRouter
 //
 // SimpleRouter implements the Router interface with rule-based provider selection:
-//   1. Check process-state routing overrides
-//   2. Try preferred provider first, then fallback chain
-//   3. Filter by availability + required capabilities
-//   4. Score local > cloud (sovereignty gradient)
-//   5. Record every routing decision for future sentinel training
+//  1. Check process-state routing overrides
+//  2. Try preferred provider first, then fallback chain
+//  3. Filter by availability + required capabilities
+//  4. Score local > cloud (sovereignty gradient)
+//  5. Record every routing decision for future sentinel training
 //
 // BuildRouter reads .cog/config/providers.yaml and instantiates enabled providers.
 // Falls back to a default Ollama config when no providers.yaml is present.
@@ -23,6 +23,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+var toolCallRejectionsByProvider sync.Map // map[string]*atomic.Int64
 
 // SimpleRouter implements Router with rule-based provider selection.
 type SimpleRouter struct {
@@ -164,13 +166,18 @@ func (r *SimpleRouter) Route(ctx context.Context, req *CompletionRequest) (Provi
 // Stats returns current routing statistics.
 func (r *SimpleRouter) Stats() RouterStats {
 	stats := RouterStats{
-		TotalRequests:      r.totalRequests.Load(),
-		EscalationCount:    r.escalations.Load(),
-		FallbackCount:      r.fallbacks.Load(),
-		RequestsByProvider: make(map[string]int64),
+		TotalRequests:                r.totalRequests.Load(),
+		EscalationCount:              r.escalations.Load(),
+		FallbackCount:                r.fallbacks.Load(),
+		RequestsByProvider:           make(map[string]int64),
+		ToolCallRejectionsByProvider: make(map[string]int64),
 	}
 	r.byProvider.Range(func(k, v any) bool {
 		stats.RequestsByProvider[k.(string)] = v.(*atomic.Int64).Load()
+		return true
+	})
+	toolCallRejectionsByProvider.Range(func(k, v any) bool {
+		stats.ToolCallRejectionsByProvider[k.(string)] = v.(*atomic.Int64).Load()
 		return true
 	})
 	if stats.TotalRequests > 0 {
@@ -187,6 +194,14 @@ func (r *SimpleRouter) Stats() RouterStats {
 		stats.SovereigntyRatio = float64(local) / float64(stats.TotalRequests)
 	}
 	return stats
+}
+
+func recordToolCallRejection(providerName string) {
+	if providerName == "" {
+		return
+	}
+	counter, _ := toolCallRejectionsByProvider.LoadOrStore(providerName, &atomic.Int64{})
+	counter.(*atomic.Int64).Add(1)
 }
 
 // buildCandidateOrder returns providers ordered by routing preference.
@@ -252,7 +267,7 @@ func BuildRouter(cfg *Config, opts ...BuildRouterOption) (Router, error) {
 	pcfg, err := loadProvidersConfig(cfg)
 	if err != nil {
 		slog.Warn("router: providers.yaml not found, using default (ollama)", "err", err)
-		pcfg = defaultProvidersConfig()
+		pcfg = defaultProvidersConfig(cfg.LocalModel)
 	}
 
 	router := NewSimpleRouter(pcfg.Routing)
@@ -295,7 +310,27 @@ func loadProvidersConfig(cfg *Config) (ProvidersConfig, error) {
 	if err := yaml.Unmarshal(data, &pcfg); err != nil {
 		return ProvidersConfig{}, fmt.Errorf("parse providers.yaml: %w", err)
 	}
+	applyLocalModelConfig(cfg, &pcfg)
 	return pcfg, nil
+}
+
+func applyLocalModelConfig(cfg *Config, pcfg *ProvidersConfig) {
+	if cfg == nil || pcfg == nil || cfg.LocalModel == "" {
+		return
+	}
+	for name, pc := range pcfg.Providers {
+		providerType := pc.Type
+		if providerType == "" {
+			providerType = name
+		}
+		if providerType != "ollama" {
+			continue
+		}
+		if pc.Model == "" || cfg.localModelConfigured {
+			pc.Model = cfg.LocalModel
+			pcfg.Providers[name] = pc
+		}
+	}
 }
 
 // makeProvider instantiates a Provider from a ProviderConfig.
@@ -325,15 +360,18 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 }
 
 // defaultProvidersConfig returns a minimal config pointing at local Ollama.
-func defaultProvidersConfig() ProvidersConfig {
+func defaultProvidersConfig(localModel string) ProvidersConfig {
 	enabled := true
+	if localModel == "" {
+		localModel = defaultOllamaModel
+	}
 	return ProvidersConfig{
 		Providers: map[string]ProviderConfig{
 			"ollama": {
 				Type:     "ollama",
 				Enabled:  &enabled,
 				Endpoint: "http://localhost:11434",
-				Model:    "qwen3.5:9b",
+				Model:    localModel,
 				Timeout:  60,
 			},
 		},

@@ -18,8 +18,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.Port != 6931 {
 		t.Errorf("Port = %d; want 6931", cfg.Port)
 	}
-	if cfg.ConsolidationInterval != 900 {
-		t.Errorf("ConsolidationInterval = %d; want 900", cfg.ConsolidationInterval)
+	if cfg.ConsolidationInterval != 3600 {
+		t.Errorf("ConsolidationInterval = %d; want 3600", cfg.ConsolidationInterval)
 	}
 	if cfg.HeartbeatInterval != 60 {
 		t.Errorf("HeartbeatInterval = %d; want 60", cfg.HeartbeatInterval)
@@ -33,6 +33,12 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.CogDir != filepath.Join(root, ".cog") {
 		t.Errorf("CogDir = %q; want %q", cfg.CogDir, filepath.Join(root, ".cog"))
 	}
+	if cfg.LocalModel != defaultOllamaModel {
+		t.Errorf("LocalModel = %q; want %q", cfg.LocalModel, defaultOllamaModel)
+	}
+	if !cfg.ToolCallValidationEnabled {
+		t.Error("ToolCallValidationEnabled = false; want true by default")
+	}
 }
 
 func TestLoadConfigFromFile(t *testing.T) {
@@ -43,6 +49,8 @@ func TestLoadConfigFromFile(t *testing.T) {
 consolidation_interval: 600
 heartbeat_interval: 120
 salience_days_window: 30
+local_model: gemma4:e2b
+tool_call_validation_enabled: false
 `
 	writeTestFile(t, filepath.Join(root, ".cog", "config", "kernel.yaml"), kernelYAML)
 
@@ -62,6 +70,12 @@ salience_days_window: 30
 	}
 	if cfg.SalienceDaysWindow != 30 {
 		t.Errorf("SalienceDaysWindow = %d; want 30", cfg.SalienceDaysWindow)
+	}
+	if cfg.LocalModel != "gemma4:e2b" {
+		t.Errorf("LocalModel = %q; want gemma4:e2b", cfg.LocalModel)
+	}
+	if cfg.ToolCallValidationEnabled {
+		t.Error("ToolCallValidationEnabled = true; want false from file")
 	}
 }
 

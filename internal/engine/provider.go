@@ -176,8 +176,8 @@ type StreamChunk struct {
 	Delta         string         `json:"delta,omitempty"`
 	ToolCallDelta *ToolCallDelta `json:"tool_call_delta,omitempty"`
 	Done          bool           `json:"done"`
-	StopReason    string         `json:"stop_reason,omitempty"`    // e.g. "end_turn", "max_tokens", "tool_use"
-	Usage         *TokenUsage    `json:"usage,omitempty"`          // populated on final chunk
+	StopReason    string         `json:"stop_reason,omitempty"`   // e.g. "end_turn", "max_tokens", "tool_use"
+	Usage         *TokenUsage    `json:"usage,omitempty"`         // populated on final chunk
 	ProviderMeta  *ProviderMeta  `json:"provider_meta,omitempty"` // populated on final chunk
 	Error         error          `json:"-"`
 }
@@ -245,13 +245,14 @@ type ToolCall struct {
 type Capability string
 
 const (
-	CapStreaming   Capability = "streaming"
-	CapToolUse     Capability = "tool_use"
-	CapVision      Capability = "vision"
-	CapLongContext Capability = "long_context"
-	CapJSON        Capability = "json_output"
-	CapCaching     Capability = "caching"
-	CapBatch       Capability = "batch"
+	CapStreaming          Capability = "streaming"
+	CapToolUse            Capability = "tool_use"
+	CapToolCallValidation Capability = "tool_call_validation"
+	CapVision             Capability = "vision"
+	CapLongContext        Capability = "long_context"
+	CapJSON               Capability = "json_output"
+	CapCaching            Capability = "caching"
+	CapBatch              Capability = "batch"
 )
 
 // ProviderCapabilities describes what a provider can do.
@@ -329,14 +330,15 @@ type ProviderScore struct {
 
 // RouterStats tracks routing patterns for observability.
 type RouterStats struct {
-	TotalRequests        int64                    `json:"total_requests"`
-	RequestsByProvider   map[string]int64         `json:"requests_by_provider"`
-	EscalationCount      int64                    `json:"escalation_count"`
-	FallbackCount        int64                    `json:"fallback_count"`
-	SovereigntyRatio     float64                  `json:"sovereignty_ratio"`
-	TotalCostUSD         float64                  `json:"total_cost_usd"`
-	TokensByProvider     map[string]TokenUsage    `json:"tokens_by_provider"`
-	AvgLatencyByProvider map[string]time.Duration `json:"avg_latency_by_provider"`
+	TotalRequests                int64                    `json:"total_requests"`
+	RequestsByProvider           map[string]int64         `json:"requests_by_provider"`
+	ToolCallRejectionsByProvider map[string]int64         `json:"tool_call_rejections_by_provider,omitempty"`
+	EscalationCount              int64                    `json:"escalation_count"`
+	FallbackCount                int64                    `json:"fallback_count"`
+	SovereigntyRatio             float64                  `json:"sovereignty_ratio"`
+	TotalCostUSD                 float64                  `json:"total_cost_usd"`
+	TokensByProvider             map[string]TokenUsage    `json:"tokens_by_provider"`
+	AvgLatencyByProvider         map[string]time.Duration `json:"avg_latency_by_provider"`
 }
 
 // ── Configuration types ───────────────────────────────────────────────────────
