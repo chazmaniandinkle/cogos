@@ -178,10 +178,12 @@ func TestExtractGoal(t *testing.T) {
 		prompt string
 		prefix string
 	}{
-		{"how does this work?", "understand:"},
-		{"build the auto-doc pipeline", "build the auto-doc pipeline"},
-		{"let's knock it out", "let's knock it out"},
+		{"Please explain how to build the router", "action: build"},
+		{"Could you help me debug this?", "operate: debug"},
+		{"What is the meaning of life?", "understand:"},
+		{"let's knock it out", "action: let"},
 		{"interesting stuff", "(exploring/discussing)"},
+		{"hello", "(exploring/discussing)"},
 	}
 	for _, tt := range tests {
 		got := extractGoal(tt.prompt)

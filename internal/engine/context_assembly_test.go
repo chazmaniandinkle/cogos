@@ -4,6 +4,7 @@ package engine
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -97,6 +98,64 @@ func TestAssembleContextSkipsArchiveDirs(t *testing.T) {
 
 // ── conversation scoring ─────────────────────────────────────────────────────
 
+func TestEstTokensPreciseHigherForJSON(t *testing.T) {
+	t.Parallel()
+	jsonText := `{"user":{"id":123,"name":"Ada","roles":["admin","editor"],"active":true},"items":[{"k":"v1"},{"k":"v2"}],"count":2}`
+
+	fast := estTokens(jsonText)
+	precise := estTokensPrecise(jsonText)
+	if precise <= fast {
+		t.Fatalf("precise = %d; want > fast = %d", precise, fast)
+	}
+}
+
+func TestEstTokensPreciseHigherForCJK(t *testing.T) {
+	t.Parallel()
+	cjkText := strings.Repeat("漢字かなカナ混在テキスト", 16)
+
+	fast := estTokens(cjkText)
+	precise := estTokensPrecise(cjkText)
+	if precise <= fast {
+		t.Fatalf("precise = %d; want > fast = %d", precise, fast)
+	}
+}
+
+func TestEstTokensPreciseMatchesEnglishWithinTenPercent(t *testing.T) {
+	t.Parallel()
+	englishText := strings.Repeat("plain english prose with ordinary words ", 64)
+
+	fast := estTokens(englishText)
+	precise := estTokensPrecise(englishText)
+	if precise < fast {
+		t.Fatalf("precise = %d; want >= fast = %d", precise, fast)
+	}
+	if float64(precise-fast) > float64(fast)*0.10 {
+		t.Fatalf("precise = %d; want within 10%% of fast = %d", precise, fast)
+	}
+}
+
+func TestAssembleContextUsesPreciseEstimatorUnderHighIrisPressure(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	p := NewProcess(cfg, makeNucleus("T", "r"))
+
+	messages := []ProviderMessage{{Role: "user", Content: `{"payload":{"id":123,"flags":[true,false,true],"meta":{"nested":"value"}}}`}}
+
+	lowPressure, err := p.AssembleContext("payload", messages, 0, WithIrisSignal(irisSignal{Size: 1000, Used: 700}))
+	if err != nil {
+		t.Fatalf("AssembleContext low pressure: %v", err)
+	}
+	highPressure, err := p.AssembleContext("payload", messages, 0, WithIrisSignal(irisSignal{Size: 1000, Used: 900}))
+	if err != nil {
+		t.Fatalf("AssembleContext high pressure: %v", err)
+	}
+
+	if highPressure.TotalTokens <= lowPressure.TotalTokens {
+		t.Fatalf("high pressure total = %d; want > low pressure total = %d", highPressure.TotalTokens, lowPressure.TotalTokens)
+	}
+}
+
 func TestScoreConversationRecency(t *testing.T) {
 	t.Parallel()
 	history := []ProviderMessage{
@@ -155,23 +214,41 @@ func TestEvictForBudgetFitsAll(t *testing.T) {
 	_ = keptDocs
 }
 
-func TestEvictForBudgetDropsOldestConversation(t *testing.T) {
+func TestEvictForBudgetKeepsTurnPairsAndStandaloneMessages(t *testing.T) {
 	t.Parallel()
 	conv := []ScoredMessage{
-		{Role: "user", Content: "old message that is fairly long", Tokens: 8},
-		{Role: "assistant", Content: "old reply that is also long", Tokens: 7},
-		{Role: "user", Content: "new", Tokens: 1},
-		{Role: "assistant", Content: "new reply", Tokens: 2},
+		{Role: "system", Content: "system note", Tokens: 1},
+		{Role: "user", Content: "old prompt", Tokens: 4},
+		{Role: "assistant", Content: "old answer", Tokens: 2},
+		{Role: "tool_result", Content: "tool output", Tokens: 1},
+		{Role: "user", Content: "new prompt", Tokens: 1},
+		{Role: "assistant", Content: "new answer", Tokens: 2},
 	}
-	// Budget only fits the newest turns.
-	_, keptConv := evictForBudget(nil, conv, 5, t.TempDir())
-	// Should keep newest turns, drop oldest.
-	if len(keptConv) > 2 {
-		t.Errorf("expected eviction, got %d turns", len(keptConv))
+	// Budget fits the newest user/assistant pair, fits standalone messages,
+	// but only the old assistant would fit on its own.
+	_, keptConv := evictForBudget(nil, conv, 7, t.TempDir())
+
+	if len(keptConv) != 4 {
+		t.Fatalf("kept conv len = %d; want 4", len(keptConv))
 	}
-	// Newest turn should be present.
-	if len(keptConv) > 0 && keptConv[len(keptConv)-1].Content != "new reply" {
-		t.Errorf("last kept message = %q; want 'new reply'", keptConv[len(keptConv)-1].Content)
+
+	got := []string{
+		keptConv[0].Content,
+		keptConv[1].Content,
+		keptConv[2].Content,
+		keptConv[3].Content,
+	}
+	want := []string{"system note", "tool output", "new prompt", "new answer"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("keptConv[%d] = %q; want %q", i, got[i], want[i])
+		}
+	}
+
+	for _, msg := range keptConv {
+		if msg.Content == "old prompt" || msg.Content == "old answer" {
+			t.Fatalf("old turn pair should be dropped together, kept %q", msg.Content)
+		}
 	}
 }
 

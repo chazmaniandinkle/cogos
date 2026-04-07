@@ -93,6 +93,55 @@ func estTokens(s string) int {
 	return n
 }
 
+// estTokensPrecise estimates tokens using rune-aware character-class heuristics.
+//
+// Heuristic selection:
+//   - ASCII-heavy text: runes/4
+//   - >20% non-ASCII: runes/2
+//   - >30% non-alphanumeric: runes/3
+//
+// The result is never allowed to fall below the fast byte-based estimate, and a
+// 10% safety margin is added to reduce underestimation near full contexts.
+func estTokensPrecise(s string) int {
+	if s == "" {
+		return 0
+	}
+
+	runes := 0
+	nonASCII := 0
+	nonAlnum := 0
+	for _, r := range s {
+		runes++
+		if r > unicode.MaxASCII {
+			nonASCII++
+		}
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			nonAlnum++
+		}
+	}
+	if runes == 0 {
+		return 0
+	}
+
+	divisor := 4
+	if nonASCII*5 > runes {
+		divisor = 2
+	}
+	if nonAlnum*10 > runes*3 && divisor > 3 {
+		divisor = 3
+	}
+
+	base := (runes + divisor - 1) / divisor
+	if fast := estTokens(s); fast > base {
+		base = fast
+	}
+	estimate := (base*11 + 9) / 10
+	if estimate < 1 {
+		return 1
+	}
+	return estimate
+}
+
 // AssembleContext builds a ContextPackage from the full client request.
 //
 // It decomposes the incoming messages[], scores conversation history alongside
@@ -107,7 +156,7 @@ func (p *Process) AssembleContext(query string, messages []ProviderMessage, budg
 	for _, o := range opts {
 		o(&ao)
 	}
-	return p.assembleContextInnerWithOpts(ao.ctx, ao.convID, query, messages, budget, ao.manifestMode)
+	return p.assembleContextInnerWithOpts(ao.ctx, ao.convID, query, messages, budget, ao.manifestMode, ao.iris)
 }
 
 // AssembleOption configures optional AssembleContext parameters.
@@ -116,6 +165,7 @@ type AssembleOption func(*assembleOpts)
 type assembleOpts struct {
 	ctx          context.Context
 	convID       string
+	iris         irisSignal
 	manifestMode bool
 }
 
@@ -133,6 +183,12 @@ func WithConversationID(id string) AssembleOption {
 	return func(o *assembleOpts) { o.convID = id }
 }
 
+// WithIrisSignal sets the current context-window usage signal for pressure-aware
+// token estimation.
+func WithIrisSignal(signal irisSignal) AssembleOption {
+	return func(o *assembleOpts) { o.iris = signal }
+}
+
 // WithManifestMode switches CogDoc injection from full-body content to
 // summary manifests with on-demand retrieval.
 func WithManifestMode(enabled bool) AssembleOption {
@@ -140,12 +196,21 @@ func WithManifestMode(enabled bool) AssembleOption {
 }
 
 func (p *Process) assembleContextInner(ctx context.Context, convID string, query string, messages []ProviderMessage, budget int) (*ContextPackage, error) {
-	return p.assembleContextInnerWithOpts(ctx, convID, query, messages, budget, false)
+	return p.assembleContextInnerWithOpts(ctx, convID, query, messages, budget, false, irisSignal{})
 }
 
-func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID string, query string, messages []ProviderMessage, budget int, manifestMode bool) (*ContextPackage, error) {
+func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID string, query string, messages []ProviderMessage, budget int, manifestMode bool, iris irisSignal) (*ContextPackage, error) {
 	if budget <= 0 {
 		budget = 32768
+	}
+
+	estimateTokens := estTokens
+	pressure := 0.0
+	if iris.Size > 0 {
+		pressure = float64(iris.Used) / float64(iris.Size)
+		if pressure > 0.8 {
+			estimateTokens = estTokensPrecise
+		}
 	}
 
 	outputReserve := p.cfg.OutputReserve
@@ -187,11 +252,11 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 	p.nucleus.mu.RUnlock()
 	pkg.NucleusText = nucleusCard
 
-	nucleusTokens := estTokens(nucleusCard)
-	clientSysTokens := estTokens(pkg.ClientSystem)
+	nucleusTokens := estimateTokens(nucleusCard)
+	clientSysTokens := estimateTokens(pkg.ClientSystem)
 	currentMsgTokens := 0
 	if pkg.CurrentMessage != nil {
-		currentMsgTokens = estTokens(pkg.CurrentMessage.Content)
+		currentMsgTokens = estimateTokens(pkg.CurrentMessage.Content)
 	}
 
 	// Budget available for CogDocs + conversation history.
@@ -267,11 +332,11 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 
 	// === Score conversation history ===
 
-	scoredHistory := scoreConversation(history, keywords)
+	scoredHistory := scoreConversationWithEstimator(history, keywords, estimateTokens)
 
 	// === Evict to fit budget ===
 
-	pkg.FovealDocs, pkg.Conversation = evictForBudgetMode(docCandidates, scoredHistory, flexBudget, p.cfg.WorkspaceRoot, manifestMode)
+	pkg.FovealDocs, pkg.Conversation = evictForBudgetModeWithEstimator(docCandidates, scoredHistory, flexBudget, p.cfg.WorkspaceRoot, manifestMode, estimateTokens)
 
 	// Compute total tokens.
 	total := nucleusTokens + clientSysTokens + currentMsgTokens
@@ -294,6 +359,8 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 		"budget":           budget,
 		"output_reserve":   outputReserve,
 		"flex_budget":      flexBudget,
+		"iris_pressure":    pressure,
+		"precise_tokens":   pressure > 0.8,
 		"used_trm":         usedTRM,
 	})
 
@@ -302,6 +369,7 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 		"conv_turns", len(pkg.Conversation),
 		"tokens", pkg.TotalTokens,
 		"budget", budget,
+		"pressure", fmt.Sprintf("%.1f%%", pressure*100),
 	)
 
 	return pkg, nil
@@ -362,6 +430,10 @@ func (pkg *ContextPackage) FormatForProvider() (string, []ProviderMessage) {
 // scoreConversation scores conversation turns by recency and query relevance.
 // Returns ScoredMessage slice preserving chronological order.
 func scoreConversation(history []ProviderMessage, keywords []string) []ScoredMessage {
+	return scoreConversationWithEstimator(history, keywords, estTokens)
+}
+
+func scoreConversationWithEstimator(history []ProviderMessage, keywords []string, estimateTokens func(string) int) []ScoredMessage {
 	if len(history) == 0 {
 		return nil
 	}
@@ -376,7 +448,7 @@ func scoreConversation(history []ProviderMessage, keywords []string) []ScoredMes
 		scored[i] = ScoredMessage{
 			Role:           m.Role,
 			Content:        m.Content,
-			Tokens:         estTokens(m.Content),
+			Tokens:         estimateTokens(m.Content),
 			TurnIndex:      i,
 			RecencyScore:   recency,
 			RelevanceScore: relevance,
@@ -397,6 +469,10 @@ func evictForBudget(docs []FovealDoc, conv []ScoredMessage, budget int, workspac
 }
 
 func evictForBudgetMode(docs []FovealDoc, conv []ScoredMessage, budget int, workspaceRoot string, manifestMode bool) ([]FovealDoc, []ScoredMessage) {
+	return evictForBudgetModeWithEstimator(docs, conv, budget, workspaceRoot, manifestMode, estTokens)
+}
+
+func evictForBudgetModeWithEstimator(docs []FovealDoc, conv []ScoredMessage, budget int, workspaceRoot string, manifestMode bool, estimateTokens func(string) int) ([]FovealDoc, []ScoredMessage) {
 	if budget <= 0 {
 		return nil, nil
 	}
@@ -410,7 +486,7 @@ func evictForBudgetMode(docs []FovealDoc, conv []ScoredMessage, budget int, work
 			break
 		}
 		if manifestMode {
-			manifestDoc, err := buildManifestDoc(doc, workspaceRoot)
+			manifestDoc, err := buildManifestDocWithEstimator(doc, workspaceRoot, estimateTokens)
 			if err != nil || manifestDoc.Summary == "" {
 				continue
 			}
@@ -423,7 +499,7 @@ func evictForBudgetMode(docs []FovealDoc, conv []ScoredMessage, budget int, work
 			if err != nil || content == "" {
 				continue
 			}
-			tokens := estTokens(content)
+			tokens := estimateTokens(content)
 			title := doc.Title
 			if title == "" {
 				title = filepath.Base(doc.Path)
@@ -447,6 +523,15 @@ func evictForBudgetMode(docs []FovealDoc, conv []ScoredMessage, budget int, work
 				break
 			}
 			m := conv[i]
+			if m.Role == "assistant" && i > 0 && conv[i-1].Role == "user" {
+				pairTokens := conv[i-1].Tokens + m.Tokens
+				if pairTokens <= remaining {
+					keptConv = append(keptConv, m, conv[i-1])
+					remaining -= pairTokens
+				}
+				i--
+				continue
+			}
 			if m.Tokens <= remaining {
 				keptConv = append(keptConv, m)
 				remaining -= m.Tokens
@@ -604,6 +689,10 @@ func renderWorkspaceManifest(docs []FovealDoc) string {
 }
 
 func buildManifestDoc(doc FovealDoc, workspaceRoot string) (FovealDoc, error) {
+	return buildManifestDocWithEstimator(doc, workspaceRoot, estTokens)
+}
+
+func buildManifestDocWithEstimator(doc FovealDoc, workspaceRoot string, estimateTokens func(string) int) (FovealDoc, error) {
 	source, err := readManifestSource(doc.Path, 100)
 	if err != nil {
 		return FovealDoc{}, err
@@ -636,7 +725,7 @@ func buildManifestDoc(doc FovealDoc, workspaceRoot string) (FovealDoc, error) {
 	doc.Content = ""
 	doc.Summary = summary
 	doc.SchemaIssues = missingSchemaIssues(source)
-	doc.Tokens = estTokens(fmt.Sprintf("- %s — %s [salience: %.2f]", firstNonBlank(uri, doc.Path), summary, doc.Salience))
+	doc.Tokens = estimateTokens(fmt.Sprintf("- %s — %s [salience: %.2f]", firstNonBlank(uri, doc.Path), summary, doc.Salience))
 	return doc, nil
 }
 
