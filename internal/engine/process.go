@@ -89,6 +89,12 @@ type Process struct {
 	// externalCh receives events from the HTTP serve layer.
 	externalCh chan *GateEvent
 
+	// tailerCh receives normalized CogBlocks from StreamTailer adapters.
+	tailerCh chan CogBlock
+
+	// tailerManager coordinates configured digestion stream tailers.
+	tailerManager *TailerManager
+
 	// index is the CogDoc index, rebuilt on each consolidation.
 	indexMu sync.RWMutex
 	index   *CogDocIndex
@@ -140,6 +146,7 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 			CoherenceFingerprint: "sha256:" + sha256Hex("coherence:unknown"),
 		},
 		externalCh:          make(chan *GateEvent, 64),
+		tailerCh:            make(chan CogBlock, 64),
 		observer:            NewTrajectoryModel(),
 		lastConsolidation:   now,
 		lastMaintenanceTick: now,
@@ -257,6 +264,7 @@ func (p *Process) Run(ctx context.Context) error {
 		p.indexMu.Unlock()
 		slog.Info("process: index built", "docs", len(idx.ByURI))
 	}
+	p.initTailers(ctx)
 
 	// Update attentional field (slow — git log per file, runs in background).
 	go func() {
@@ -294,6 +302,9 @@ func (p *Process) Run(ctx context.Context) error {
 		case evt := <-p.externalCh:
 			p.handleExternal(evt)
 
+		case block := <-p.tailerCh:
+			p.handleTailerBlock(block)
+
 		case <-consolidationTicker.C:
 			p.runConsolidation()
 
@@ -301,6 +312,86 @@ func (p *Process) Run(ctx context.Context) error {
 			p.emitHeartbeat()
 		}
 	}
+}
+
+func (p *Process) initTailers(ctx context.Context) {
+	if p.tailerManager == nil {
+		p.tailerManager = NewTailerManager(p.tailerCh)
+		p.registerConfiguredTailers(p.tailerManager)
+	}
+
+	if p.tailerManager == nil {
+		return
+	}
+
+	go func() {
+		if err := p.tailerManager.Run(ctx); err != nil {
+			slog.Warn("process: tailer manager stopped with error", "err", err)
+		}
+	}()
+}
+
+func (p *Process) registerConfiguredTailers(manager *TailerManager) {
+	if p == nil || p.cfg == nil || manager == nil || len(p.cfg.DigestPaths) == 0 {
+		return
+	}
+
+	for adapterName, configuredPath := range p.cfg.DigestPaths {
+		path := strings.TrimSpace(configuredPath)
+		switch adapterName {
+		case claudeCodeSourceChannel:
+			if path == "" {
+				path = "~/.claude/"
+			}
+			path = expandDigestPath(path)
+			if err := manager.Register(&ClaudeCodeTailer{}, path); err != nil {
+				slog.Warn("process: digest tailer register failed", "adapter", adapterName, "path", path, "err", err)
+				continue
+			}
+			slog.Info("process: digest tailer registered", "adapter", adapterName, "path", path)
+
+		case "openclaw":
+			if path == "" {
+				slog.Warn("process: digest tailer path empty", "adapter", adapterName)
+				continue
+			}
+			path = expandDigestPath(path)
+			if err := manager.Register(&OpenClawTailer{}, path); err != nil {
+				slog.Warn("process: digest tailer register failed", "adapter", adapterName, "path", path, "err", err)
+				continue
+			}
+			slog.Info("process: digest tailer registered", "adapter", adapterName, "path", path)
+
+		default:
+			slog.Warn("process: unknown digest adapter", "adapter", adapterName)
+		}
+	}
+}
+
+func expandDigestPath(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+		}
+	}
+	return path
+}
+
+func (p *Process) handleTailerBlock(block CogBlock) {
+	state := p.State()
+	if state != StateReceptive && state != StateActive {
+		slog.Debug("process: dropping tailer block outside receptive states", "state", state.String(), "source_channel", block.SourceChannel, "kind", block.Kind)
+		return
+	}
+
+	b := block
+	if b.Timestamp.IsZero() {
+		b.Timestamp = time.Now().UTC()
+	}
+
+	ref := p.RecordBlock(&b)
+	slog.Info("process: tailer block ingested", "source_channel", b.SourceChannel, "kind", b.Kind, "ledger_ref", ref)
 }
 
 // handleExternal processes an external perturbation.

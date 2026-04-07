@@ -62,6 +62,10 @@ type Config struct {
 	// Providers that advertise CapToolUse are trusted and skip this guardrail.
 	ToolCallValidationEnabled bool
 
+	// DigestPaths maps stream tailer adapter names to JSONL file/directory paths.
+	// Empty map means external digestion is disabled.
+	DigestPaths map[string]string
+
 	LocalModel string
 
 	localModelConfigured bool
@@ -69,18 +73,19 @@ type Config struct {
 
 // kernelConfigSection holds settings that can appear at the top level or inside v3:.
 type kernelConfigSection struct {
-	Port                  int    `yaml:"port"`
-	ConsolidationInterval int    `yaml:"consolidation_interval"`
-	HeartbeatInterval     int    `yaml:"heartbeat_interval"`
-	SalienceDaysWindow    int    `yaml:"salience_days_window"`
-	OutputReserve         int    `yaml:"output_reserve"`
-	TRMWeightsPath        string `yaml:"trm_weights_path"`
-	TRMEmbeddingsPath     string `yaml:"trm_embeddings_path"`
-	TRMChunksPath         string `yaml:"trm_chunks_path"`
-	OllamaEmbedEndpoint   string `yaml:"ollama_embed_endpoint"`
-	OllamaEmbedModel      string `yaml:"ollama_embed_model"`
-	ToolCallValidation    *bool  `yaml:"tool_call_validation_enabled"`
-	LocalModel            string `yaml:"local_model"`
+	Port                  int               `yaml:"port"`
+	ConsolidationInterval int               `yaml:"consolidation_interval"`
+	HeartbeatInterval     int               `yaml:"heartbeat_interval"`
+	SalienceDaysWindow    int               `yaml:"salience_days_window"`
+	OutputReserve         int               `yaml:"output_reserve"`
+	TRMWeightsPath        string            `yaml:"trm_weights_path"`
+	TRMEmbeddingsPath     string            `yaml:"trm_embeddings_path"`
+	TRMChunksPath         string            `yaml:"trm_chunks_path"`
+	OllamaEmbedEndpoint   string            `yaml:"ollama_embed_endpoint"`
+	OllamaEmbedModel      string            `yaml:"ollama_embed_model"`
+	ToolCallValidation    *bool             `yaml:"tool_call_validation_enabled"`
+	LocalModel            string            `yaml:"local_model"`
+	DigestPaths           map[string]string `yaml:"digest_paths"`
 }
 
 // kernelConfig is the on-disk YAML shape of .cog/config/kernel.yaml.
@@ -117,6 +122,7 @@ func LoadConfig(workspaceRoot string, port int) (*Config, error) {
 		OutputReserve:             4096,
 		ToolCallValidationEnabled: true,
 		LocalModel:                defaultOllamaModel,
+		DigestPaths:               make(map[string]string),
 	}
 
 	// Load from file if present.
@@ -176,6 +182,14 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	if s.LocalModel != "" {
 		cfg.LocalModel = s.LocalModel
 		cfg.localModelConfigured = true
+	}
+	if len(s.DigestPaths) > 0 {
+		if cfg.DigestPaths == nil {
+			cfg.DigestPaths = make(map[string]string, len(s.DigestPaths))
+		}
+		for name, path := range s.DigestPaths {
+			cfg.DigestPaths[name] = path
+		}
 	}
 }
 

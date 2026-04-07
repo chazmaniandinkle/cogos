@@ -39,6 +39,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if !cfg.ToolCallValidationEnabled {
 		t.Error("ToolCallValidationEnabled = false; want true by default")
 	}
+	if len(cfg.DigestPaths) != 0 {
+		t.Errorf("DigestPaths len = %d; want 0", len(cfg.DigestPaths))
+	}
 }
 
 func TestLoadConfigFromFile(t *testing.T) {
@@ -51,6 +54,9 @@ heartbeat_interval: 120
 salience_days_window: 30
 local_model: gemma4:e2b
 tool_call_validation_enabled: false
+digest_paths:
+  claude-code: ~/.claude/events.jsonl
+  openclaw: /tmp/openclaw
 `
 	writeTestFile(t, filepath.Join(root, ".cog", "config", "kernel.yaml"), kernelYAML)
 
@@ -76,6 +82,12 @@ tool_call_validation_enabled: false
 	}
 	if cfg.ToolCallValidationEnabled {
 		t.Error("ToolCallValidationEnabled = true; want false from file")
+	}
+	if cfg.DigestPaths["claude-code"] != "~/.claude/events.jsonl" {
+		t.Errorf("DigestPaths[claude-code] = %q; want ~/.claude/events.jsonl", cfg.DigestPaths["claude-code"])
+	}
+	if cfg.DigestPaths["openclaw"] != "/tmp/openclaw" {
+		t.Errorf("DigestPaths[openclaw] = %q; want /tmp/openclaw", cfg.DigestPaths["openclaw"])
 	}
 }
 
