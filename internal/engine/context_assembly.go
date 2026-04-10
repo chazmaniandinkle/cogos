@@ -495,7 +495,11 @@ func evictForBudgetModeWithEstimator(docs []FovealDoc, conv []ScoredMessage, bud
 			}
 			doc = manifestDoc
 		} else {
-			content, err := readDocContent(doc.Path, remaining)
+			readPath := doc.Path
+			if !filepath.IsAbs(readPath) && workspaceRoot != "" {
+				readPath = filepath.Join(workspaceRoot, readPath)
+			}
+			content, err := readDocContent(readPath, remaining)
 			if err != nil || content == "" {
 				continue
 			}
@@ -693,7 +697,11 @@ func buildManifestDoc(doc FovealDoc, workspaceRoot string) (FovealDoc, error) {
 }
 
 func buildManifestDocWithEstimator(doc FovealDoc, workspaceRoot string, estimateTokens func(string) int) (FovealDoc, error) {
-	source, err := readManifestSource(doc.Path, 100)
+	absPath := doc.Path
+	if !filepath.IsAbs(absPath) && workspaceRoot != "" {
+		absPath = filepath.Join(workspaceRoot, absPath)
+	}
+	source, err := readManifestSource(absPath, 100)
 	if err != nil {
 		return FovealDoc{}, err
 	}
