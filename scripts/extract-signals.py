@@ -163,10 +163,11 @@ def normalize_path(path: str) -> str:
         return os.path.relpath(path, ws)
     if path.startswith(alt_ws + "/"):
         return os.path.relpath(path, alt_ws)
-    if path.startswith("/Users/slowbro/cog-workspace/"):
-        return path.replace("/Users/slowbro/cog-workspace/", "")
-    if path.startswith("/Users/slowbro/workspaces/cog/"):
-        return path.replace("/Users/slowbro/workspaces/cog/", "")
+    home = os.path.expanduser("~")
+    if path.startswith(home + "/cog-workspace/"):
+        return path.replace(home + "/cog-workspace/", "")
+    if path.startswith(home + "/workspaces/cog/"):
+        return path.replace(home + "/workspaces/cog/", "")
     return path
 
 
