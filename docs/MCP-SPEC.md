@@ -81,7 +81,7 @@ This is useful for `.mcp.json` configurations that launch the server as a subpro
       "command": "cogos-v3",
       "args": ["serve", "--mcp-stdio"],
       "env": {
-        "COG_WORKSPACE": "/Users/slowbro/cog-workspace"
+        "COG_WORKSPACE": "/path/to/cog-workspace"
       }
     }
   }
@@ -146,7 +146,7 @@ This is useful for `.mcp.json` configurations that launch the server as a subpro
 {
   "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec",
   "resolved": true,
-  "filesystem_path": "/Users/slowbro/cog-workspace/.cog/mem/semantic/architecture/cogos-v3-design-spec.cog.md",
+  "filesystem_path": "$COG_WORKSPACE/.cog/mem/semantic/architecture/cogos-v3-design-spec.cog.md",
   "metadata": {
     "type": "architecture",
     "title": "CogOS v3 Design Specification",
@@ -634,7 +634,7 @@ Input: { "format": "summary" }
 ```json
 {
   "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec",
-  "filesystem_path": "/Users/slowbro/cog-workspace/.cog/mem/semantic/architecture/cogos-v3-design-spec.cog.md",
+  "filesystem_path": "$COG_WORKSPACE/.cog/mem/semantic/architecture/cogos-v3-design-spec.cog.md",
   "frontmatter": {
     "title": "CogOS v3 Design Specification",
     "type": "architecture",
@@ -728,7 +728,7 @@ Input: { "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec#two-axioms
 ```json
 {
   "uri": "cog://mem/semantic/project/new-doc",
-  "filesystem_path": "/Users/slowbro/cog-workspace/.cog/mem/semantic/project/new-doc.cog.md",
+  "filesystem_path": "$COG_WORKSPACE/.cog/mem/semantic/project/new-doc.cog.md",
   "created": false,
   "updated": true,
   "ledger_event_id": "evt_abc123",

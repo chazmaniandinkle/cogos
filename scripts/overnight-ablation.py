@@ -35,7 +35,7 @@ from urllib.error import URLError
 
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 KERNEL = os.environ.get("KERNEL_HOST", "http://localhost:6931")
-WORKSPACE = os.environ.get("WORKSPACE", "/Users/slowbro/workspaces/cog")
+WORKSPACE = os.environ.get("WORKSPACE", os.path.expanduser("~/workspaces/cog"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/ablation-overnight")
 
 # ── Workspace QA Set ─────────────────────────────────────────────────────────

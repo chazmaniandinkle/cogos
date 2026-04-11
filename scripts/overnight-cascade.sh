@@ -20,8 +20,8 @@ set -euo pipefail
 # ── Config ───────────────────────────────────────────────────────────────────
 
 SUPERVISOR="${SUPERVISOR:-local}"  # "local" (gemma4:26b) or "codex"
-WORKSPACE="${CASCADE_WORKSPACE:-/Users/slowbro/workspaces/cog}"
-COGOS_WORKSPACE="${CASCADE_COGOS:-/Users/slowbro/workspaces/cogos-dev/cogos}"
+WORKSPACE="${CASCADE_WORKSPACE:-$HOME/workspaces/cog}"
+COGOS_WORKSPACE="${CASCADE_COGOS:-$HOME/workspaces/cogos-dev/cogos}"
 OLLAMA="${OLLAMA_HOST:-http://localhost:11434}"
 MAX_CYCLES="${MAX_CYCLES:-999}"
 CYCLE_PAUSE="${CYCLE_PAUSE:-60}"  # seconds between cycles

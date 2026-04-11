@@ -41,7 +41,7 @@ func (f *fakeRuntime) Pull(_ string) error {
 
 func TestWorkspaceSlug(t *testing.T) {
 	t.Parallel()
-	got := workspaceSlug("/Users/slowbro/cog workspace")
+	got := workspaceSlug("/home/user/cog workspace")
 	if got != "cog-workspace" {
 		t.Fatalf("workspaceSlug = %q; want %q", got, "cog-workspace")
 	}
