@@ -23,6 +23,14 @@ Thumbs.db
 *.swp
 *.swo
 
+# Model weights (trained on personal data — never release)
+*.pt
+*.onnx
+*.safetensors
+*.gguf
+*.bin
+!go.sum
+
 # Eval artifacts (may contain PII)
 autoresearch-foveated/eval-details.json
 
