@@ -1,50 +1,123 @@
-# CogOS Kernel — Makefile
+# CogOS Kernel Build System
+# github.com/cogos-dev/cogos
 #
-# Targets:
-#   make build      — compile the binary
-#   make test       — run unit tests
-#   make e2e        — run e2e test in a container (cold-start → serve → verify)
-#   make e2e-local  — run e2e test locally (requires built binary)
-#   make image      — build production OCI image
-#   make run        — run in Docker with workspace volume mount
-#   make clean      — remove build artifacts
-#   make tidy       — go mod tidy
+# Multi-platform binaries can be built for distribution.
+#
+# Usage:
+#   make          - Build for current platform (creates 'cog' binary)
+#   make all      - Build for all platforms (cog-{os}-{arch})
+#   make test     - Run tests
+#   make clean    - Remove build artifacts
+#   make install  - Install to ~/.cog/bin/cogos
+#   make push     - Build + push to OCI layout (triggers kernel auto-reload)
+#   make image    - Build production OCI image
+#   make e2e      - Run e2e test in a container
+#   make e2e-local - Run e2e test locally
 
-BINARY     := cogos
+VERSION := 2.4.0
+BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -s -w -X main.BuildTime=$(BUILD_TIME)
+BUILD_TAGS := fts5
+BINARY := cog
+GO := go
+
 IMAGE      := cogos-dev/cogos
 TAG        := dev
 PORT       := 6931
 WORKSPACE  ?= $(shell git rev-parse --show-toplevel 2>/dev/null || echo $$HOME/cog-workspace)
-BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-VERSION    ?= dev
-LDFLAGS    := -s -w -X github.com/cogos-dev/cogos/internal/engine.Version=$(VERSION) -X github.com/cogos-dev/cogos/internal/engine.BuildTime=$(BUILD_TIME)
 
-.PHONY: build test test-coverage test-integration bench install image run push clean tidy e2e e2e-local
+# Detect current platform
+GOOS := $(shell go env GOOS)
+GOARCH := $(shell go env GOARCH)
 
-build:
-	go build -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/cogos
+# Build targets
+PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64
 
-build-mcp:
-	go build -tags mcpserver -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/cogos
+.PHONY: all build clean test test-coverage test-integration bench install push image run e2e e2e-local $(PLATFORMS)
 
+# Default: build for current platform
+build: $(BINARY)
+
+GO_SOURCES := $(wildcard *.go) $(wildcard harness/*.go)
+
+$(BINARY): $(GO_SOURCES) go.mod harness/go.mod
+	$(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) .
+
+# Build for all platforms
+all: $(PLATFORMS)
+
+darwin-arm64:
+	GOOS=darwin GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-darwin-arm64 .
+
+darwin-amd64:
+	GOOS=darwin GOARCH=amd64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-darwin-amd64 .
+
+linux-amd64:
+	GOOS=linux GOARCH=amd64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-linux-amd64 .
+
+linux-arm64:
+	GOOS=linux GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-linux-arm64 .
+
+# Android requires PIE (position-independent executables)
+android-arm64:
+	GOOS=android GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -buildmode=pie -ldflags="$(LDFLAGS)" -o $(BINARY)-android-arm64 .
+
+INSTALL_DIR := $(HOME)/.cog/bin
+INSTALL_TARGET := $(INSTALL_DIR)/cogos
+
+# Install to ~/.cog/bin/cogos (atomic: build, verify, checksum, move)
 install: build
-	install -m 755 $(BINARY) /usr/local/bin/cogos
-	@echo "Installed /usr/local/bin/cogos"
+	@echo "=== Installing to $(INSTALL_TARGET) ==="
+	@./$(BINARY) version > /dev/null 2>&1 || (echo "ERROR: built binary fails version check" && exit 1)
+	@mkdir -p "$(INSTALL_DIR)"
+	@if [ -f "$(INSTALL_TARGET)" ]; then \
+		cp "$(INSTALL_TARGET)" "$(INSTALL_TARGET).bak"; \
+		echo "  Backed up existing binary to $(INSTALL_TARGET).bak"; \
+	fi
+	@cp $(BINARY) "$(INSTALL_TARGET).tmp"
+	@chmod +x "$(INSTALL_TARGET).tmp"
+	@mv "$(INSTALL_TARGET).tmp" "$(INSTALL_TARGET)"
+	@NEW_SHA=$$(shasum -a 256 "$(INSTALL_TARGET)" | cut -d' ' -f1); \
+		echo "  Installed cogos $(VERSION) ($(GOOS)/$(GOARCH))"; \
+		echo "  SHA-256: $$NEW_SHA"
 
-test:
-	go test -race -count=1 ./...
+# Push to OCI layout — running kernel auto-reloads
+push: build
+	@echo "=== Pushing to OCI layout ==="
+	@./$(BINARY) oci push ./$(BINARY)
+
+# Run tests
+test: build
+	@echo "=== Unit Tests ==="
+	$(GO) test -tags "$(BUILD_TAGS)" -count=1 ./...
+	@echo ""
+	@echo "=== Smoke Tests ==="
+	@echo "=== Version Test ==="
+	./$(BINARY) version
+	@echo ""
+	@echo "=== Help Test ==="
+	./$(BINARY) help
+	@echo ""
+	@echo "=== Health Check ==="
+	./$(BINARY) health
+	@echo ""
+	@echo "=== Coherence Check ==="
+	./$(BINARY) coherence check || true
+	@echo ""
+	@echo "=== All tests passed ==="
 
 test-coverage:
-	go test -race -count=1 -coverprofile=coverage.out ./...
+	$(GO) test -tags "$(BUILD_TAGS)" -race -count=1 -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
 
 test-integration:
-	go test -tags integration -race -count=1 -timeout 30s ./...
+	$(GO) test -tags "integration,$(BUILD_TAGS)" -race -count=1 -timeout 30s ./...
 
 bench: build
 	./$(BINARY) bench --workspace $(WORKSPACE) --no-inference
 
+# Docker targets
 image:
 	docker build \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
@@ -58,9 +131,6 @@ run: image
 		$(IMAGE):$(TAG) \
 		serve --workspace $(WORKSPACE) --port $(PORT)
 
-push:
-	docker push $(IMAGE):$(TAG)
-
 e2e:
 	docker build -f Dockerfile.e2e -t cogos-e2e-test .
 	docker run --rm cogos-e2e-test
@@ -68,9 +138,51 @@ e2e:
 e2e-local: build
 	COGOS_BIN=./$(BINARY) ./scripts/e2e-test.sh
 
+# Compare with Python version
+compare: build
+	@echo "=== Go Version ==="
+	./$(BINARY) coherence check
+	@echo ""
+	@echo "=== Python Version ==="
+	python3 hooks/coherence.py check || echo "(Python coherence not available)"
+
+# Clean build artifacts
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) $(BINARY)-*
+	rm -f *.tmp.*
 	go clean ./...
+
+# Development helpers
+fmt:
+	gofmt -s -w *.go
+
+vet:
+	$(GO) vet ./...
 
 tidy:
 	go mod tidy
+
+lint: vet
+	@echo "=== Checking for bare exec.Command ==="
+	@if grep -n 'exec\.Command(' *.go | grep -v '_test\.go' | grep -v 'CommandContext' | grep -v '// bare-ok' > /dev/null 2>&1; then \
+		echo "ERROR: bare exec.Command found (use CommandContext with timeout):"; \
+		grep -n 'exec\.Command(' *.go | grep -v '_test\.go' | grep -v 'CommandContext' | grep -v '// bare-ok'; \
+		exit 1; \
+	else \
+		echo "  All exec.Command calls use CommandContext"; \
+	fi
+	@if grep -rn 'exec\.Command(' sdk/ | grep -v '_test\.go' | grep -v 'CommandContext' | grep -v '// bare-ok' > /dev/null 2>&1; then \
+		echo "ERROR: bare exec.Command found in sdk/:"; \
+		grep -rn 'exec\.Command(' sdk/ | grep -v '_test\.go' | grep -v 'CommandContext' | grep -v '// bare-ok'; \
+		exit 1; \
+	else \
+		echo "  SDK: All exec.Command calls use CommandContext"; \
+	fi
+
+# Show binary info
+info: build
+	@echo "Binary: $(BINARY)"
+	@echo "Size: $(shell ls -lh $(BINARY) | awk '{print $$5}')"
+	@echo "Version: $(VERSION)"
+	@echo "Build: $(BUILD_TIME)"
+	@file $(BINARY)

@@ -6,22 +6,23 @@
 *.dylib
 *.so
 
-# Build artifacts
+# Build / test artifacts
 .tmp/
 .gotmp/
+*.tmp.*
 *.test
 *.out
 coverage.html
-
-# OS
-.DS_Store
-Thumbs.db
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+
+# OS
+.DS_Store
+Thumbs.db
 
 # Model weights (trained on personal data — never release)
 *.pt
