@@ -1,17 +1,35 @@
 # Binaries
 cog
 cogos
+cogos-v3
+cog-v3
 cog-*
 *.exe
+*.dylib
+*.so
 
-# Test artifacts
+# Build / test artifacts
+.tmp/
+.gotmp/
 *.tmp.*
 *.test
+*.out
+coverage.html
 
 # IDE
 .idea/
 .vscode/
 *.swp
+*.swo
 
 # OS
 .DS_Store
+Thumbs.db
+
+# Eval artifacts (may contain PII)
+autoresearch-foveated/eval-details.json
+
+# Runtime
+*.log
+*.pid
+run/

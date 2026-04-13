@@ -10,6 +10,9 @@
 #   make clean    - Remove build artifacts
 #   make install  - Install to ~/.cog/bin/cogos
 #   make push     - Build + push to OCI layout (triggers kernel auto-reload)
+#   make image    - Build production OCI image
+#   make e2e      - Run e2e test in a container
+#   make e2e-local - Run e2e test locally
 
 VERSION := 2.4.0
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -18,6 +21,11 @@ BUILD_TAGS := fts5
 BINARY := cog
 GO := go
 
+IMAGE      := cogos-dev/cogos
+TAG        := dev
+PORT       := 6931
+WORKSPACE  ?= $(shell git rev-parse --show-toplevel 2>/dev/null || echo $$HOME/cog-workspace)
+
 # Detect current platform
 GOOS := $(shell go env GOOS)
 GOARCH := $(shell go env GOARCH)
@@ -25,7 +33,7 @@ GOARCH := $(shell go env GOARCH)
 # Build targets
 PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64
 
-.PHONY: all build clean test install push $(PLATFORMS)
+.PHONY: all build clean test test-coverage test-integration bench install push image run e2e e2e-local $(PLATFORMS)
 
 # Default: build for current platform
 build: $(BINARY)
@@ -98,6 +106,38 @@ test: build
 	@echo ""
 	@echo "=== All tests passed ==="
 
+test-coverage:
+	$(GO) test -tags "$(BUILD_TAGS)" -race -count=1 -coverprofile=coverage.out ./...
+	go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report: coverage.html"
+
+test-integration:
+	$(GO) test -tags "integration,$(BUILD_TAGS)" -race -count=1 -timeout 30s ./...
+
+bench: build
+	./$(BINARY) bench --workspace $(WORKSPACE) --no-inference
+
+# Docker targets
+image:
+	docker build \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t $(IMAGE):$(TAG) \
+		.
+
+run: image
+	docker run --rm \
+		-v $(WORKSPACE):$(WORKSPACE) \
+		-p $(PORT):$(PORT) \
+		$(IMAGE):$(TAG) \
+		serve --workspace $(WORKSPACE) --port $(PORT)
+
+e2e:
+	docker build -f Dockerfile.e2e -t cogos-e2e-test .
+	docker run --rm cogos-e2e-test
+
+e2e-local: build
+	COGOS_BIN=./$(BINARY) ./scripts/e2e-test.sh
+
 # Compare with Python version
 compare: build
 	@echo "=== Go Version ==="
@@ -110,6 +150,7 @@ compare: build
 clean:
 	rm -f $(BINARY) $(BINARY)-*
 	rm -f *.tmp.*
+	go clean ./...
 
 # Development helpers
 fmt:
@@ -117,6 +158,9 @@ fmt:
 
 vet:
 	$(GO) vet ./...
+
+tidy:
+	go mod tidy
 
 lint: vet
 	@echo "=== Checking for bare exec.Command ==="

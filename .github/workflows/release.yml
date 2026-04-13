@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X github.com/cogos-dev/cogos/internal/engine.Version=${VERSION} -X github.com/cogos-dev/cogos/internal/engine.BuildTime=${BUILD_TIME}"
+          for GOOS in linux darwin windows; do
+            for GOARCH in amd64 arm64; do
+              ext=""
+              if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+              output="dist/cogos-${GOOS}-${GOARCH}${ext}"
+              echo "Building $output..."
+              CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="${LDFLAGS}" -o "$output" ./cmd/cogos/
+            done
+          done
+          cd dist && sha256sum cogos-* > checksums.txt
+          ls -lh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}

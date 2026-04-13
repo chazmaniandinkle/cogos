@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# cog — CogOS workspace CLI
+#
+# User-facing shell for interacting with CogOS workspaces.
+# Routes commands to the cogos kernel binary.
+#
+# Usage:
+#   cog <command> [args...]       Direct kernel command
+#   cog -p <prompt>               Natural language mode
+#   cog -w <path> <command>       Target a specific workspace
+
+set -euo pipefail
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
+show_help() {
+    cat <<'EOF'
+cog — CogOS workspace CLI
+
+USAGE:
+    cog [FLAGS] <command> [args...]
+    cog -p <natural language prompt>
+
+FLAGS:
+    -p <prompt>         Natural language mode
+    -w <path>           Target a specific workspace
+    -v, --verbose       Verbose output
+    -h, --help          Show this help
+
+COMMANDS:
+    init [path]         Initialize a new workspace
+    serve               Start the daemon (foreground)
+    start               Start the daemon (container)
+    stop                Stop the daemon
+    status              Show daemon status
+    health              Health check
+    version             Show version
+    chat                Interactive chat
+    logs                View daemon logs
+
+EXAMPLES:
+    cog init ~/my-project
+    cog serve
+    cog health
+    cog -p "search memory for anything about authentication"
+    cog -w ~/other-project status
+
+EOF
+}
+
+# ── Workspace detection ───────────────────────────────────────────────────────
+
+find_workspace() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -d "$dir/.cog" ]; then
+            echo "$dir"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+# ── Kernel resolution ─────────────────────────────────────────────────────────
+
+find_kernel() {
+    # 1. ~/.cogos/bin/cogos (standard install location)
+    if [ -x "$HOME/.cogos/bin/cogos" ]; then
+        echo "$HOME/.cogos/bin/cogos"
+        return 0
+    fi
+
+    # 2. cogos on PATH
+    if command -v cogos &>/dev/null; then
+        command -v cogos
+        return 0
+    fi
+
+    # 3. Workspace-local binary (legacy/development)
+    if [ -n "${WORKSPACE:-}" ] && [ -x "$WORKSPACE/.cog/bin/cogos" ]; then
+        echo "$WORKSPACE/.cog/bin/cogos"
+        return 0
+    fi
+
+    return 1
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+WORKSPACE=""
+PROMPT_MODE=false
+VERBOSE=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -p)
+            PROMPT_MODE=true
+            shift
+            break
+            ;;
+        -w|--workspace)
+            WORKSPACE="$2"
+            shift 2
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            export COG_VERBOSE=true
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Resolve workspace (if not specified, detect from cwd).
+if [ -z "$WORKSPACE" ]; then
+    WORKSPACE=$(find_workspace 2>/dev/null || true)
+fi
+
+# Some commands don't need a workspace (init, version).
+case "${1:-}" in
+    init|version|--help|-h)
+        # These work without a workspace
+        ;;
+    *)
+        if [ -z "$WORKSPACE" ]; then
+            echo "Error: No workspace found." >&2
+            echo "Run from inside a workspace, use -w <path>, or run 'cog init' first." >&2
+            exit 1
+        fi
+        ;;
+esac
+
+# Resolve kernel binary.
+KERNEL=$(find_kernel 2>/dev/null || true)
+if [ -z "$KERNEL" ]; then
+    echo "Error: cogos binary not found." >&2
+    echo "Run setup-dev.sh or install cogos first." >&2
+    exit 1
+fi
+
+# Route.
+if [ "$PROMPT_MODE" = true ]; then
+    PROMPT="$*"
+    if [ -z "$PROMPT" ]; then
+        echo "Error: -p requires a prompt" >&2
+        exit 1
+    fi
+    if [ "$VERBOSE" = true ]; then
+        echo "[cog] prompt mode: $PROMPT" >&2
+    fi
+    exec "$KERNEL" infer-intent "$PROMPT"
+else
+    if [ "$VERBOSE" = true ]; then
+        echo "[cog] → $KERNEL $*" >&2
+    fi
+
+    # Pass workspace flag if we have one and the command isn't init with a positional arg.
+    if [ -n "$WORKSPACE" ]; then
+        exec "$KERNEL" --workspace "$WORKSPACE" "$@"
+    else
+        exec "$KERNEL" "$@"
+    fi
+fi

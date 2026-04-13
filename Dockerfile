@@ -1,17 +1,20 @@
-# CogOS Kernel — Multi-stage Docker build
-# Produces a minimal Alpine image with the kernel binary.
+# CogOS Kernel — Multi-stage OCI build
 #
 # Build:
-#   docker build -t cogos/kernel:latest .
+#   docker build -t cogos-dev/cogos:dev .
 #
 # Run:
-#   docker run -v /path/to/.cog:/workspace/.cog -p 5100:5100 cogos/kernel:latest
+#   docker run -v /path/to/workspace:/workspace \
+#              -p 6931:6931 cogos-dev/cogos:dev \
+#              serve --workspace /workspace --port 6931
 #
 # Multi-platform:
-#   docker buildx build --platform linux/amd64,linux/arm64 -t cogos/kernel:latest .
+#   docker buildx build --platform linux/amd64,linux/arm64 -t cogos-dev/cogos:dev .
 
-# ── Stage 1: Build ───────────────────────────────────────────────────────────────
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
 FROM golang:1.24-alpine AS builder
+
+ARG BUILD_TIME=unknown
 
 RUN apk add --no-cache gcc musl-dev sqlite-dev
 
@@ -32,24 +35,18 @@ COPY . .
 # Build with CGO for SQLite FTS5 support
 RUN CGO_ENABLED=1 go build \
     -tags "fts5" \
-    -ldflags="-s -w -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -ldflags="-s -w -X main.BuildTime=${BUILD_TIME}" \
     -o /cog .
 
-# ── Stage 2: Runtime ─────────────────────────────────────────────────────────────
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM alpine:3.21
 
 RUN apk add --no-cache \
     ca-certificates \
     sqlite-libs \
     git \
-    curl \
-    nodejs \
-    npm
+    curl
 
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
-
-# Create non-root user
 RUN addgroup -S cogos && adduser -S cogos -G cogos
 
 WORKDIR /workspace
@@ -58,17 +55,17 @@ WORKDIR /workspace
 COPY --from=builder /cog /usr/local/bin/cog
 
 # Create workspace structure
-RUN mkdir -p .cog/mem .cog/config .cog/run .cog/logs \
+RUN mkdir -p .cog/mem .cog/config .cog/run .cog/logs .cog/ledger \
     && chown -R cogos:cogos /workspace
 
 USER cogos
 
 # Kernel API port
-EXPOSE 5100
+EXPOSE 6931
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:5100/health || exit 1
+    CMD curl -f http://localhost:6931/health || exit 1
 
 ENTRYPOINT ["cog"]
-CMD ["serve", "--port", "5100"]
+CMD ["serve", "--port", "6931"]
