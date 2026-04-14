@@ -201,10 +201,9 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 		Goal:   goal,
 	}
 
-	// Tier 0, stability 90: Project block (CLAUDE.md)
-	if blk := buildProjectBlock(s.cfg.WorkspaceRoot); blk != nil {
-		frame.Blocks = append(frame.Blocks, *blk)
-	}
+	// NOTE: CLAUDE.md (project block) is NOT injected here.
+	// Claude Code loads it natively — injecting it again wastes ~1.4k tokens.
+	// The kernel's foveated context is additive: only what the client doesn't have.
 
 	// Tier 2, stability 70: Node health (sibling services)
 	if blk := buildNodeBlock(s.process); blk != nil {
