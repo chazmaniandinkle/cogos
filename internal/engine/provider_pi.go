@@ -29,7 +29,7 @@ import (
 type PiProvider struct {
 	name      string
 	provider  string // ollama, openrouter, etc.
-	model     string // qwen3.5:9b, gemma4:e4b, etc.
+	model     string // gemma4:e4b, gemma4:e2b, etc.
 	thinking  string // off, minimal, low, medium, high, xhigh
 	timeout   time.Duration
 	piBinary  string // path to pi binary (default: "pi")
@@ -41,7 +41,7 @@ type PiProvider struct {
 func NewPiProvider(name string, cfg ProviderConfig, procMgr *ProcessManager) *PiProvider {
 	model := cfg.Model
 	if model == "" {
-		model = "qwen3.5:9b"
+		model = defaultOllamaModel
 	}
 	timeout := time.Duration(cfg.Timeout) * time.Second
 	if timeout == 0 {

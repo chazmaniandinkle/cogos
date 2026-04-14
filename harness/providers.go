@@ -67,7 +67,7 @@ func DefaultProviders() map[ProviderType]*ProviderConfig {
 			Type:    ProviderOllama,
 			BaseURL: ollamaHost + "/v1", // Ollama's OpenAI-compatible endpoint
 			APIKey:  "",                 // Ollama doesn't require API key
-			Model:   "llama3.2",
+			Model:   "gemma4:e4b",
 		},
 		ProviderLocal: {
 			Type:    ProviderLocal,

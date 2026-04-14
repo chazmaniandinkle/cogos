@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-04-14 — Gemma 4 default, dashboard model selector
+
+### Changed
+- Default Ollama model switched from Qwen 3.5 / Llama 3.2 to Gemma 4 E4B across all layers (inference.go, harness, serve_providers, provider_pi, dashboard HTML)
+- Dashboard model selector updated: gemma4:e4b, gemma4:e2b, gemma4:26b, llama3.2:1b
+- Provider model list now reflects locally available Ollama models
+- Pi provider default model uses `defaultOllamaModel` constant instead of hardcoded string
+- Help text in chat and benchmark commands updated for Gemma 4 examples
+
+## [2.4.0]
+
 ### Added
 - OpenAI-compatible provider for LM Studio, vLLM, llama.cpp (1,613 LOC, 18 tests)
 - Auto-discovery of inference providers on localhost

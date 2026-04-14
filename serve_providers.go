@@ -60,7 +60,7 @@ func getProviderModels(pt ProviderType) []string {
 	case ProviderOpenRouter:
 		return []string{"anthropic/claude-3-haiku", "openai/gpt-4o-mini", "google/gemini-pro"}
 	case ProviderOllama:
-		return []string{"llama3.2", "mistral", "codellama"}
+		return []string{"gemma4:e4b", "gemma4:e2b", "gemma4:26b", "llama3.2:1b"}
 	case ProviderLocal:
 		return []string{"claude"} // Routes to Claude by default
 	default:
