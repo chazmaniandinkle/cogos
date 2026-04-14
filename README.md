@@ -1,5 +1,9 @@
 # CogOS
 
+[![CI](https://github.com/cogos-dev/cogos/actions/workflows/ci.yml/badge.svg)](https://github.com/cogos-dev/cogos/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go Report Card](https://goreportcard.com/badge/github.com/cogos-dev/cogos)](https://goreportcard.com/report/github.com/cogos-dev/cogos)
+
 A cognitive daemon for AI agents. Written in Go. Runs locally. Gives Claude Code, Cursor, and other AI tools persistent memory, scored context, and workspace continuity.
 
 ```sh
@@ -185,6 +189,7 @@ CogOS is one piece of a larger system. Each component is its own repo with indep
 | [constellation](https://github.com/cogos-dev/constellation) | Distributed identity and workspace sync (BEP-based) |
 | [mod3](https://github.com/cogos-dev/mod3) | Modality bus -- voice I/O, TTS, channel multiplexing |
 | [skills](https://github.com/cogos-dev/skills) | Agent skill library (Claude Code compatible) |
+| [openclaw-plugin](https://github.com/cogos-dev/openclaw-plugin) | OpenClaw digestion adapter for Claude Code |
 | [charts](https://github.com/cogos-dev/charts) | Helm charts and Docker Compose for deployment |
 | [desktop](https://github.com/cogos-dev/desktop) | macOS app -- kernel management and dashboard |
 
