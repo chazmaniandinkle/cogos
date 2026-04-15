@@ -1,4 +1,4 @@
-package main
+package coordination
 
 import (
 	"encoding/json"
@@ -58,12 +58,13 @@ func pathToClaim(path string) string {
 	return strings.ReplaceAll(path, "/", "_") + ".claim"
 }
 
-// CreateClaim acquires a file lock for exclusive work
-func CreateClaim(workspaceRoot, path, reason string) error {
-	agent := getAgentID()
+// CreateClaim acquires a file lock for exclusive work.
+// Returns the created Claim on success.
+func CreateClaim(workspaceRoot, path, reason string) (*Claim, error) {
+	agent := AgentID()
 	claimDir := filepath.Join(workspaceRoot, ".cog", "claims")
 	if err := os.MkdirAll(claimDir, 0755); err != nil {
-		return fmt.Errorf("failed to create claims directory: %w", err)
+		return nil, fmt.Errorf("failed to create claims directory: %w", err)
 	}
 
 	claimFile := filepath.Join(claimDir, pathToClaim(path))
@@ -71,7 +72,7 @@ func CreateClaim(workspaceRoot, path, reason string) error {
 	// Check if already claimed
 	if existing, err := ReadClaim(workspaceRoot, path); err == nil {
 		if existing.Agent != agent {
-			return fmt.Errorf("already claimed by: %s", existing.Agent)
+			return nil, fmt.Errorf("already claimed by: %s", existing.Agent)
 		}
 		// Same agent re-claiming - update timestamp
 	}
@@ -86,18 +87,17 @@ func CreateClaim(workspaceRoot, path, reason string) error {
 
 	data, err := json.MarshalIndent(claim, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal claim: %w", err)
+		return nil, fmt.Errorf("failed to marshal claim: %w", err)
 	}
 
 	if err := os.WriteFile(claimFile, data, 0644); err != nil {
-		return fmt.Errorf("failed to write claim: %w", err)
+		return nil, fmt.Errorf("failed to write claim: %w", err)
 	}
 
-	fmt.Printf("Claimed: %s\n", PathToURI(workspaceRoot, path))
-	return nil
+	return &claim, nil
 }
 
-// ReleaseClaim releases a file lock
+// ReleaseClaim releases a file lock.
 func ReleaseClaim(workspaceRoot, path string) error {
 	claimFile := filepath.Join(workspaceRoot, ".cog", "claims", pathToClaim(path))
 
@@ -110,7 +110,6 @@ func ReleaseClaim(workspaceRoot, path string) error {
 		return fmt.Errorf("failed to release claim: %w", err)
 	}
 
-	fmt.Printf("Released: %s\n", PathToURI(workspaceRoot, path))
 	return nil
 }
 
@@ -188,15 +187,15 @@ func ListClaims(workspaceRoot string) ([]Claim, error) {
 // CHECKPOINTS - Synchronization points
 // =============================================================================
 
-// CreateCheckpoint creates a checkpoint signal for the current agent
-// Uses the signal system (sdk/signals.go) for stigmergic coordination
-func CreateCheckpoint(workspaceRoot, name string) error {
-	agent := getAgentID()
+// CreateCheckpoint creates a checkpoint signal for the current agent.
+// Returns the agent ID and checkpoint name for display purposes.
+func CreateCheckpoint(workspaceRoot, name string) (agentID string, err error) {
+	agent := AgentID()
 
 	// Create signal directory
 	signalDir := filepath.Join(workspaceRoot, ".cog", "signals", "checkpoint", name)
 	if err := os.MkdirAll(signalDir, 0755); err != nil {
-		return fmt.Errorf("failed to create checkpoint directory: %w", err)
+		return "", fmt.Errorf("failed to create checkpoint directory: %w", err)
 	}
 
 	// Write timestamp as signal
@@ -204,11 +203,10 @@ func CreateCheckpoint(workspaceRoot, name string) error {
 	timestamp := time.Now().Format(time.RFC3339)
 
 	if err := os.WriteFile(signalFile, []byte(timestamp), 0644); err != nil {
-		return fmt.Errorf("failed to write checkpoint signal: %w", err)
+		return "", fmt.Errorf("failed to write checkpoint signal: %w", err)
 	}
 
-	fmt.Printf("Checkpoint created: %s/%s\n", name, agent)
-	return nil
+	return agent, nil
 }
 
 // WaitCheckpoint waits for all agents to reach a checkpoint
@@ -227,7 +225,6 @@ func WaitCheckpoint(workspaceRoot, name string, agents []string, timeout time.Du
 		}
 
 		if allReady {
-			fmt.Printf("Checkpoint reached: %s (all agents ready)\n", name)
 			return nil
 		}
 
@@ -243,13 +240,14 @@ func WaitCheckpoint(workspaceRoot, name string, agents []string, timeout time.Du
 // HANDOFFS - Sequential coordination
 // =============================================================================
 
-// CreateHandoff creates a handoff to another agent
-func CreateHandoff(workspaceRoot, toAgent, artifact, message string) error {
-	fromAgent := getAgentID()
+// CreateHandoff creates a handoff to another agent.
+// Returns the created Handoff on success.
+func CreateHandoff(workspaceRoot, toAgent, artifact, message string) (*Handoff, error) {
+	fromAgent := AgentID()
 	handoffDir := filepath.Join(workspaceRoot, ".cog", "handoffs")
 
 	if err := os.MkdirAll(handoffDir, 0755); err != nil {
-		return fmt.Errorf("failed to create handoffs directory: %w", err)
+		return nil, fmt.Errorf("failed to create handoffs directory: %w", err)
 	}
 
 	handoff := Handoff{
@@ -262,24 +260,24 @@ func CreateHandoff(workspaceRoot, toAgent, artifact, message string) error {
 
 	data, err := json.MarshalIndent(handoff, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal handoff: %w", err)
+		return nil, fmt.Errorf("failed to marshal handoff: %w", err)
 	}
 
 	filename := fmt.Sprintf("%s-%d.json", toAgent, time.Now().Unix())
 	handoffFile := filepath.Join(handoffDir, filename)
 
 	if err := os.WriteFile(handoffFile, data, 0644); err != nil {
-		return fmt.Errorf("failed to write handoff: %w", err)
+		return nil, fmt.Errorf("failed to write handoff: %w", err)
 	}
 
-	fmt.Printf("Handoff created: %s -> %s (%s)\n", fromAgent, toAgent, artifact)
-	return nil
+	return &handoff, nil
 }
 
-// ListHandoffs returns pending handoffs for an agent
+// ListHandoffs returns pending handoffs for an agent.
+// If agent is empty, uses the current agent ID.
 func ListHandoffs(workspaceRoot, agent string) ([]Handoff, error) {
 	if agent == "" {
-		agent = getAgentID()
+		agent = AgentID()
 	}
 
 	handoffDir := filepath.Join(workspaceRoot, ".cog", "handoffs")
@@ -329,7 +327,6 @@ func AcceptHandoff(workspaceRoot, handoffFile string) error {
 		return fmt.Errorf("failed to archive handoff: %w", err)
 	}
 
-	fmt.Printf("Handoff accepted: %s\n", handoffFile)
 	return nil
 }
 
@@ -337,13 +334,14 @@ func AcceptHandoff(workspaceRoot, handoffFile string) error {
 // BROADCASTS - One-to-many signals
 // =============================================================================
 
-// CreateBroadcast broadcasts a message to a channel
-func CreateBroadcast(workspaceRoot, channel, message string) error {
-	agent := getAgentID()
+// CreateBroadcast broadcasts a message to a channel.
+// Returns the created Broadcast on success.
+func CreateBroadcast(workspaceRoot, channel, message string) (*Broadcast, error) {
+	agent := AgentID()
 	broadcastDir := filepath.Join(workspaceRoot, ".cog", "broadcasts", channel)
 
 	if err := os.MkdirAll(broadcastDir, 0755); err != nil {
-		return fmt.Errorf("failed to create broadcast directory: %w", err)
+		return nil, fmt.Errorf("failed to create broadcast directory: %w", err)
 	}
 
 	broadcast := Broadcast{
@@ -355,18 +353,17 @@ func CreateBroadcast(workspaceRoot, channel, message string) error {
 
 	data, err := json.MarshalIndent(broadcast, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal broadcast: %w", err)
+		return nil, fmt.Errorf("failed to marshal broadcast: %w", err)
 	}
 
 	filename := fmt.Sprintf("%s-%d.msg", agent, time.Now().Unix())
 	broadcastFile := filepath.Join(broadcastDir, filename)
 
 	if err := os.WriteFile(broadcastFile, data, 0644); err != nil {
-		return fmt.Errorf("failed to write broadcast: %w", err)
+		return nil, fmt.Errorf("failed to write broadcast: %w", err)
 	}
 
-	fmt.Printf("Broadcast sent: [%s] %s\n", channel, message)
-	return nil
+	return &broadcast, nil
 }
 
 // ListBroadcasts returns broadcasts on a channel since a time window
@@ -418,8 +415,9 @@ func ListBroadcasts(workspaceRoot, channel string, since time.Duration) ([]Broad
 // UTILITIES
 // =============================================================================
 
-// getAgentID returns the current agent identifier
-func getAgentID() string {
+// AgentID returns the current agent identifier.
+// It checks COG_AGENT_ID, then USER, defaulting to "root".
+func AgentID() string {
 	if agent := os.Getenv("COG_AGENT_ID"); agent != "" {
 		return agent
 	}
