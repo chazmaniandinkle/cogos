@@ -332,6 +332,19 @@ body {
 }
 .cogdoc-viewer-overlay.open { display: block; }
 
+/* ── Decompose Panel ── */
+.decomp-row {
+  padding: 6px 8px; border-radius: 4px; margin-bottom: 4px;
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.5;
+}
+.decomp-row .decomp-hash { color: var(--accent); }
+.decomp-row .decomp-tier { color: var(--text-dim); }
+.decomp-row .decomp-total { color: var(--text); font-weight: 600; }
+.decomp-row.ratio-high { border-left: 3px solid var(--green); }
+.decomp-row.ratio-mid { border-left: 3px solid var(--yellow); }
+.decomp-row.ratio-low { border-left: 3px solid var(--text-dim); opacity: 0.7; }
+
 /* ── Proprioceptive Panel ── */
 .proprio-section {
   margin-bottom: 20px;
@@ -466,6 +479,7 @@ body {
       <button class="panel-tab" data-tab="metrics">Metrics</button>
       <button class="panel-tab" data-tab="settings">Settings</button>
       <button class="panel-tab" data-tab="proprio">Proprioceptive</button>
+      <button class="panel-tab" data-tab="decompose">Decompose</button>
     </div>
 
     <div class="panel-content">
@@ -577,6 +591,15 @@ body {
           <div class="proprio-section-title">Last Turn Detail</div>
           <div class="proprio-card" id="proprio-last-turn">
             <div class="pred-graph-empty">No turns recorded yet</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel-section" id="tab-decompose">
+        <div class="proprio-section">
+          <div class="proprio-section-title">Recent Decompositions</div>
+          <div id="decompose-history" style="font-family:var(--font-mono);font-size:12px;color:var(--text-dim)">
+            No decompositions recorded yet
           </div>
         </div>
       </div>
@@ -1355,10 +1378,79 @@ function startProprioPolling() {
   }, 10000);
 }
 
+// ── Decomposition Panel ──
+let decompRefreshTimer = null;
+
+async function refreshDecompositions() {
+  try {
+    const res = await fetch(API + '/v1/bus/events?bus_id=decompose&type=decompose.complete&limit=10');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderDecompositions(data.events || data || []);
+  } catch {}
+}
+
+function fmtLatency(ms) {
+  if (ms == null) return '--';
+  if (ms < 1000) return ms + 'ms';
+  return (ms / 1000).toFixed(1) + 's';
+}
+
+function renderDecompositions(events) {
+  const container = document.getElementById('decompose-history');
+  if (!events || events.length === 0) {
+    container.innerHTML = '<div style="color:var(--text-dim);font-size:12px">No decompositions recorded yet</div>';
+    return;
+  }
+
+  let html = '';
+  for (const evt of events) {
+    const p = evt.payload || evt;
+    const hash = (p.input_hash || '--').substring(0, 10);
+    const ratio = p.compression_ratio || 0;
+    const ratioClass = ratio > 100 ? 'ratio-high' : (ratio >= 50 ? 'ratio-mid' : 'ratio-low');
+    const ts = evt.ts ? new Date(evt.ts).toLocaleTimeString() : '--';
+
+    html += '<div class="decomp-row ' + ratioClass + '">'
+      + '<span style="color:var(--text-dim)">[' + ts + ']</span> '
+      + '<span class="decomp-hash">' + hash + '...</span>'
+      + '<br>'
+      + '<span class="decomp-tier">T0: ' + (p.tier0_tokens || 0) + 'tok ' + fmtLatency(p.tier0_latency_ms) + '</span>'
+      + ' | <span class="decomp-tier">T1: ' + (p.tier1_tokens || 0) + 'tok ' + fmtLatency(p.tier1_latency_ms) + '</span>'
+      + ' | <span class="decomp-tier">T2: ' + (p.tier2_tokens || 0) + 'tok ' + fmtLatency(p.tier2_latency_ms) + '</span>'
+      + '<br>'
+      + '<span class="decomp-total">Total: ' + fmtLatency(p.total_latency) + '</span>'
+      + (ratio > 0 ? ' | <span style="color:' + (ratio > 100 ? 'var(--green)' : ratio >= 50 ? 'var(--yellow)' : 'var(--text-dim)') + '">' + Math.round(ratio) + ':1</span>' : '')
+      + (p.schema_conformant === false ? ' | <span style="color:var(--red)">retry</span>' : '')
+      + '</div>';
+  }
+  container.innerHTML = html;
+}
+
+// Hook tab switching to trigger decompose refresh
+document.querySelectorAll('.panel-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    if (tab.dataset.tab === 'decompose') {
+      refreshDecompositions();
+    }
+  });
+});
+
+function startDecompPolling() {
+  if (decompRefreshTimer) return;
+  decompRefreshTimer = setInterval(() => {
+    const tab = document.querySelector('.panel-tab[data-tab="decompose"]');
+    if (tab && tab.classList.contains('active')) {
+      refreshDecompositions();
+    }
+  }, 15000);
+}
+
 // ── Init ──
 pollHealth();
 setInterval(pollHealth, 5000);
 startProprioPolling();
+startDecompPolling();
 inputEl.focus();
 </script>
 </body>

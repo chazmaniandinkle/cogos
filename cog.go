@@ -5828,6 +5828,8 @@ func main() {
 		code = cmdOCI(os.Args[2:])
 	case "service":
 		code = cmdService(os.Args[2:])
+	case "decompose":
+		code = cmdDecompose(os.Args[2:])
 	case "version", "-v", "--version":
 		code = cmdVersion()
 	case "info":

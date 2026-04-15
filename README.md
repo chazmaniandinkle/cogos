@@ -29,6 +29,8 @@ make build && ./cogos serve --workspace ~/my-project
 
 - **Anthropic Messages API proxy** -- Transparent proxy at `POST /v1/messages` that forwards to the real Anthropic API with streaming SSE passthrough. Enables `cog claude` to route Claude Code through the kernel via `ANTHROPIC_BASE_URL`.
 
+- **Foveated decomposition pipeline** -- `cog decompose` processes any input through E4B into four tiers: Tier 0 (one-sentence, ~15 tokens), Tier 1 (paragraph, ~100 tokens), Tier 2 (full CogDoc with sections and embeddings), Tier 3 (raw, gated). Includes an interactive workbench TUI (`--workbench`), embedding co-generation via nomic-embed-text, content-addressed CogDoc storage, and bus event emission for observability. This is the DECOMPOSE stage of the CogOS Hypercycle.
+
 ---
 
 ## Architecture
@@ -234,6 +236,9 @@ scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
 agent_harness.go        Native agent loop (Ollama /api/chat)
 agent_tools.go          Kernel-native tool implementations
 agent_serve.go          Agent status HTTP endpoint
+decompose.go            Foveated decomposition engine (4-tier pipeline)
+decompose_store.go      Embedding generation and CogDoc storage
+decompose_tui.go        Interactive workbench TUI (Bubbletea)
 serve_messages.go       Anthropic Messages API proxy
 serve_dashboard.go      Embedded web dashboard
 mcp_http.go             MCP Streamable HTTP transport
@@ -255,7 +260,8 @@ mcp_mod3.go             Mod3 voice tool bridge for MCP
 - MCP Streamable HTTP server (8 tools, JSON-RPC 2.0, sessions)
 - Anthropic Messages API proxy with streaming SSE
 - Native Go agent harness with adaptive interval and 6 kernel tools
-- Embedded web dashboard with agent status and cycle history
+- Embedded web dashboard with agent status, cycle history, and decomposition panel
+- Foveated decomposition pipeline (`cog decompose`) with 4-tier output, workbench TUI, embeddings, and bus events
 - Library extraction: 7 packages in pkg/ (69 files, ~10.2K LOC, 190 tests)
 - Content-addressed blob store
 - Git-derived salience scoring
