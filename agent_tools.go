@@ -18,12 +18,21 @@ import (
 // RegisterCoreTools adds the standard kernel tools to the harness.
 // workspaceRoot is the absolute path to the .cog workspace.
 func RegisterCoreTools(h *AgentHarness, workspaceRoot string) {
+	// Read-only observation tools
 	h.RegisterTool(memorySearchDef(), newMemorySearchFunc(workspaceRoot))
 	h.RegisterTool(memoryReadDef(), newMemoryReadFunc(workspaceRoot))
-	h.RegisterTool(memoryWriteDef(), newMemoryWriteFunc(workspaceRoot))
 	h.RegisterTool(coherenceCheckDef(), newCoherenceCheckFunc(workspaceRoot))
-	h.RegisterTool(busEmitDef(), newBusEmitFunc(workspaceRoot))
 	h.RegisterTool(workspaceStatusDef(), newWorkspaceStatusFunc(workspaceRoot))
+
+	// Propose-only write tools (no direct memory modification)
+	RegisterProposalTools(h, workspaceRoot)
+
+	// Bus events (observable side-effects only)
+	h.RegisterTool(busEmitDef(), newBusEmitFunc(workspaceRoot))
+
+	// NOTE: memory_write is deliberately excluded.
+	// The agent proposes changes via the propose tool; a human or
+	// cloud-tier agent authorizes them before they take effect.
 }
 
 // --- memory_search ---

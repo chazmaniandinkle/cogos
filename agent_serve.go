@@ -295,14 +295,17 @@ func (sa *ServeAgent) runCycle(ctx context.Context) string {
 
 Respond ONLY with a JSON object. No markdown, no explanation, no thinking.
 
-{"action": "<sleep|consolidate|repair|observe|escalate>", "reason": "<brief reason>", "urgency": <0.0-1.0>, "target": "<URI or path or empty>"}
+{"action": "<sleep|consolidate|repair|observe|propose|escalate>", "reason": "<brief reason>", "urgency": <0.0-1.0>, "target": "<URI or path or empty>"}
 
 Actions:
-- sleep: nothing needs attention
-- consolidate: organize memory, clean stale docs
-- repair: fix coherence drift or broken state
-- observe: gather more info before acting (use tools)
-- escalate: beyond local capability, needs cloud model`, sa.root)
+- sleep: nothing needs attention right now
+- observe: gather more info before acting (use memory_search, memory_read, workspace_status, coherence_check)
+- propose: write a proposal for a change (use the propose tool). You CANNOT modify the workspace directly — only propose changes for authorization.
+- consolidate: organize memory via proposals (propose updates to stale docs)
+- repair: propose fixes for coherence drift or broken state
+- escalate: beyond local capability, needs cloud model or human attention
+
+Important: Check your Recent Cycle Memory. If you've been taking the same action repeatedly without effect, consider a different action. If you've already proposed something about an issue, check your Pending Proposals before proposing again.`, sa.root)
 
 	assessment, executeResult, err := sa.harness.RunCycle(ctx, systemPrompt, observation)
 	duration := time.Since(start)
@@ -408,6 +411,11 @@ func (sa *ServeAgent) gatherObservation() string {
 		}
 	}
 
+	// Inject pending proposals so the agent sees what it's already proposed
+	if proposals := sa.gatherPendingProposals(); proposals != "" {
+		sb.WriteString(proposals)
+	}
+
 	obs := sb.String()
 	sa.lastObservation = obs // cache for decomposition context
 	return obs
@@ -421,6 +429,39 @@ func (sa *ServeAgent) emitEvent(eventType string, payload map[string]interface{}
 	if _, err := sa.bus.appendBusEvent(agentBusID, eventType, "kernel:agent", payload); err != nil {
 		log.Printf("[agent] bus event emit error: %v", err)
 	}
+}
+
+// gatherPendingProposals returns a summary of pending proposals for observation injection.
+func (sa *ServeAgent) gatherPendingProposals() string {
+	dir := filepath.Join(sa.root, proposalsDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+
+	var pending []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		contentStr := string(content)
+		if !strings.Contains(contentStr, "status: pending") {
+			continue
+		}
+		title := extractFMField(contentStr, "title")
+		pType := extractFMField(contentStr, "type")
+		pending = append(pending, fmt.Sprintf("  [%s] %s", pType, title))
+	}
+
+	if len(pending) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("\n=== Pending Proposals (%d) ===\n%s\n", len(pending), strings.Join(pending, "\n"))
 }
 
 // handleAgentStatus serves GET /v1/agent/status.
