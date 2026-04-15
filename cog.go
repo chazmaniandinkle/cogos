@@ -35,7 +35,7 @@ import (
 
 // === VERSION & BUILD INFO ===
 
-const Version = "2.4.0"
+const Version = "2.5.0"
 
 var BuildTime = "unknown" // Injected at build time
 
@@ -5828,6 +5828,8 @@ func main() {
 		code = cmdOCI(os.Args[2:])
 	case "service":
 		code = cmdService(os.Args[2:])
+	case "decompose":
+		code = cmdDecompose(os.Args[2:])
 	case "version", "-v", "--version":
 		code = cmdVersion()
 	case "info":

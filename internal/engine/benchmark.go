@@ -260,7 +260,7 @@ func runBenchCmd(args []string, workspaceRoot string, defaultPort int) {
 	fs := flag.NewFlagSet("bench", flag.ExitOnError)
 	workspace := fs.String("workspace", workspaceRoot, "Workspace root path (auto-detected if empty)")
 	promptsFile := fs.String("prompts", "", "Path to benchmark_prompts.json (default: testdata/)")
-	model := fs.String("model", "", "Model override (e.g. qwen3.5:9b)")
+	model := fs.String("model", "", "Model override (e.g. gemma4:e4b)")
 	budget := fs.Int("budget", 4096, "Token budget for context assembly")
 	noInference := fs.Bool("no-inference", false, "Skip inference, measure assembly only")
 	_ = fs.Parse(args)

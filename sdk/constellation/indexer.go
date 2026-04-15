@@ -127,6 +127,47 @@ func (c *Constellation) IndexWorkspace() error {
 	return indexErr
 }
 
+// IndexFile indexes a single cogdoc file into the constellation.
+// This is the public entry point for incremental indexing (e.g., after
+// a decomposition stores a new CogDoc). It handles its own transaction,
+// FTS rebuild for the affected document, and optional async embedding.
+func (c *Constellation) IndexFile(path string) error {
+	tx, err := c.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() {
+		if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
+			fmt.Fprintf(os.Stderr, "Warning: IndexFile rollback: %v\n", err)
+		}
+	}()
+
+	if err := c.indexCogdoc(tx, path); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	// Rebuild FTS to include the new/updated document
+	if err := c.rebuildFTS(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: FTS rebuild after IndexFile: %v\n", err)
+	}
+
+	// Async embedding if configured
+	if c.embedClient != nil {
+		go func() {
+			indexer := NewEmbedIndexer(c, c.embedClient)
+			if _, err := indexer.BackfillAll(1); err != nil {
+				fmt.Fprintf(os.Stderr, "[embed-indexer] single-doc backfill error: %v\n", err)
+			}
+		}()
+	}
+
+	return nil
+}
+
 // indexCogdoc parses and indexes a single cogdoc file.
 func (c *Constellation) indexCogdoc(tx *sql.Tx, path string) error {
 	// Read file

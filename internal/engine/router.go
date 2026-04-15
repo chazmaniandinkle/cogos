@@ -358,6 +358,11 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 		return NewClaudeCodeProvider(name, pc, procMgr), nil
 	case "codex":
 		return NewCodexProvider(name, pc), nil
+	case "pi":
+		if procMgr == nil {
+			procMgr = NewProcessManager(ProcessManagerConfig{})
+		}
+		return NewPiProvider(name, pc, procMgr), nil
 	case "stub":
 		return NewStubProvider(name, "stub response"), nil
 	default:

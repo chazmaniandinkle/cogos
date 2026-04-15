@@ -76,6 +76,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// Block sync endpoints (Phase 3 block sync protocol)
 	s.registerBlockRoutes(mux)
 	s.registerCompatRoutes(mux)
+	s.registerMCPRoutes(mux)
 
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
@@ -131,9 +132,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	trust := s.process.TrustSnapshot()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	resp := map[string]interface{}{
 		"status":   status,
 		"version":  Version,
 		"state":    s.process.State().String(),
@@ -146,7 +145,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		},
 		"workspace": s.cfg.WorkspaceRoot,
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
-	})
+	}
+
+	if nh := s.process.NodeHealth(); nh != nil {
+		if summary := nh.Summary(); len(summary) > 0 {
+			resp["node"] = summary
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleContext returns the current attentional field (top-20 fovea).

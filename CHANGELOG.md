@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-04-15 — Decomposition pipeline workbench
+
+### Added
+- `cog decompose` CLI command with 4-tier foveated decomposition via E4B:
+  Tier 0 (one-sentence ~15 tokens), Tier 1 (paragraph ~100 tokens),
+  Tier 2 (full CogDoc with frontmatter + sections + embeddings),
+  Tier 3 (raw passthrough, gated)
+- `DecompositionRunner` engine using `AgentHarness.GenerateJSON()` with
+  JSON mode, per-tier schema validation, and one-retry error correction
+- Interactive workbench TUI (`--workbench`): Bubbletea 2x2 viewport grid
+  with tier focus switching, re-run, and metrics bar
+- Embedding co-generation via nomic-embed-text (128-dim + 768-dim Matryoshka)
+  for Tier 0, 1, and 2 output
+- Content-addressed CogDoc storage at `.cog/mem/semantic/decompositions/`
+  with full YAML frontmatter, section index, and source refs
+- Constellation indexing for vector + FTS5 retrieval of decomposition output
+- Bus event lifecycle (`decompose.start/tier.start/tier.complete/complete/error`)
+  with file-based JSONL emission for standalone CLI runs
+- Quality metrics: compression ratio, cross-tier embedding fidelity (cosine
+  similarity), schema conformance tracking
+- Dashboard Decompose tab with recent decomposition history, per-tier
+  timing bars, and compression ratio color coding
+- `GenerateJSON()` method on `AgentHarness` for general-purpose JSON-mode
+  LLM completions (reusable beyond decomposition)
+- 52 tests (unit + integration) across 4 test files, including mock Ollama
+  server tests for prompt construction, retry logic, and event sequencing
+
+### Files
+- `decompose.go` — Core engine, types, prompts, CLI, formatter (846 lines)
+- `decompose_store.go` — Embedding generation, CogDoc storage (306 lines)
+- `decompose_tui.go` — Bubbletea workbench TUI (351 lines)
+- `decompose_test.go` — Unit tests (1,325 lines)
+- `decompose_store_test.go` — Storage tests (238 lines)
+- `decompose_tui_test.go` — TUI tests (97 lines)
+- `decompose_integration_test.go` — E2E with live Ollama (310 lines)
+
+## [2.5.0] - 2026-04-14 — Gemma 4 default, dashboard model selector
+
+### Changed
+- Default Ollama model switched from Qwen 3.5 / Llama 3.2 to Gemma 4 E4B across all layers (inference.go, harness, serve_providers, provider_pi, dashboard HTML)
+- Dashboard model selector updated: gemma4:e4b, gemma4:e2b, gemma4:26b, llama3.2:1b
+- Provider model list now reflects locally available Ollama models
+- Pi provider default model uses `defaultOllamaModel` constant instead of hardcoded string
+- Help text in chat and benchmark commands updated for Gemma 4 examples
+
+## [2.4.0]
+
 ### Added
 - OpenAI-compatible provider for LM Studio, vLLM, llama.cpp (1,613 LOC, 18 tests)
 - Auto-discovery of inference providers on localhost

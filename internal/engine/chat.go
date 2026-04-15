@@ -35,7 +35,7 @@ func runChat(args []string, defaultWorkspace string, defaultPort int) {
 	direct := fs.Bool("direct", false, "Call Ollama directly without the daemon")
 	port := fs.Int("port", defaultPort, "Daemon port (server mode)")
 	workspace := fs.String("workspace", defaultWorkspace, "Workspace root (direct mode)")
-	model := fs.String("model", "", "Model name override (e.g. qwen3.5:0.8b, qwen3.5:9b)")
+	model := fs.String("model", "", "Model name override (e.g. gemma4:e4b, gemma4:e2b)")
 	_ = fs.Parse(args)
 
 	if *port == 0 {
