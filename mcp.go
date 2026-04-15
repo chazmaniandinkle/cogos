@@ -473,6 +473,10 @@ type MCPServer struct {
 
 	// Tracing — propagated from parent process via TRACEPARENT env var
 	traceCtx context.Context
+
+	// Bus integration (HTTP mode only — nil for stdio)
+	busManager *busSessionManager
+	busID      string
 }
 
 // NewMCPServer creates a new MCP server
@@ -483,6 +487,22 @@ func NewMCPServer(root string, reader io.Reader, writer io.Writer) *MCPServer {
 		writer: writer,
 		debug:  os.Getenv("MCP_DEBUG") != "",
 	}
+}
+
+// NewMCPServerForHTTP creates an MCPServer for HTTP transport (no stdin/stdout).
+// Used by MCPSessionManager to create per-session servers.
+func NewMCPServerForHTTP(root string, busManager *busSessionManager) *MCPServer {
+	return &MCPServer{
+		root:       root,
+		debug:      os.Getenv("MCP_DEBUG") != "",
+		busManager: busManager,
+	}
+}
+
+// HandleRequest dispatches a JSON-RPC request and returns the result.
+// This is the public entry point used by both the stdio loop and the HTTP transport.
+func (s *MCPServer) HandleRequest(req *JSONRPCRequest) (interface{}, *JSONRPCError) {
+	return s.handleRequest(req)
 }
 
 // EnableBridge activates bridge mode with the given OpenClaw connection
@@ -587,7 +607,7 @@ func (s *MCPServer) handleInitialize(params json.RawMessage) (interface{}, *JSON
 	}
 
 	return &MCPInitializeResult{
-		ProtocolVersion: "2024-11-05",
+		ProtocolVersion: "2025-03-26",
 		Capabilities: MCPServerCaps{
 			Resources: &MCPResourcesCaps{
 				Subscribe:   false,
@@ -1045,11 +1065,14 @@ func GetMCPTools() []MCPTool {
 	}
 }
 
-// handleToolsList returns available tools, merging local + external in bridge mode.
+// handleToolsList returns available tools, merging local + Mod3 + external in bridge mode.
 // External tools come from the tool registry (populated from the request body's tools field),
 // not from an HTTP discovery endpoint.
 func (s *MCPServer) handleToolsList(params json.RawMessage) (interface{}, *JSONRPCError) {
 	tools := GetMCPTools()
+
+	// Always include Mod3 tools (they gracefully degrade if Mod3 is unreachable)
+	tools = append(tools, GetMod3Tools()...)
 
 	if s.bridgeOn && len(s.externalTools) > 0 {
 		for _, rt := range s.externalTools {
@@ -1124,6 +1147,17 @@ func (s *MCPServer) handleToolsCall(params json.RawMessage) (interface{}, *JSONR
 		result, rpcErr = s.toolMemoryWrite(p.Arguments)
 	case "cogos_coherence_check":
 		result, rpcErr = s.toolCoherenceCheck(p.Arguments)
+
+	// Mod3 tools — forwarded to Mod3 HTTP API
+	case "mod3_speak":
+		result, rpcErr = toolMod3Speak(p.Arguments)
+	case "mod3_stop":
+		result, rpcErr = toolMod3Stop(p.Arguments)
+	case "mod3_voices":
+		result, rpcErr = toolMod3Voices(p.Arguments)
+	case "mod3_status":
+		result, rpcErr = toolMod3Status(p.Arguments)
+
 	default:
 		span.SetStatus(codes.Error, "unknown tool")
 		return nil, &JSONRPCError{Code: MethodNotFound, Message: fmt.Sprintf("Unknown tool: %s", p.Name)}

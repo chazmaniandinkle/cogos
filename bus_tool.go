@@ -21,6 +21,10 @@ const (
 	BlockSystemStartup  = "system.startup"
 	BlockSystemShutdown = "system.shutdown"
 	BlockSystemHealth   = "system.health"
+
+	// MCP session lifecycle
+	BlockMCPSessionInit = "mcp.session.init"
+	BlockMCPSessionEnd  = "mcp.session.end"
 )
 
 // ToolInvokePayload is the bus event payload for tool invocation requests.

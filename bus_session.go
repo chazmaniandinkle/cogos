@@ -125,6 +125,38 @@ func (m *busSessionManager) createChatBus(sessionID, origin string) (string, err
 	return busID, nil
 }
 
+// createMCPBus creates a new bus for an MCP HTTP session.
+// The bus ID is derived from the session ID: bus_mcp_{sessionID}.
+func (m *busSessionManager) createMCPBus(sessionID, origin string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	busID := fmt.Sprintf("bus_mcp_%s", sessionID)
+
+	// Create bus directory
+	busDir := filepath.Join(m.busesDir(), busID)
+	if err := os.MkdirAll(busDir, 0755); err != nil {
+		return "", fmt.Errorf("create bus dir: %w", err)
+	}
+
+	// Create events file if it doesn't exist
+	eventsFile := filepath.Join(busDir, "events.jsonl")
+	if _, err := os.Stat(eventsFile); os.IsNotExist(err) {
+		f, err := os.Create(eventsFile)
+		if err != nil {
+			return "", fmt.Errorf("create events file: %w", err)
+		}
+		f.Close()
+	}
+
+	// Register bus in registry
+	if err := m.registerBus(busID, sessionID, origin); err != nil {
+		return "", fmt.Errorf("register bus: %w", err)
+	}
+
+	return busID, nil
+}
+
 // registerBus adds or updates a bus entry in the registry.
 func (m *busSessionManager) registerBus(busID, sessionID, origin string) error {
 	registry := m.loadRegistry()
