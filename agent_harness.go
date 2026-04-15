@@ -16,36 +16,25 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// thinkingTagRe matches <think>...</think> blocks that some models emit.
-var thinkingTagRe = regexp.MustCompile(`(?s)<think>.*?</think>`)
+// --- Wire protocol types (Ollama native /api/chat) ---
+//
+// Uses Ollama's native API instead of the OpenAI-compatible shim because:
+// - Native API supports "think": false to control thinking mode at the source
+// - OpenAI shim has no way to disable thinking (content bleeds into reasoning field)
+// - Native API is the recommended path per Ollama docs
+// See: https://github.com/ollama/ollama/issues/15288
 
-// stripThinkingTags removes <think>...</think> blocks and extracts the
-// actual content. Models like Gemma 4 sometimes wrap JSON output in
-// thinking tags even when response_format is json_object.
-func stripThinkingTags(s string) string {
-	s = thinkingTagRe.ReplaceAllString(s, "")
-	return strings.TrimSpace(s)
-}
-
-// --- Wire protocol types (self-contained, no harness import) ---
-
-// agentChatRequest is the OpenAI chat completions request body.
+// agentChatRequest is the Ollama native /api/chat request body.
 type agentChatRequest struct {
-	Model          string             `json:"model"`
-	Messages       []agentChatMessage `json:"messages"`
-	Tools          []ToolDefinition   `json:"tools,omitempty"`
-	Stream         bool               `json:"stream"`
-	ResponseFormat *responseFormat     `json:"response_format,omitempty"`
-}
-
-// responseFormat controls structured output mode.
-type responseFormat struct {
-	Type string `json:"type"` // "json_object" or "text"
+	Model    string             `json:"model"`
+	Messages []agentChatMessage `json:"messages"`
+	Tools    []ToolDefinition   `json:"tools,omitempty"`
+	Stream   bool               `json:"stream"`
+	Think    bool               `json:"think"`              // explicit thinking control
+	Format   string             `json:"format,omitempty"`   // "json" for structured output
 }
 
 // agentChatMessage is a single message in the conversation.
@@ -53,7 +42,7 @@ type agentChatMessage struct {
 	Role       string          `json:"role"`                  // system, user, assistant, tool
 	Content    string          `json:"content,omitempty"`     // text content
 	ToolCalls  []agentToolCall `json:"tool_calls,omitempty"`  // assistant tool invocations
-	ToolCallID string          `json:"tool_call_id,omitempty"` // for role=tool responses
+	ToolCallID string          `json:"tool_call_id,omitempty"` // for role=tool responses (OpenAI compat in Ollama)
 }
 
 // agentToolCall is a tool invocation returned by the model.
@@ -61,23 +50,21 @@ type agentToolCall struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"` // "function"
 	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"` // JSON string
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"` // JSON object (Ollama native returns object, not string)
 	} `json:"function"`
 }
 
-// agentChatResponse is the non-streaming chat completions response.
+// agentChatResponse is the Ollama native /api/chat response.
 type agentChatResponse struct {
-	ID      string `json:"id"`
-	Choices []struct {
-		Index   int `json:"index"`
-		Message struct {
-			Role      string          `json:"role"`
-			Content   string          `json:"content"`
-			ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
-		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
+	Model   string `json:"model"`
+	Message struct {
+		Role      string          `json:"role"`
+		Content   string          `json:"content"`
+		ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
+	} `json:"message"`
+	Done       bool `json:"done"`
+	DoneReason string `json:"done_reason,omitempty"`
 }
 
 // --- Tool definition types ---
@@ -123,7 +110,7 @@ type AgentHarness struct {
 
 // AgentHarnessConfig holds configuration for creating an AgentHarness.
 type AgentHarnessConfig struct {
-	OllamaURL string // e.g. "http://localhost:11434/v1"
+	OllamaURL string // e.g. "http://localhost:11434" (native API, no /v1 suffix)
 	Model     string // e.g. "gemma4:e4b"
 	MaxTurns  int    // safety limit per execution cycle (default: 10)
 }
@@ -164,9 +151,8 @@ func (h *AgentHarness) Assess(ctx context.Context, systemPrompt, observation str
 		Model:    h.model,
 		Messages: messages,
 		Stream:   false,
-		ResponseFormat: &responseFormat{
-			Type: "json_object",
-		},
+		Think:    false, // disable thinking — we want clean JSON output
+		Format:   "json",
 	}
 
 	resp, err := h.chatCompletion(ctx, req)
@@ -174,15 +160,7 @@ func (h *AgentHarness) Assess(ctx context.Context, systemPrompt, observation str
 		return nil, fmt.Errorf("assess: %w", err)
 	}
 
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("assess: no choices in response")
-	}
-
-	content := resp.Choices[0].Message.Content
-
-	// Strip thinking tags if the model includes them (Gemma 4 sometimes wraps
-	// output in <think>...</think> even in JSON mode).
-	content = stripThinkingTags(content)
+	content := resp.Message.Content
 
 	var assessment Assessment
 	if err := json.Unmarshal([]byte(content), &assessment); err != nil {
@@ -207,6 +185,7 @@ func (h *AgentHarness) Execute(ctx context.Context, systemPrompt, task string) (
 			Messages: messages,
 			Tools:    h.tools,
 			Stream:   false,
+			Think:    false, // disable thinking for tool loop
 		}
 
 		resp, err := h.chatCompletion(ctx, req)
@@ -214,25 +193,21 @@ func (h *AgentHarness) Execute(ctx context.Context, systemPrompt, task string) (
 			return "", fmt.Errorf("execute turn %d: %w", turn, err)
 		}
 
-		if len(resp.Choices) == 0 {
-			return "", fmt.Errorf("execute turn %d: no choices", turn)
-		}
-
-		choice := resp.Choices[0]
+		msg := resp.Message
 
 		// No tool calls — model is done. Return the content.
-		if len(choice.Message.ToolCalls) == 0 {
-			return choice.Message.Content, nil
+		if len(msg.ToolCalls) == 0 {
+			return msg.Content, nil
 		}
 
 		// Append the assistant message with tool calls.
 		messages = append(messages, agentChatMessage{
 			Role:      "assistant",
-			ToolCalls: choice.Message.ToolCalls,
+			ToolCalls: msg.ToolCalls,
 		})
 
 		// Dispatch each tool call and collect results.
-		for _, tc := range choice.Message.ToolCalls {
+		for _, tc := range msg.ToolCalls {
 			result, err := h.dispatchTool(ctx, tc)
 			if err != nil {
 				// Tool errors go back to the model as content, not Go errors.
@@ -284,7 +259,8 @@ func (h *AgentHarness) chatCompletion(ctx context.Context, req agentChatRequest)
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, h.ollamaURL+"/chat/completions", bytes.NewReader(body))
+	// Use Ollama native /api/chat (not OpenAI-compat /v1/chat/completions)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, h.ollamaURL+"/api/chat", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}

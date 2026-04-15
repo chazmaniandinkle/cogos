@@ -48,7 +48,7 @@ func TestAgentHarness_ToolDispatch(t *testing.T) {
 		Type: "function",
 	}
 	tc.Function.Name = "test_tool"
-	tc.Function.Arguments = `{"x":"hello"}`
+	tc.Function.Arguments = json.RawMessage(`{"x":"hello"}`)
 
 	result, err := h.dispatchTool(context.Background(), tc)
 	if err != nil {
@@ -87,7 +87,7 @@ func TestAgentHarness_ToolDispatch_UnknownTool(t *testing.T) {
 
 	tc := agentToolCall{ID: "call_1", Type: "function"}
 	tc.Function.Name = "nonexistent"
-	tc.Function.Arguments = `{}`
+	tc.Function.Arguments = json.RawMessage(`{}`)
 
 	_, err := h.dispatchTool(context.Background(), tc)
 	if err == nil {
@@ -105,28 +105,12 @@ func TestAgentHarness_Assess_MessageBuilding(t *testing.T) {
 			t.Errorf("decode request: %v", err)
 		}
 		resp := agentChatResponse{
-			Choices: []struct {
-				Index   int `json:"index"`
-				Message struct {
-					Role      string          `json:"role"`
-					Content   string          `json:"content"`
-					ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
-				} `json:"message"`
-				FinishReason string `json:"finish_reason"`
-			}{
-				{
-					Message: struct {
-						Role      string          `json:"role"`
-						Content   string          `json:"content"`
-						ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
-					}{
-						Role:    "assistant",
-						Content: `{"action":"sleep","reason":"all quiet","urgency":0.1,"target":""}`,
-					},
-					FinishReason: "stop",
-				},
-			},
+			Model: "test-model",
+			Done:  true,
+			DoneReason: "stop",
 		}
+		resp.Message.Role = "assistant"
+		resp.Message.Content = `{"action":"sleep","reason":"all quiet","urgency":0.1,"target":""}`
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	}))
@@ -161,8 +145,8 @@ func TestAgentHarness_Assess_MessageBuilding(t *testing.T) {
 	if receivedReq.Messages[1].Content != "Workspace is quiet." {
 		t.Errorf("unexpected user content: %q", receivedReq.Messages[1].Content)
 	}
-	if receivedReq.ResponseFormat == nil || receivedReq.ResponseFormat.Type != "json_object" {
-		t.Error("expected response_format json_object for assess")
+	if receivedReq.Format != "json" {
+		t.Error("expected format 'json' for assess")
 	}
 }
 
@@ -401,29 +385,13 @@ func newCannedServer(t *testing.T, content string, toolCalls []agentToolCall) *h
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		resp := agentChatResponse{
-			Choices: []struct {
-				Index   int `json:"index"`
-				Message struct {
-					Role      string          `json:"role"`
-					Content   string          `json:"content"`
-					ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
-				} `json:"message"`
-				FinishReason string `json:"finish_reason"`
-			}{
-				{
-					Message: struct {
-						Role      string          `json:"role"`
-						Content   string          `json:"content"`
-						ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
-					}{
-						Role:      "assistant",
-						Content:   content,
-						ToolCalls: toolCalls,
-					},
-					FinishReason: "stop",
-				},
-			},
+			Model: "test",
+			Done:  true,
+			DoneReason: "stop",
 		}
+		resp.Message.Role = "assistant"
+		resp.Message.Content = content
+		resp.Message.ToolCalls = toolCalls
 		json.NewEncoder(w).Encode(resp)
 	}))
 }
@@ -432,55 +400,25 @@ func newCannedServer(t *testing.T, content string, toolCalls []agentToolCall) *h
 func makeToolCallResponse(id, name, args string) agentChatResponse {
 	tc := agentToolCall{ID: id, Type: "function"}
 	tc.Function.Name = name
-	tc.Function.Arguments = args
-	return agentChatResponse{
-		Choices: []struct {
-			Index   int `json:"index"`
-			Message struct {
-				Role      string          `json:"role"`
-				Content   string          `json:"content"`
-				ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
-			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
-		}{
-			{
-				Message: struct {
-					Role      string          `json:"role"`
-					Content   string          `json:"content"`
-					ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
-				}{
-					Role:      "assistant",
-					ToolCalls: []agentToolCall{tc},
-				},
-				FinishReason: "tool_calls",
-			},
-		},
+	tc.Function.Arguments = json.RawMessage(args)
+	resp := agentChatResponse{
+		Model: "test",
+		Done:  true,
+		DoneReason: "tool_calls",
 	}
+	resp.Message.Role = "assistant"
+	resp.Message.ToolCalls = []agentToolCall{tc}
+	return resp
 }
 
 // makeContentResponse builds a response with content and no tool calls.
 func makeContentResponse(content string) agentChatResponse {
-	return agentChatResponse{
-		Choices: []struct {
-			Index   int `json:"index"`
-			Message struct {
-				Role      string          `json:"role"`
-				Content   string          `json:"content"`
-				ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
-			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
-		}{
-			{
-				Message: struct {
-					Role      string          `json:"role"`
-					Content   string          `json:"content"`
-					ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
-				}{
-					Role:    "assistant",
-					Content: content,
-				},
-				FinishReason: "stop",
-			},
-		},
+	resp := agentChatResponse{
+		Model: "test",
+		Done:  true,
+		DoneReason: "stop",
 	}
+	resp.Message.Role = "assistant"
+	resp.Message.Content = content
+	return resp
 }

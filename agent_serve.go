@@ -67,7 +67,7 @@ func NewServeAgent(root string) *ServeAgent {
 	if ollamaURL == "" {
 		ollamaURL = "http://localhost:11434"
 	}
-	ollamaURL = strings.TrimRight(ollamaURL, "/") + "/v1"
+	ollamaURL = strings.TrimRight(ollamaURL, "/")
 
 	model := os.Getenv("COG_AGENT_MODEL")
 	if model == "" {
