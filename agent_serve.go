@@ -146,6 +146,9 @@ func (sa *ServeAgent) Stop() {
 // runLoop is the main ticker loop with adaptive interval.
 // Starts at agentIntervalMin, doubles toward agentIntervalMax on consecutive
 // "sleep" assessments, resets to agentIntervalMin on any non-sleep action.
+//
+// The loop is resilient: panics in runCycle are recovered and logged,
+// and the loop continues after a backoff delay.
 func (sa *ServeAgent) runLoop(ctx context.Context) {
 	defer sa.wg.Done()
 
@@ -154,12 +157,8 @@ func (sa *ServeAgent) runLoop(ctx context.Context) {
 	// Run initial cycle after a short delay (let the kernel fully initialize)
 	select {
 	case <-time.After(60 * time.Second):
-		action := sa.runCycle(ctx)
-		if action == "sleep" {
-			consecutiveSleeps++
-		} else {
-			consecutiveSleeps = 0
-		}
+		action := sa.safeCycle(ctx)
+		consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
 	case <-sa.stopCh:
 		return
 	}
@@ -178,16 +177,31 @@ func (sa *ServeAgent) runLoop(ctx context.Context) {
 
 		select {
 		case <-time.After(interval):
-			action := sa.runCycle(ctx)
-			if action == "sleep" {
-				consecutiveSleeps++
-			} else {
-				consecutiveSleeps = 0
-			}
+			action := sa.safeCycle(ctx)
+			consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
 		case <-sa.stopCh:
 			return
 		}
 	}
+}
+
+// safeCycle wraps runCycle with panic recovery so the loop survives crashes.
+func (sa *ServeAgent) safeCycle(ctx context.Context) (action string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[agent] PANIC recovered in cycle: %v", r)
+			action = "error"
+		}
+	}()
+	return sa.runCycle(ctx)
+}
+
+// updateSleepCount returns the new consecutive sleep counter.
+func (sa *ServeAgent) updateSleepCount(action string, current int) int {
+	if action == "sleep" {
+		return current + 1
+	}
+	return 0
 }
 
 // runCycle executes a single observe-assess-execute pass.
