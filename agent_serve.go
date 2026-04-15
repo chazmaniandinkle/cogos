@@ -22,6 +22,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,6 +98,12 @@ func (sa *ServeAgent) SetBus(mgr *busSessionManager) {
 func (sa *ServeAgent) Start() error {
 	log.Printf("[agent] starting homeostatic loop (interval=%s, model=%s)", sa.interval, sa.harness.model)
 
+	// Ensure the agent bus exists and is registered so events appear
+	// in /v1/bus/list and cross-bus queries.
+	if sa.bus != nil {
+		sa.ensureBus()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	sa.cancel = cancel
 
@@ -104,6 +111,28 @@ func (sa *ServeAgent) Start() error {
 	go sa.runLoop(ctx)
 
 	return nil
+}
+
+// ensureBus creates the bus directory, events file, and registry entry
+// for the agent harness bus if they don't already exist.
+func (sa *ServeAgent) ensureBus() {
+	busDir := filepath.Join(sa.bus.busesDir(), agentBusID)
+	if err := os.MkdirAll(busDir, 0755); err != nil {
+		log.Printf("[agent] failed to create bus dir: %v", err)
+		return
+	}
+	eventsFile := filepath.Join(busDir, "events.jsonl")
+	if _, err := os.Stat(eventsFile); os.IsNotExist(err) {
+		f, err := os.Create(eventsFile)
+		if err != nil {
+			log.Printf("[agent] failed to create events file: %v", err)
+			return
+		}
+		f.Close()
+	}
+	if err := sa.bus.registerBus(agentBusID, "kernel:agent", "kernel:agent"); err != nil {
+		log.Printf("[agent] failed to register bus: %v", err)
+	}
 }
 
 // Stop signals the loop to stop and waits for completion.
