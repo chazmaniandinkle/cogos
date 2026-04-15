@@ -29,7 +29,8 @@ import (
 )
 
 const (
-	defaultAgentInterval = 30 * time.Minute
+	agentIntervalMin     = 5 * time.Minute  // start fast
+	agentIntervalMax     = 30 * time.Minute // relax to this after consecutive sleeps
 	agentBusID           = "bus_agent_harness"
 )
 
@@ -49,10 +50,12 @@ type ServeAgent struct {
 }
 
 // NewServeAgent creates an agent loop for the given workspace.
+// Starts at agentIntervalMin (5m) and relaxes toward agentIntervalMax (30m)
+// when the model reports consecutive "sleep" assessments.
 func NewServeAgent(root string) *ServeAgent {
-	interval := defaultAgentInterval
+	interval := agentIntervalMin
 
-	// Allow override via env var
+	// Allow override via env var (disables adaptive interval)
 	if v := os.Getenv("COG_AGENT_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			interval = d
@@ -111,25 +114,47 @@ func (sa *ServeAgent) Stop() {
 	log.Printf("[agent] stopped after %d cycles", atomic.LoadInt64(&sa.cycleCount))
 }
 
-// runLoop is the main ticker loop.
+// runLoop is the main ticker loop with adaptive interval.
+// Starts at agentIntervalMin, doubles toward agentIntervalMax on consecutive
+// "sleep" assessments, resets to agentIntervalMin on any non-sleep action.
 func (sa *ServeAgent) runLoop(ctx context.Context) {
 	defer sa.wg.Done()
 
-	// Run initial cycle after a delay (let the kernel fully initialize)
+	consecutiveSleeps := 0
+
+	// Run initial cycle after a short delay (let the kernel fully initialize)
 	select {
 	case <-time.After(60 * time.Second):
-		sa.runCycle(ctx)
+		action := sa.runCycle(ctx)
+		if action == "sleep" {
+			consecutiveSleeps++
+		} else {
+			consecutiveSleeps = 0
+		}
 	case <-sa.stopCh:
 		return
 	}
 
-	ticker := time.NewTicker(sa.interval)
-	defer ticker.Stop()
-
 	for {
+		// Adaptive interval: double on each consecutive sleep, cap at max
+		interval := sa.interval
+		for i := 0; i < consecutiveSleeps && interval < agentIntervalMax; i++ {
+			interval *= 2
+		}
+		if interval > agentIntervalMax {
+			interval = agentIntervalMax
+		}
+
+		log.Printf("[agent] next cycle in %s (consecutive sleeps: %d)", interval, consecutiveSleeps)
+
 		select {
-		case <-ticker.C:
-			sa.runCycle(ctx)
+		case <-time.After(interval):
+			action := sa.runCycle(ctx)
+			if action == "sleep" {
+				consecutiveSleeps++
+			} else {
+				consecutiveSleeps = 0
+			}
 		case <-sa.stopCh:
 			return
 		}
@@ -137,7 +162,8 @@ func (sa *ServeAgent) runLoop(ctx context.Context) {
 }
 
 // runCycle executes a single observe-assess-execute pass.
-func (sa *ServeAgent) runCycle(ctx context.Context) {
+// Returns the assessment action string for adaptive interval logic.
+func (sa *ServeAgent) runCycle(ctx context.Context) string {
 	start := time.Now()
 	cycle := atomic.AddInt64(&sa.cycleCount, 1)
 
@@ -146,19 +172,20 @@ func (sa *ServeAgent) runCycle(ctx context.Context) {
 	// Build observation from workspace state
 	observation := sa.gatherObservation()
 
-	systemPrompt := fmt.Sprintf(`You are the CogOS kernel agent running on a local node.
-Your workspace is at: %s
-You observe the workspace state and decide what needs attention.
+	// System prompt: concise, no thinking tags (Gemma E4B doesn't need them).
+	// JSON mode is enforced by the harness via response_format.
+	systemPrompt := fmt.Sprintf(`You are the CogOS kernel agent on a local node. Workspace: %s
 
-Respond with a JSON object:
-{"action": "<sleep|consolidate|repair|observe|escalate>", "reason": "<why>", "urgency": <0-1>, "target": "<what to act on>"}
+Respond ONLY with a JSON object. No markdown, no explanation, no thinking.
+
+{"action": "<sleep|consolidate|repair|observe|escalate>", "reason": "<brief reason>", "urgency": <0.0-1.0>, "target": "<URI or path or empty>"}
 
 Actions:
-- sleep: nothing needs attention right now
-- consolidate: memory needs organizing, stale docs need cleanup
-- repair: coherence drift detected, something is broken
-- observe: need more information before acting (use tools)
-- escalate: this is beyond local model capability, needs cloud model`, sa.root)
+- sleep: nothing needs attention
+- consolidate: organize memory, clean stale docs
+- repair: fix coherence drift or broken state
+- observe: gather more info before acting (use tools)
+- escalate: beyond local capability, needs cloud model`, sa.root)
 
 	assessment, executeResult, err := sa.harness.RunCycle(ctx, systemPrompt, observation)
 	duration := time.Since(start)
@@ -169,7 +196,7 @@ Actions:
 			"cycle": cycle,
 			"error": err.Error(),
 		})
-		return
+		return "error"
 	}
 
 	sa.lastRun = time.Now()
@@ -178,13 +205,13 @@ Actions:
 		cycle, assessment.Action, assessment.Urgency, assessment.Reason, duration.Round(time.Millisecond))
 
 	sa.emitEvent("agent.cycle", map[string]interface{}{
-		"cycle":      cycle,
-		"action":     assessment.Action,
-		"reason":     assessment.Reason,
-		"urgency":    assessment.Urgency,
-		"target":     assessment.Target,
+		"cycle":       cycle,
+		"action":      assessment.Action,
+		"reason":      assessment.Reason,
+		"urgency":     assessment.Urgency,
+		"target":      assessment.Target,
 		"duration_ms": duration.Milliseconds(),
-		"executed":   executeResult != "",
+		"executed":    executeResult != "",
 	})
 
 	if assessment.Action == "escalate" {
@@ -196,6 +223,8 @@ Actions:
 			"target": assessment.Target,
 		})
 	}
+
+	return assessment.Action
 }
 
 // gatherObservation builds a compact observation string from workspace state.

@@ -16,8 +16,21 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 )
+
+// thinkingTagRe matches <think>...</think> blocks that some models emit.
+var thinkingTagRe = regexp.MustCompile(`(?s)<think>.*?</think>`)
+
+// stripThinkingTags removes <think>...</think> blocks and extracts the
+// actual content. Models like Gemma 4 sometimes wrap JSON output in
+// thinking tags even when response_format is json_object.
+func stripThinkingTags(s string) string {
+	s = thinkingTagRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
+}
 
 // --- Wire protocol types (self-contained, no harness import) ---
 
@@ -165,9 +178,15 @@ func (h *AgentHarness) Assess(ctx context.Context, systemPrompt, observation str
 		return nil, fmt.Errorf("assess: no choices in response")
 	}
 
+	content := resp.Choices[0].Message.Content
+
+	// Strip thinking tags if the model includes them (Gemma 4 sometimes wraps
+	// output in <think>...</think> even in JSON mode).
+	content = stripThinkingTags(content)
+
 	var assessment Assessment
-	if err := json.Unmarshal([]byte(resp.Choices[0].Message.Content), &assessment); err != nil {
-		return nil, fmt.Errorf("assess: parse assessment: %w", err)
+	if err := json.Unmarshal([]byte(content), &assessment); err != nil {
+		return nil, fmt.Errorf("assess: parse assessment (raw=%q): %w", content, err)
 	}
 	return &assessment, nil
 }
