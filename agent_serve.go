@@ -70,6 +70,10 @@ type ServeAgent struct {
 	lastUrgency float64
 	lastReason  string
 	lastDurMs   int64
+
+	// Decomposition-fed rolling memory (the first hypercycle wire)
+	cycleMemory     *agentCycleMemory
+	lastObservation string // cached for decomposition context
 }
 
 // Status returns the current agent loop status for the API.
@@ -138,12 +142,15 @@ func NewServeAgent(root string) *ServeAgent {
 	})
 	RegisterCoreTools(harness, root)
 
-	return &ServeAgent{
-		root:     root,
-		interval: interval,
-		harness:  harness,
-		stopCh:   make(chan struct{}),
+	sa := &ServeAgent{
+		root:        root,
+		interval:    interval,
+		harness:     harness,
+		stopCh:      make(chan struct{}),
+		cycleMemory: newAgentCycleMemory(maxRollingMemory),
 	}
+	sa.loadCycleMemory()
+	return sa
 }
 
 // SetBus attaches a bus session manager for emitting agent events.
@@ -342,6 +349,12 @@ Actions:
 		})
 	}
 
+	// Decompose the assessment into Tier 0 and feed into rolling memory.
+	// Runs asynchronously so it doesn't delay the next cycle.
+	// This is the first self-feeding wire in the CogOS Hypercycle:
+	// PRODUCE → DECOMPOSE → ABSORB (via gatherObservation on next cycle).
+	go sa.decomposeAndStore(ctx, cycle, assessment)
+
 	return assessment.Action
 }
 
@@ -388,7 +401,16 @@ func (sa *ServeAgent) gatherObservation() string {
 		sb.WriteString(fmt.Sprintf("Last cycle: %s ago\n", time.Since(sa.lastRun).Round(time.Second)))
 	}
 
-	return sb.String()
+	// Inject rolling compressed memory from previous cycles (the hypercycle wire)
+	if sa.cycleMemory != nil {
+		if mem := sa.cycleMemory.formatForObservation(); mem != "" {
+			sb.WriteString(mem)
+		}
+	}
+
+	obs := sb.String()
+	sa.lastObservation = obs // cache for decomposition context
+	return obs
 }
 
 // emitEvent sends an event to the CogBus (best-effort).
