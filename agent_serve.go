@@ -526,6 +526,37 @@ Rules:
 
 	// Run assessment phase (JSON mode)
 	assessment, err := sa.harness.Assess(ctx, systemPrompt, observation)
+
+	// Hard loop breaker: if the model chose the same action 3+ times,
+	// override to a different action. E4B can reason about the rule
+	// but can't reliably follow it, so we enforce it in code.
+	if err == nil && sa.cycleMemory != nil {
+		recent := sa.cycleMemory.recent(3)
+		if len(recent) >= 3 {
+			allSame := recent[0].Action == recent[1].Action && recent[1].Action == recent[2].Action
+			if allSame && assessment.Action == recent[0].Action {
+				old := assessment.Action
+				switch old {
+				case "observe":
+					if sa.lastProposalCount > 0 {
+						assessment.Action = "propose"
+						assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → propose (pending proposals exist)", old)
+					} else {
+						assessment.Action = "sleep"
+						assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → sleep", old)
+					}
+				case "propose":
+					assessment.Action = "sleep"
+					assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → sleep", old)
+				default:
+					assessment.Action = "sleep"
+					assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → sleep", old)
+				}
+				log.Printf("[agent] cycle %d: hard loop break: %s → %s", cycle, old, assessment.Action)
+			}
+		}
+	}
+
 	var executeResult string
 	if err == nil && assessment.Action != "sleep" {
 		// Execute phase gets a different prompt that encourages tool chaining
