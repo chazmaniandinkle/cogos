@@ -160,7 +160,14 @@ func (sa *ServeAgent) getActivityForAPI() *AgentActivitySummary {
 
 	now := time.Now()
 	summary := &AgentActivitySummary{UserPresence: "unknown"}
-	var latestEventTime time.Time
+
+	apiBusExclude := map[string]bool{
+		"bus_chat_system_capabilities": true,
+		"bus_chat_http":                true,
+		"bus_agent_harness":            true,
+		"bus_index":                    true,
+	}
+	var userEventTime time.Time
 
 	for _, entry := range registry {
 		seq := int64(entry.LastEventSeq)
@@ -181,27 +188,29 @@ func (sa *ServeAgent) getActivityForAPI() *AgentActivitySummary {
 			}
 		}
 
-		if entry.LastEventAt != "" {
+		bid := entry.BusID
+		isSystem := apiBusExclude[bid]
+
+		if !isSystem && entry.LastEventAt != "" {
 			if t, err := time.Parse(time.RFC3339Nano, entry.LastEventAt); err == nil {
-				if t.After(latestEventTime) {
-					latestEventTime = t
+				if t.After(userEventTime) {
+					userEventTime = t
 				}
 			}
 		}
 
-		bid := entry.BusID
 		if strings.HasPrefix(bid, "claude-code-") && delta > 0 {
 			summary.ClaudeCodeActive++
 			summary.ClaudeCodeEvents += delta
 		}
 	}
 
-	if !latestEventTime.IsZero() {
-		ago := now.Sub(latestEventTime)
+	if !userEventTime.IsZero() {
+		ago := now.Sub(userEventTime)
 		summary.UserLastEventAgo = formatAgo(ago)
 		if ago < 5*time.Minute {
 			summary.UserPresence = "active"
-		} else if ago < time.Hour {
+		} else if ago < 30*time.Minute {
 			summary.UserPresence = "recent"
 		} else {
 			summary.UserPresence = "idle"
@@ -488,22 +497,21 @@ func (sa *ServeAgent) runCycle(ctx context.Context) string {
 
 Respond ONLY with a JSON object. No markdown, no explanation, no thinking.
 
-{"action": "<sleep|consolidate|repair|observe|propose|escalate>", "reason": "<brief reason>", "urgency": <0.0-1.0>, "target": "<URI or path or empty>"}
+{"action": "<sleep|observe|propose|escalate>", "reason": "<brief reason>", "urgency": <0.0-1.0>, "target": "<URI or path or empty>"}
 
 Actions:
-- sleep: nothing needs attention right now
-- observe: gather more info before acting (use memory_search, memory_read, workspace_status, coherence_check)
-- propose: write a proposal for a change (use the propose tool). You CANNOT modify the workspace directly — only propose changes for authorization.
-- consolidate: organize memory via proposals (propose updates to stale docs)
-- repair: propose fixes for coherence drift or broken state
-- escalate: beyond local capability, needs cloud model or human attention
+- sleep: nothing needs attention, rest until next cycle
+- observe: gather more info using tools (memory_search, memory_read, workspace_status, coherence_check)
+- propose: write a proposal using the propose tool — this is your primary way of acting. Proposals are safe, lightweight, and never disrupt the user. Use them freely.
+- escalate: something needs human or cloud-model attention
 
-Important:
-- Check your Recent Cycle Memory. If you've been taking the same action repeatedly without effect, consider a different action.
-- If you've already proposed something about an issue, check your Pending Proposals before proposing again.
-- The System Activity section shows what's happening across the workspace since your last cycle. "User presence: active" means someone is working. When the user is active, prefer observing over acting — don't disrupt their flow.
-- If you were skipped (no model call because nothing changed), your memory will show "Cycle skipped". This is normal during idle periods.
-- When the workspace has been idle for a long time with no user activity, consider whether it's time to sleep or whether proposals are warranted.`, sa.root)
+You are an observer and advisor. Your proposals are staged in a directory — they do not modify anything. The user reviews them at their convenience. You cannot interrupt anyone. Act confidently.
+
+Rules:
+- If your Recent Cycle Memory shows 3+ consecutive identical actions, you MUST choose differently. Break the loop.
+- If there are Pending Proposals, engage with them: read them with read_proposal, respond with your own proposal, or note that you've reviewed them.
+- Prefer action over inaction. Proposing is always safe. Observing without purpose is wasted compute.
+- When nothing needs attention and no proposals are pending, sleep.`, sa.root)
 
 	assessment, executeResult, err := sa.harness.RunCycle(ctx, systemPrompt, observation)
 	duration := time.Since(start)
@@ -648,6 +656,15 @@ func (sa *ServeAgent) gatherActivitySummary() string {
 	}
 
 	now := time.Now()
+
+	// System buses that fire from the kernel itself — NOT user activity
+	systemBuses := map[string]bool{
+		"bus_chat_system_capabilities": true,
+		"bus_chat_http":                true,
+		"bus_agent_harness":            true,
+		"bus_index":                    true,
+	}
+
 	var (
 		claudeCodeActive   int
 		claudeCodeEvents   int64
@@ -657,7 +674,7 @@ func (sa *ServeAgent) gatherActivitySummary() string {
 		totalDelta         int64
 		hottestBus         string
 		hottestDelta       int64
-		latestEventTime    time.Time
+		userEventTime      time.Time // only from user-initiated buses
 		newSnapshot        = make(map[string]int64, len(registry))
 	)
 
@@ -680,24 +697,26 @@ func (sa *ServeAgent) gatherActivitySummary() string {
 			}
 		}
 
-		// Parse last event time for recency
-		if entry.LastEventAt != "" {
+		bid := entry.BusID
+		isSystem := systemBuses[bid]
+
+		// Track user presence only from user-initiated buses (not kernel system buses)
+		if !isSystem && entry.LastEventAt != "" {
 			if t, err := time.Parse(time.RFC3339Nano, entry.LastEventAt); err == nil {
-				if t.After(latestEventTime) {
-					latestEventTime = t
+				if t.After(userEventTime) {
+					userEventTime = t
 				}
 			}
 		}
 
 		// Classify by prefix
-		bid := entry.BusID
 		switch {
 		case strings.HasPrefix(bid, "claude-code-"):
-			if delta > 0 || (entry.State == "active" && entry.LastEventAt != "") {
+			if delta > 0 {
 				claudeCodeActive++
 				claudeCodeEvents += delta
 			}
-		case strings.HasPrefix(bid, "bus_chat_"):
+		case strings.HasPrefix(bid, "bus_chat_") && !isSystem:
 			if delta > 0 {
 				chatActive++
 			}
@@ -720,11 +739,11 @@ func (sa *ServeAgent) gatherActivitySummary() string {
 	sb.WriteString("\n=== System Activity (since last cycle) ===\n")
 
 	// User presence
-	if !latestEventTime.IsZero() {
-		ago := now.Sub(latestEventTime).Round(time.Second)
+	if !userEventTime.IsZero() {
+		ago := now.Sub(userEventTime).Round(time.Second)
 		if ago < 5*time.Minute {
 			sb.WriteString(fmt.Sprintf("User presence: active (last event %s ago)\n", ago))
-		} else if ago < time.Hour {
+		} else if ago < 30*time.Minute {
 			sb.WriteString(fmt.Sprintf("User presence: recent (last event %s ago)\n", formatAgo(ago)))
 		} else {
 			sb.WriteString(fmt.Sprintf("User presence: idle (last event %s ago)\n", formatAgo(ago)))
