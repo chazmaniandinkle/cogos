@@ -665,6 +665,14 @@ body {
             No pending proposals
           </div>
         </div>
+
+        <!-- Cycle Traces -->
+        <div class="proprio-section">
+          <div class="proprio-section-title">Cycle Traces</div>
+          <div id="agent-traces" style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto">
+            No traces yet
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -1533,7 +1541,56 @@ async function refreshAgent() {
       if (urgencyHistory.length > 20) urgencyHistory.shift();
       renderUrgencySparkline();
     }
+    // Fetch traces when Agent tab is active
+    const agentTab = document.querySelector('.panel-tab[data-tab="agent"]');
+    if (agentTab && agentTab.classList.contains('active')) {
+      refreshAgentTraces();
+    }
   } catch {}
+}
+
+async function refreshAgentTraces() {
+  try {
+    const res = await fetch(API + '/v1/agent/traces');
+    if (!res.ok) return;
+    const traces = await res.json();
+    renderAgentTraces(traces);
+  } catch {}
+}
+
+function renderAgentTraces(traces) {
+  const container = document.getElementById('agent-traces');
+  if (!traces || traces.length === 0) {
+    container.innerHTML = '<div style="color:var(--text-dim)">No traces yet</div>';
+    return;
+  }
+  // Show most recent first
+  let html = '';
+  for (let i = traces.length - 1; i >= 0; i--) {
+    const t = traces[i];
+    const color = actionColors[t.action] || '#888';
+    const ago = t.timestamp ? timeSince(new Date(t.timestamp)) : '--';
+    const hasResult = t.result && t.result.length > 0;
+    const id = `trace-${t.cycle}`;
+    html += `<details style="margin-bottom:6px;border-left:2px solid ${color};padding-left:6px">`;
+    html += `<summary style="cursor:pointer;color:var(--text)">`;
+    html += `<span style="color:${color};font-weight:600">${t.action}</span>`;
+    html += ` <span style="color:var(--text-dim)">u=${t.urgency.toFixed(1)} · ${ago} ago · ${t.duration_ms}ms</span>`;
+    if (hasResult) html += ` <span style="color:#c084fc;font-size:10px">▸ has result</span>`;
+    html += `</summary>`;
+    html += `<div style="margin-top:4px;padding:4px;background:var(--bg-surface);border-radius:3px">`;
+    html += `<div style="color:var(--text);margin-bottom:4px"><strong>Reason:</strong> ${esc(t.reason)}</div>`;
+    if (t.target) html += `<div style="color:var(--text-dim);margin-bottom:4px"><strong>Target:</strong> ${esc(t.target)}</div>`;
+    if (hasResult) {
+      html += `<div style="margin-top:4px"><strong style="color:#c084fc">Execute Result:</strong></div>`;
+      html += `<pre style="white-space:pre-wrap;word-break:break-word;color:var(--text);font-size:10px;max-height:200px;overflow-y:auto;margin:4px 0;padding:4px;background:var(--bg);border-radius:2px">${esc(t.result)}</pre>`;
+    }
+    html += `<details style="margin-top:4px"><summary style="cursor:pointer;color:var(--text-dim);font-size:10px">Observation (${t.observation.length} chars)</summary>`;
+    html += `<pre style="white-space:pre-wrap;word-break:break-word;color:var(--text-dim);font-size:10px;max-height:300px;overflow-y:auto;margin:4px 0;padding:4px;background:var(--bg);border-radius:2px">${esc(t.observation)}</pre>`;
+    html += `</details>`;
+    html += `</div></details>`;
+  }
+  container.innerHTML = html;
 }
 
 function renderAgentPill(d) {

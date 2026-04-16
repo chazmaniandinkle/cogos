@@ -215,3 +215,68 @@ func (sa *ServeAgent) loadCycleMemory() {
 	}
 	log.Printf("[agent] loaded %d cycle memory entries from disk", len(entries))
 }
+
+// --- Cycle Trace Storage ---
+
+// cycleTrace is the full record of one agent cycle, written to disk.
+type cycleTrace struct {
+	Cycle       int64      `json:"cycle"`
+	Timestamp   time.Time  `json:"timestamp"`
+	DurationMs  int64      `json:"duration_ms"`
+	Action      string     `json:"action"`
+	Urgency     float64    `json:"urgency"`
+	Reason      string     `json:"reason"`
+	Target      string     `json:"target"`
+	Observation string     `json:"observation"`
+	Result      string     `json:"result,omitempty"`
+}
+
+const maxStoredTraces = 20
+
+// storeCycleTrace writes the full cycle record to disk.
+// Keeps the last N traces in a JSON array file.
+func (sa *ServeAgent) storeCycleTrace(cycle int64, assessment *Assessment, observation, result string, duration time.Duration) {
+	traceDir := filepath.Join(sa.root, ".cog", ".state", "agent")
+	if err := os.MkdirAll(traceDir, 0o755); err != nil {
+		return
+	}
+	traceFile := filepath.Join(traceDir, "cycle-traces.json")
+
+	// Load existing traces
+	var traces []cycleTrace
+	if data, err := os.ReadFile(traceFile); err == nil {
+		json.Unmarshal(data, &traces)
+	}
+
+	// Append new trace
+	traces = append(traces, cycleTrace{
+		Cycle:       cycle,
+		Timestamp:   time.Now(),
+		DurationMs:  duration.Milliseconds(),
+		Action:      assessment.Action,
+		Urgency:     assessment.Urgency,
+		Reason:      assessment.Reason,
+		Target:      assessment.Target,
+		Observation: observation,
+		Result:      result,
+	})
+
+	// Keep only last N
+	if len(traces) > maxStoredTraces {
+		traces = traces[len(traces)-maxStoredTraces:]
+	}
+
+	data, err := json.MarshalIndent(traces, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(traceFile, data, 0o644)
+}
+
+// truncate returns at most n characters of s, appending "..." if truncated.
+func agentTruncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}

@@ -538,6 +538,10 @@ Rules:
 	log.Printf("[agent] cycle %d: action=%s urgency=%.1f reason=%q (%s)",
 		cycle, assessment.Action, assessment.Urgency, assessment.Reason, duration.Round(time.Millisecond))
 
+	if executeResult != "" {
+		log.Printf("[agent] cycle %d: execute result: %s", cycle, agentTruncate(executeResult, 500))
+	}
+
 	sa.emitEvent("agent.cycle", map[string]interface{}{
 		"cycle":       cycle,
 		"action":      assessment.Action,
@@ -546,7 +550,11 @@ Rules:
 		"target":      assessment.Target,
 		"duration_ms": duration.Milliseconds(),
 		"executed":    executeResult != "",
+		"result":      agentTruncate(executeResult, 2000),
 	})
+
+	// Store full cycle trace to disk for dashboard display
+	sa.storeCycleTrace(cycle, assessment, observation, executeResult, duration)
 
 	if assessment.Action == "escalate" {
 		log.Printf("[agent] cycle %d: escalation requested — %s (target: %s)",
@@ -909,6 +917,22 @@ func (s *serveServer) handleAgentStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	json.NewEncoder(w).Encode(s.agent.Status())
+}
+
+// handleAgentTraces serves GET /v1/agent/traces — returns recent cycle traces.
+func (s *serveServer) handleAgentTraces(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.agent == nil {
+		json.NewEncoder(w).Encode([]cycleTrace{})
+		return
+	}
+	traceFile := filepath.Join(s.agent.root, ".cog", ".state", "agent", "cycle-traces.json")
+	data, err := os.ReadFile(traceFile)
+	if err != nil {
+		json.NewEncoder(w).Encode([]cycleTrace{})
+		return
+	}
+	w.Write(data)
 }
 
 // handleAgentTrigger serves POST /v1/agent/trigger — manually triggers one cycle.
