@@ -229,6 +229,7 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("GET /v1/card", s.handleCard)                              // ADR-048: Kernel capability card
 	mux.HandleFunc("POST /v1/tool-bridge/pending", s.handleToolBridgePending) // Synchronous tool bridge
 	mux.HandleFunc("GET /v1/agent/status", s.handleAgentStatus)              // Homeostatic agent loop status
+	mux.HandleFunc("POST /v1/agent/trigger", s.handleAgentTrigger)           // Manual cycle trigger
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("GET /v1/health/canary", s.handleHealthCanary)
 	mux.HandleFunc("GET /v1/metrics/foveated", s.handleFoveatedMetrics) // B4: FCE quality metrics

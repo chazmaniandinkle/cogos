@@ -911,6 +911,18 @@ func (s *serveServer) handleAgentStatus(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(s.agent.Status())
 }
 
+// handleAgentTrigger serves POST /v1/agent/trigger — manually triggers one cycle.
+func (s *serveServer) handleAgentTrigger(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.agent == nil {
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "agent not running"})
+		return
+	}
+	go s.agent.safeCycle(context.Background())
+	json.NewEncoder(w).Encode(map[string]string{"status": "triggered"})
+}
+
 // runQuietCommand runs a command and returns stdout, suppressing stderr.
 func runQuietCommand(dir string, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(context.Background(), name, args...)

@@ -609,7 +609,10 @@ body {
       <div class="panel-section" id="tab-agent">
         <!-- Status Card -->
         <div class="proprio-section">
-          <div class="proprio-section-title">Agent Status</div>
+          <div class="proprio-section-title" style="display:flex;justify-content:space-between;align-items:center">
+            Agent Status
+            <button id="agent-trigger-btn" onclick="triggerAgentCycle()" style="font-size:10px;padding:2px 8px;background:var(--bg-surface);border:1px solid var(--border);border-radius:3px;color:var(--text);cursor:pointer">▶ Trigger Cycle</button>
+          </div>
           <div id="agent-status-card" style="font-family:var(--font-mono);font-size:12px">
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;color:var(--text-dim)">
               <span>Model:</span><span id="agent-model" style="color:var(--text)">--</span>
@@ -1664,6 +1667,24 @@ function parseInterval(s) {
   const h = s.match(/(\d+)h/);
   if (h) return parseInt(h[1]) * 3600;
   return 300;
+}
+
+async function triggerAgentCycle() {
+  const btn = document.getElementById('agent-trigger-btn');
+  btn.textContent = '⏳ Running...';
+  btn.disabled = true;
+  try {
+    await fetch(API + '/v1/agent/trigger', { method: 'POST' });
+    // Wait a moment for the cycle to complete, then refresh
+    setTimeout(() => {
+      refreshAgent();
+      btn.textContent = '▶ Trigger Cycle';
+      btn.disabled = false;
+    }, 12000);
+  } catch {
+    btn.textContent = '▶ Trigger Cycle';
+    btn.disabled = false;
+  }
 }
 
 function startAgentPolling() {
