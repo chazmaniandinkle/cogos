@@ -1431,3 +1431,90 @@ func TestDecompFileEventCallbackNoopOnBadDir(t *testing.T) {
 	// Calling the no-op callback should not panic
 	callback("test.event", map[string]interface{}{"key": "value"})
 }
+
+// TestDecompAcknowledgeProposal verifies that the acknowledge_proposal tool
+// correctly transitions a proposal from pending to the requested status.
+func TestDecompAcknowledgeProposal(t *testing.T) {
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, proposalsDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a pending proposal
+	proposal := `---
+id: 20260415-120000
+type: observation
+title: "Test proposal"
+target: ""
+urgency: 0.5
+created: 2026-04-15T12:00:00Z
+status: pending
+---
+
+# Test proposal
+
+This is a test proposal body.
+`
+	filename := "20260415-120000-test-proposal.md"
+	if err := os.WriteFile(filepath.Join(dir, filename), []byte(proposal), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call the acknowledge function
+	fn := newAcknowledgeProposalFunc(tmp)
+	args, _ := json.Marshal(map[string]string{
+		"filename": filename,
+		"status":   "acknowledged",
+	})
+	result, err := fn(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal(result, &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp["status"] != "acknowledged" {
+		t.Errorf("expected status=acknowledged, got %q", resp["status"])
+	}
+
+	// Verify the file was updated
+	updated, err := os.ReadFile(filepath.Join(dir, filename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(updated), "status: pending") {
+		t.Error("file still contains 'status: pending'")
+	}
+	if !strings.Contains(string(updated), "status: acknowledged") {
+		t.Error("file does not contain 'status: acknowledged'")
+	}
+
+	// Test with a note
+	fn2 := newAcknowledgeProposalFunc(tmp)
+	args2, _ := json.Marshal(map[string]string{
+		"filename": filename,
+		"status":   "approved",
+		"note":     "Looks good, proceed.",
+	})
+	result2, err := fn2(context.Background(), args2)
+	if err != nil {
+		t.Fatalf("unexpected error on second call: %v", err)
+	}
+	var resp2 map[string]string
+	json.Unmarshal(result2, &resp2)
+	if resp2["status"] != "approved" {
+		t.Errorf("expected status=approved, got %q", resp2["status"])
+	}
+
+	// Verify note was appended
+	final, _ := os.ReadFile(filepath.Join(dir, filename))
+	if !strings.Contains(string(final), "## Operator Note") {
+		t.Error("file does not contain operator note header")
+	}
+	if !strings.Contains(string(final), "Looks good, proceed.") {
+		t.Error("file does not contain the note text")
+	}
+}
