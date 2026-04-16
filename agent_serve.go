@@ -513,7 +513,26 @@ Rules:
 - Prefer action over inaction. Proposing is always safe. Observing without purpose is wasted compute.
 - When nothing needs attention and no proposals are pending, sleep.`, sa.root)
 
-	assessment, executeResult, err := sa.harness.RunCycle(ctx, systemPrompt, observation)
+	// Run assessment phase (JSON mode)
+	assessment, err := sa.harness.Assess(ctx, systemPrompt, observation)
+	var executeResult string
+	if err == nil && assessment.Action != "sleep" {
+		// Execute phase gets a different prompt that encourages tool chaining
+		executePrompt := fmt.Sprintf(`You are the CogOS kernel agent executing an action. Workspace: %s
+
+You decided: %s (reason: %s, target: %s)
+
+Now execute this using your tools. You may call MULTIPLE tools in sequence:
+- Call read_proposal to read proposals, then call propose to respond
+- Call memory_search to find docs, then call memory_read to read them
+- Call coherence_check, then propose a fix if needed
+
+Do not just describe what you would do — actually call the tools. When you are finished acting, respond with a brief summary of what you did.`, sa.root, assessment.Action, assessment.Reason, assessment.Target)
+
+		task := fmt.Sprintf("Execute: %s\nTarget: %s\nReason: %s",
+			assessment.Action, assessment.Target, assessment.Reason)
+		executeResult, _ = sa.harness.Execute(ctx, executePrompt, task)
+	}
 	duration := time.Since(start)
 
 	if err != nil {
