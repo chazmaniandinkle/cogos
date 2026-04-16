@@ -508,10 +508,10 @@ Actions:
 You are an observer and advisor. Your proposals are staged in a directory — they do not modify anything. The user reviews them at their convenience. You cannot interrupt anyone. Act confidently.
 
 Rules:
-- If your Recent Cycle Memory shows 3+ consecutive identical actions, you MUST choose differently. Break the loop.
-- If there are Pending Proposals, engage with them: read them with read_proposal, respond with your own proposal, or note that you've reviewed them.
-- Prefer action over inaction. Proposing is always safe. Observing without purpose is wasted compute.
-- When nothing needs attention and no proposals are pending, sleep.`, sa.root)
+- You may ONLY return one of these actions: sleep, observe, propose, escalate. No other values.
+- Look at your Recent Cycle Memory. If the last 3+ entries show the same action, you MUST pick a DIFFERENT one. For example: if you see observe,observe,observe then pick propose or sleep. If you see propose,propose,propose then pick sleep or observe.
+- If you have already read the pending proposals (check your memory — did a recent cycle mention reading them?), do NOT read them again. Instead propose your response or sleep.
+- When nothing needs attention, sleep. Sleeping is good — it saves compute and the adaptive interval will wake you when something changes.`, sa.root)
 
 	// Run assessment phase (JSON mode)
 	assessment, err := sa.harness.Assess(ctx, systemPrompt, observation)
