@@ -1525,6 +1525,7 @@ const actionColors = {
 
 let agentRefreshTimer = null;
 let urgencyHistory = [];
+let lastTraceHash = '';
 
 async function refreshAgent() {
   try {
@@ -1554,6 +1555,10 @@ async function refreshAgentTraces() {
     const res = await fetch(API + '/v1/agent/traces');
     if (!res.ok) return;
     const traces = await res.json();
+    // Only re-render if data changed — avoids collapsing open <details>
+    const hash = JSON.stringify(traces.map(t => t.cycle + ':' + t.action));
+    if (hash === lastTraceHash) return;
+    lastTraceHash = hash;
     renderAgentTraces(traces);
   } catch {}
 }
