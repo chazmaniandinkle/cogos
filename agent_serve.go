@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,7 @@ const (
 // AgentStatusResponse is the JSON payload for GET /v1/agent/status.
 type AgentStatusResponse struct {
 	Alive       bool    `json:"alive"`
+	Running     bool    `json:"running"`
 	Uptime      string  `json:"uptime"`
 	UptimeSec   int64   `json:"uptime_sec"`
 	CycleCount  int64   `json:"cycle_count"`
@@ -114,6 +116,9 @@ type ServeAgent struct {
 	lastGitFileCount     int              // modified file count at last cycle
 	lastCoherenceOK      bool             // coherence status at last cycle
 	lastProposalCount    int              // pending proposal count at last cycle
+
+	// Run awareness — prevents overlapping cycles
+	running int32 // atomic: 1 if a cycle is in progress, 0 otherwise
 }
 
 // Status returns the current agent loop status for the API.
@@ -124,6 +129,7 @@ func (sa *ServeAgent) Status() AgentStatusResponse {
 	uptime := time.Since(sa.startedAt)
 	resp := AgentStatusResponse{
 		Alive:       true,
+		Running:     atomic.LoadInt32(&sa.running) == 1,
 		Uptime:      agentFormatDuration(uptime),
 		UptimeSec:   int64(uptime.Seconds()),
 		CycleCount:  sa.cycleCount,
@@ -431,8 +437,15 @@ func (sa *ServeAgent) runLoop(ctx context.Context) {
 	}
 }
 
-// safeCycle wraps runCycle with panic recovery so the loop survives crashes.
+// safeCycle wraps runCycle with panic recovery and run-overlap guard.
 func (sa *ServeAgent) safeCycle(ctx context.Context) (action string) {
+	// Prevent overlapping cycles
+	if !atomic.CompareAndSwapInt32(&sa.running, 0, 1) {
+		log.Printf("[agent] cycle skipped: already running")
+		return "skip"
+	}
+	defer atomic.StoreInt32(&sa.running, 0)
+
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[agent] PANIC recovered in cycle: %v", r)
@@ -480,12 +493,8 @@ func (sa *ServeAgent) runCycle(ctx context.Context) string {
 			"reason": reason,
 		})
 
-		// Feed skip into rolling memory so the agent knows it was skipped
-		go sa.decomposeAndStore(ctx, cycle, &Assessment{
-			Action:  "sleep",
-			Reason:  "Cycle skipped: " + reason,
-			Urgency: 0,
-		})
+		// Skips don't write to rolling memory — only real assessments do.
+		// This prevents error/skip noise from diluting the compressed narrative.
 
 		return "sleep"
 	}
@@ -963,6 +972,11 @@ func (s *serveServer) handleAgentTrigger(w http.ResponseWriter, r *http.Request)
 	if s.agent == nil {
 		w.WriteHeader(503)
 		json.NewEncoder(w).Encode(map[string]string{"error": "agent not running"})
+		return
+	}
+	if atomic.LoadInt32(&s.agent.running) == 1 {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]string{"status": "already_running"})
 		return
 	}
 	go s.agent.safeCycle(context.Background())
