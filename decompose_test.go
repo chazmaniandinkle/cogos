@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // === E1: Schema Tests ===
@@ -117,6 +118,113 @@ func TestDecompMalformedJSON(t *testing.T) {
 				t.Errorf("expected error for %q, got nil", tc.name)
 			}
 		})
+	}
+}
+
+// === CycleMemoryEntry Quality Round-trip Tests ===
+
+func TestDecompCycleMemoryEntryQualityRoundTrip(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond) // truncate for JSON round-trip precision
+
+	cases := []struct {
+		name    string
+		quality string
+	}{
+		{"decomposed", "decomposed"},
+		{"fallback", "fallback"},
+		{"empty", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := cycleMemoryEntry{
+				Cycle:     42,
+				Action:    "observe",
+				Urgency:   0.7,
+				Sentence:  "Test sentence for quality round-trip.",
+				Timestamp: now,
+				Quality:   tc.quality,
+			}
+
+			data, err := json.Marshal(entry)
+			if err != nil {
+				t.Fatalf("marshal failed: %v", err)
+			}
+
+			var decoded cycleMemoryEntry
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatalf("unmarshal failed: %v", err)
+			}
+
+			if decoded.Quality != tc.quality {
+				t.Errorf("quality mismatch: got %q, want %q", decoded.Quality, tc.quality)
+			}
+			if decoded.Cycle != entry.Cycle {
+				t.Errorf("cycle mismatch: got %d, want %d", decoded.Cycle, entry.Cycle)
+			}
+			if decoded.Action != entry.Action {
+				t.Errorf("action mismatch: got %q, want %q", decoded.Action, entry.Action)
+			}
+			if decoded.Urgency != entry.Urgency {
+				t.Errorf("urgency mismatch: got %f, want %f", decoded.Urgency, entry.Urgency)
+			}
+			if decoded.Sentence != entry.Sentence {
+				t.Errorf("sentence mismatch: got %q, want %q", decoded.Sentence, entry.Sentence)
+			}
+
+			// Verify the JSON contains the quality field
+			if !strings.Contains(string(data), `"quality"`) {
+				t.Error("serialized JSON should contain 'quality' field")
+			}
+		})
+	}
+}
+
+func TestDecompCycleMemoryFormatObservationQualityTag(t *testing.T) {
+	mem := newAgentCycleMemory(10)
+
+	mem.append(cycleMemoryEntry{
+		Cycle:     1,
+		Action:    "observe",
+		Urgency:   0.5,
+		Sentence:  "Normal decomposed entry.",
+		Timestamp: time.Now(),
+		Quality:   "decomposed",
+	})
+	mem.append(cycleMemoryEntry{
+		Cycle:     2,
+		Action:    "sleep",
+		Urgency:   0.1,
+		Sentence:  "Fallback entry due to GPU timeout.",
+		Timestamp: time.Now(),
+		Quality:   "fallback",
+	})
+
+	output := mem.formatForObservation()
+
+	// The decomposed entry should NOT have [fallback] tag
+	if strings.Contains(output, "Normal decomposed entry.") && strings.Contains(output, "[fallback]") {
+		// Make sure [fallback] is only on the fallback line
+		lines := strings.Split(output, "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "Normal decomposed entry.") && strings.Contains(line, "[fallback]") {
+				t.Error("decomposed entry should not have [fallback] tag")
+			}
+		}
+	}
+
+	// The fallback entry should have [fallback] tag
+	lines := strings.Split(output, "\n")
+	foundFallbackTag := false
+	for _, line := range lines {
+		if strings.Contains(line, "Fallback entry due to GPU timeout.") {
+			if strings.Contains(line, "[fallback]") {
+				foundFallbackTag = true
+			}
+		}
+	}
+	if !foundFallbackTag {
+		t.Error("fallback entry should have [fallback] tag in observation output")
 	}
 }
 

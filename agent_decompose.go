@@ -39,6 +39,7 @@ type cycleMemoryEntry struct {
 	Urgency   float64   `json:"urgency"`
 	Sentence  string    `json:"sentence"`   // Tier 0
 	Timestamp time.Time `json:"timestamp"`
+	Quality   string    `json:"quality"`    // "decomposed" | "fallback"
 }
 
 // agentCycleMemory maintains a rolling buffer of decomposed cycle summaries.
@@ -96,8 +97,12 @@ func (m *agentCycleMemory) formatForObservation() string {
 	sb.WriteString("\n=== Recent Cycle Memory (compressed) ===\n")
 	for _, e := range entries {
 		ago := time.Since(e.Timestamp).Round(time.Minute)
-		sb.WriteString(fmt.Sprintf("[%s ago] %s (u=%.1f): %s\n",
-			formatAgo(ago), e.Action, e.Urgency, e.Sentence))
+		qualityTag := ""
+		if e.Quality == "fallback" {
+			qualityTag = " [fallback]"
+		}
+		sb.WriteString(fmt.Sprintf("[%s ago] %s (u=%.1f)%s: %s\n",
+			formatAgo(ago), e.Action, e.Urgency, qualityTag, e.Sentence))
 	}
 	return sb.String()
 }
@@ -131,9 +136,17 @@ func (sa *ServeAgent) decomposeAndStore(ctx context.Context, cycle int64, assess
 	decompCtx, cancel := context.WithTimeout(ctx, decompTimeoutSec*time.Second)
 	defer cancel()
 
+	// First attempt
 	content, err := sa.harness.GenerateJSON(decompCtx, tier0SystemPrompt(), tierUserPrompt(input))
 	if err != nil {
-		log.Printf("[agent] cycle %d: decompose failed (best-effort): %v", cycle, err)
+		// Retry once after a brief pause (GPU might be momentarily busy)
+		time.Sleep(2 * time.Second)
+		retryCtx, retryCancel := context.WithTimeout(ctx, decompTimeoutSec*time.Second)
+		content, err = sa.harness.GenerateJSON(retryCtx, tier0SystemPrompt(), tierUserPrompt(input))
+		retryCancel()
+	}
+	if err != nil {
+		log.Printf("[agent] cycle %d: decompose failed after retry: %v", cycle, err)
 		// Fall back to a mechanical summary — still useful as memory
 		sa.cycleMemory.append(cycleMemoryEntry{
 			Cycle:     cycle,
@@ -141,6 +154,7 @@ func (sa *ServeAgent) decomposeAndStore(ctx context.Context, cycle int64, assess
 			Urgency:   assessment.Urgency,
 			Sentence:  fmt.Sprintf("Cycle %d: %s (urgency %.1f) — %s", cycle, assessment.Action, assessment.Urgency, assessment.Reason),
 			Timestamp: time.Now(),
+			Quality:   "fallback",
 		})
 		return
 	}
@@ -155,6 +169,7 @@ func (sa *ServeAgent) decomposeAndStore(ctx context.Context, cycle int64, assess
 			Urgency:   assessment.Urgency,
 			Sentence:  assessment.Reason,
 			Timestamp: time.Now(),
+			Quality:   "fallback",
 		})
 		return
 	}
@@ -165,6 +180,7 @@ func (sa *ServeAgent) decomposeAndStore(ctx context.Context, cycle int64, assess
 		Urgency:   assessment.Urgency,
 		Sentence:  tier0.Summary,
 		Timestamp: time.Now(),
+		Quality:   "decomposed",
 	})
 
 	log.Printf("[agent] cycle %d: decomposed → %q", cycle, tier0.Summary)

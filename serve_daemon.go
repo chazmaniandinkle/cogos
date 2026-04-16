@@ -576,6 +576,24 @@ func cmdServeForeground(port int) int {
 			defer agent.Stop()
 		}
 
+		// 8b. Wake agent on non-system bus events
+		{
+			systemBusSet := map[string]bool{
+				"bus_chat_system_capabilities": true,
+				"bus_chat_http":                true,
+				"bus_agent_harness":            true,
+				"bus_index":                    true,
+				"decompose":                    true,
+			}
+			server.busChat.manager.AddEventHandler("agent-waker", func(busID string, block *CogBlock) {
+				if systemBusSet[busID] {
+					return
+				}
+				agent.Wake()
+			})
+			defer server.busChat.manager.RemoveEventHandler("agent-waker")
+		}
+
 		// 6b. Service health monitor: polls container health every 30s, emits bus events
 		svcMonitor := NewServiceHealthMonitor(root, server.busChat.manager)
 		svcMonitor.Start()

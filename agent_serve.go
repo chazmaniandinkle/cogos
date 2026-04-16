@@ -29,11 +29,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 const (
-	agentIntervalMin     = 5 * time.Minute  // start fast
-	agentIntervalMax     = 30 * time.Minute // relax to this after consecutive sleeps
+	agentIntervalMin     = 10 * time.Minute // start moderate; events wake us sooner
+	agentIntervalMax     = 60 * time.Minute // relax to this after consecutive sleeps
 	agentBusID           = "bus_agent_harness"
 )
 
@@ -94,6 +96,7 @@ type ServeAgent struct {
 	harness  *AgentHarness
 	bus      *busSessionManager
 	stopCh   chan struct{}
+	wakeCh   chan struct{} // event-driven wake signal (buffered 1)
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 
@@ -327,6 +330,7 @@ func NewServeAgent(root string) *ServeAgent {
 		interval:             interval,
 		harness:              harness,
 		stopCh:               make(chan struct{}),
+		wakeCh:               make(chan struct{}, 1), // buffered 1 so non-blocking send works
 		cycleMemory:          newAgentCycleMemory(maxRollingMemory),
 		lastRegistrySnapshot: make(map[string]int64),
 	}
@@ -358,6 +362,9 @@ func (sa *ServeAgent) Start() error {
 
 	sa.wg.Add(1)
 	go sa.runLoop(ctx)
+
+	// Watch proposals directory for file changes → wake agent
+	go sa.watchProposals()
 
 	return nil
 }
@@ -395,6 +402,63 @@ func (sa *ServeAgent) Stop() {
 	log.Printf("[agent] stopped after %d cycles", count)
 }
 
+// watchProposals uses fsnotify to watch the proposals directory and wake the
+// agent when new proposals are created or modified. Debounces at 500ms.
+func (sa *ServeAgent) watchProposals() {
+	dir := filepath.Join(sa.root, proposalsDir)
+	os.MkdirAll(dir, 0o755)
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("[agent] proposals watcher failed: %v", err)
+		return
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(dir); err != nil {
+		log.Printf("[agent] cannot watch proposals dir: %v", err)
+		return
+	}
+
+	log.Printf("[agent] watching proposals directory: %s", dir)
+
+	var debounceTimer *time.Timer
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
+				// Debounce: 500ms
+				if debounceTimer != nil {
+					debounceTimer.Stop()
+				}
+				debounceTimer = time.AfterFunc(500*time.Millisecond, func() {
+					log.Printf("[agent] proposals changed, waking agent")
+					sa.Wake()
+				})
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("[agent] proposals watcher error: %v", err)
+		case <-sa.stopCh:
+			return
+		}
+	}
+}
+
+// Wake signals the agent to run a cycle immediately instead of waiting for the
+// timer. Non-blocking: if a wake is already pending it's a no-op.
+func (sa *ServeAgent) Wake() {
+	select {
+	case sa.wakeCh <- struct{}{}:
+	default: // already signaled
+	}
+}
+
 // runLoop is the main ticker loop with adaptive interval.
 // Starts at agentIntervalMin, doubles toward agentIntervalMax on consecutive
 // "sleep" assessments, resets to agentIntervalMin on any non-sleep action.
@@ -409,6 +473,10 @@ func (sa *ServeAgent) runLoop(ctx context.Context) {
 	// Run initial cycle after a short delay (let the kernel fully initialize)
 	select {
 	case <-time.After(60 * time.Second):
+		action := sa.safeCycle(ctx)
+		consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
+	case <-sa.wakeCh:
+		log.Printf("[agent] woke by event (during init delay)")
 		action := sa.safeCycle(ctx)
 		consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
 	case <-sa.stopCh:
@@ -429,6 +497,10 @@ func (sa *ServeAgent) runLoop(ctx context.Context) {
 
 		select {
 		case <-time.After(interval):
+			action := sa.safeCycle(ctx)
+			consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
+		case <-sa.wakeCh:
+			log.Printf("[agent] woke by event")
 			action := sa.safeCycle(ctx)
 			consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
 		case <-sa.stopCh:
@@ -522,6 +594,7 @@ Rules:
 - You may ONLY return one of these actions: sleep, observe, propose, escalate. No other values.
 - Look at your Recent Cycle Memory. If the last 3+ entries show the same action, you MUST pick a DIFFERENT one. For example: if you see observe,observe,observe then pick propose or sleep. If you see propose,propose,propose then pick sleep or observe.
 - If you have already read the pending proposals (check your memory — did a recent cycle mention reading them?), do NOT read them again. Instead propose your response or sleep.
+- After reading a proposal's content, acknowledge it with the acknowledge_proposal tool so you don't re-process it on future cycles. This is how you close the loop on proposals.
 - When nothing needs attention, sleep. Sleeping is good — it saves compute and the adaptive interval will wake you when something changes.`, sa.root)
 
 	// Run assessment phase (JSON mode)
@@ -565,7 +638,8 @@ Rules:
 You decided: %s (reason: %s, target: %s)
 
 Now execute this using your tools. You may call MULTIPLE tools in sequence:
-- Call read_proposal to read proposals, then call propose to respond
+- Call read_proposal to read proposals, then call acknowledge_proposal to mark them processed
+- Call propose to write new proposals in response to what you read
 - Call memory_search to find docs, then call memory_read to read them
 - Call coherence_check, then propose a fix if needed
 
@@ -573,7 +647,10 @@ Do not just describe what you would do — actually call the tools. When you are
 
 		task := fmt.Sprintf("Execute: %s\nTarget: %s\nReason: %s",
 			assessment.Action, assessment.Target, assessment.Reason)
-		executeResult, _ = sa.harness.Execute(ctx, executePrompt, task)
+		// Limit execute phase to 60 seconds to prevent GPU exhaustion
+		execCtx, execCancel := context.WithTimeout(ctx, 60*time.Second)
+		executeResult, _ = sa.harness.Execute(execCtx, executePrompt, task)
+		execCancel()
 	}
 	duration := time.Since(start)
 
@@ -947,6 +1024,7 @@ func (sa *ServeAgent) gatherPendingProposals() string {
 	}
 
 	var pending []string
+	var acknowledged, approved, rejected int
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
@@ -956,19 +1034,34 @@ func (sa *ServeAgent) gatherPendingProposals() string {
 			continue
 		}
 		contentStr := string(content)
-		if !strings.Contains(contentStr, "status: pending") {
-			continue
+		status := extractFMField(contentStr, "status")
+		switch status {
+		case "pending":
+			title := extractFMField(contentStr, "title")
+			pType := extractFMField(contentStr, "type")
+			pending = append(pending, fmt.Sprintf("  [%s] %s", pType, title))
+		case "acknowledged":
+			acknowledged++
+		case "approved":
+			approved++
+		case "rejected":
+			rejected++
 		}
-		title := extractFMField(contentStr, "title")
-		pType := extractFMField(contentStr, "type")
-		pending = append(pending, fmt.Sprintf("  [%s] %s", pType, title))
 	}
 
-	if len(pending) == 0 {
+	if len(pending) == 0 && acknowledged == 0 && approved == 0 && rejected == 0 {
 		return ""
 	}
 
-	return fmt.Sprintf("\n=== Pending Proposals (%d) ===\n%s\n", len(pending), strings.Join(pending, "\n"))
+	var sb strings.Builder
+	if len(pending) > 0 {
+		sb.WriteString(fmt.Sprintf("\n=== Pending Proposals (%d) ===\n%s\n", len(pending), strings.Join(pending, "\n")))
+	}
+	if acknowledged > 0 || approved > 0 || rejected > 0 {
+		sb.WriteString(fmt.Sprintf("Previously processed: %d acknowledged, %d approved, %d rejected\n", acknowledged, approved, rejected))
+	}
+
+	return sb.String()
 }
 
 // handleAgentStatus serves GET /v1/agent/status.

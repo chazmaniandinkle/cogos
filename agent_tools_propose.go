@@ -29,6 +29,7 @@ func RegisterProposalTools(h *AgentHarness, workspaceRoot string) {
 	h.RegisterTool(proposeDef(), newProposeFunc(workspaceRoot))
 	h.RegisterTool(listProposalsDef(), newListProposalsFunc(workspaceRoot))
 	h.RegisterTool(readProposalDef(), newReadProposalFunc(workspaceRoot))
+	h.RegisterTool(acknowledgeProposalDef(), newAcknowledgeProposalFunc(workspaceRoot))
 }
 
 // --- propose ---
@@ -289,6 +290,80 @@ func newReadProposalFunc(root string) ToolFunc {
 		return json.Marshal(map[string]interface{}{
 			"proposals": proposals,
 			"count":     len(proposals),
+		})
+	}
+}
+
+// --- acknowledge_proposal ---
+
+func acknowledgeProposalDef() ToolDefinition {
+	return ToolDefinition{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "acknowledge_proposal",
+			Description: "Mark a proposal as processed. Use after reading and noting a proposal's content. Prevents re-reading on future cycles.",
+			Parameters: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"filename": {
+						"type": "string",
+						"description": "The proposal filename to acknowledge"
+					},
+					"status": {
+						"type": "string",
+						"description": "New status for the proposal",
+						"enum": ["acknowledged", "approved", "rejected"]
+					},
+					"note": {
+						"type": "string",
+						"description": "Optional note to append to the proposal"
+					}
+				},
+				"required": ["filename", "status"]
+			}`),
+		},
+	}
+}
+
+func newAcknowledgeProposalFunc(root string) ToolFunc {
+	return func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+		var p struct {
+			Filename string `json:"filename"`
+			Status   string `json:"status"`
+			Note     string `json:"note"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return nil, fmt.Errorf("parse args: %w", err)
+		}
+		if p.Filename == "" || p.Status == "" {
+			return json.Marshal(map[string]string{"error": "filename and status are required"})
+		}
+		validStatus := map[string]bool{"acknowledged": true, "approved": true, "rejected": true}
+		if !validStatus[p.Status] {
+			return json.Marshal(map[string]string{"error": "status must be acknowledged, approved, or rejected"})
+		}
+
+		path := filepath.Join(root, proposalsDir, filepath.Base(p.Filename))
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return json.Marshal(map[string]string{"error": "not found: " + err.Error()})
+		}
+
+		contentStr := string(content)
+		contentStr = strings.Replace(contentStr, "status: pending", "status: "+p.Status, 1)
+
+		if p.Note != "" {
+			contentStr += "\n\n## Operator Note\n" + p.Note + "\n"
+		}
+
+		if err := os.WriteFile(path, []byte(contentStr), 0o644); err != nil {
+			return json.Marshal(map[string]string{"error": "write failed: " + err.Error()})
+		}
+
+		return json.Marshal(map[string]string{
+			"status":  p.Status,
+			"file":    p.Filename,
+			"message": fmt.Sprintf("Proposal marked as %s.", p.Status),
 		})
 	}
 }
