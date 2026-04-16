@@ -452,7 +452,15 @@ func (sa *ServeAgent) watchProposals() {
 
 // Wake signals the agent to run a cycle immediately instead of waiting for the
 // timer. Non-blocking: if a wake is already pending it's a no-op.
+// Enforces a 30-second cooldown to prevent thrashing when the agent's own
+// proposals trigger bus events that re-wake it immediately.
 func (sa *ServeAgent) Wake() {
+	sa.mu.RLock()
+	lastRun := sa.lastRun
+	sa.mu.RUnlock()
+	if !lastRun.IsZero() && time.Since(lastRun) < 30*time.Second {
+		return // cooldown — too soon after last cycle
+	}
 	select {
 	case sa.wakeCh <- struct{}{}:
 	default: // already signaled
