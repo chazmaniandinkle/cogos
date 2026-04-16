@@ -666,6 +666,23 @@ body {
           </div>
         </div>
 
+        <!-- Link Feed / Enrichment -->
+        <div class="proprio-section">
+          <div class="proprio-section-title">Link Feed</div>
+          <div id="agent-inbox" style="font-family:var(--font-mono);font-size:12px">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;color:var(--text-dim)">
+              <span>Last pull:</span><span id="inbox-last-pull" style="color:var(--text)">--</span>
+              <span>Next:</span><span id="inbox-next-pull" style="color:var(--text)">--</span>
+              <span>Raw:</span><span id="inbox-raw" style="color:var(--yellow)">--</span>
+              <span>Enriched:</span><span id="inbox-enriched" style="color:var(--green)">--</span>
+              <span>Failed:</span><span id="inbox-failed" style="color:var(--red)">--</span>
+              <span>Total:</span><span id="inbox-total" style="color:var(--text)">--</span>
+            </div>
+            <div id="inbox-recent" style="margin-top:8px;font-size:11px;color:var(--text-dim);max-height:120px;overflow-y:auto">
+            </div>
+          </div>
+        </div>
+
         <!-- Cycle Traces -->
         <div class="proprio-section">
           <div class="proprio-section-title">Cycle Traces</div>
@@ -1537,6 +1554,7 @@ async function refreshAgent() {
     renderAgentActivity(d.activity);
     renderAgentMemory(d.memory);
     renderAgentProposals(d.proposals);
+    renderAgentInbox(d.inbox);
     if (d.last_urgency != null && d.cycle_count > 0) {
       urgencyHistory.push(d.last_urgency);
       if (urgencyHistory.length > 20) urgencyHistory.shift();
@@ -1687,6 +1705,34 @@ function renderAgentProposals(proposals) {
     html += '</div>';
   }
   container.innerHTML = html;
+}
+
+function renderAgentInbox(inbox) {
+  if (!inbox) return;
+  document.getElementById('inbox-last-pull').textContent = inbox.last_pull_ago ? `${inbox.last_pull_ago} ago` : 'never';
+  const nextEl = document.getElementById('inbox-next-pull');
+  nextEl.textContent = inbox.next_pull_in || '--';
+  nextEl.style.color = inbox.next_pull_in === 'overdue' ? 'var(--red)' : 'var(--text)';
+  document.getElementById('inbox-raw').textContent = inbox.raw_count || '0';
+  document.getElementById('inbox-enriched').textContent = inbox.enriched_count || '0';
+  document.getElementById('inbox-failed').textContent = inbox.failed_count || '0';
+  document.getElementById('inbox-total').textContent = inbox.total_count || '0';
+
+  const recentEl = document.getElementById('inbox-recent');
+  if (inbox.recent_enrichments && inbox.recent_enrichments.length > 0) {
+    let html = '<div style="font-weight:600;color:var(--text);margin-bottom:4px">Recent Enrichments</div>';
+    for (const e of inbox.recent_enrichments) {
+      const connColor = e.connections > 0 ? 'var(--green)' : 'var(--text-dim)';
+      html += `<div style="margin-bottom:2px;border-left:2px solid ${connColor};padding-left:6px">`;
+      html += `<span style="color:var(--text)">${esc(e.title)}</span>`;
+      html += ` <span style="color:${connColor}">${e.connections} conn</span>`;
+      html += ` <span style="color:var(--text-dim);font-size:10px">${e.ago} ago</span>`;
+      html += '</div>';
+    }
+    recentEl.innerHTML = html;
+  } else {
+    recentEl.innerHTML = '';
+  }
 }
 
 function renderUrgencySparkline() {

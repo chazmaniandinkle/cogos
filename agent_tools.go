@@ -30,6 +30,9 @@ func RegisterCoreTools(h *AgentHarness, workspaceRoot string) {
 	// Bus events (observable side-effects only)
 	h.RegisterTool(busEmitDef(), newBusEmitFunc(workspaceRoot))
 
+	// Link feed tools (Discord pull + enrichment)
+	RegisterLinkFeedTools(h, workspaceRoot)
+
 	// NOTE: memory_write is deliberately excluded.
 	// The agent proposes changes via the propose tool; a human or
 	// cloud-tier agent authorizes them before they take effect.

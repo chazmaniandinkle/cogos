@@ -55,9 +55,10 @@ type AgentStatusResponse struct {
 	Model       string  `json:"model"`
 
 	// Activity awareness (enriched)
-	Activity *AgentActivitySummary  `json:"activity,omitempty"`
-	Memory   []AgentMemoryEntry     `json:"memory,omitempty"`
-	Proposals []AgentProposalEntry  `json:"proposals,omitempty"`
+	Activity  *AgentActivitySummary  `json:"activity,omitempty"`
+	Memory    []AgentMemoryEntry     `json:"memory,omitempty"`
+	Proposals []AgentProposalEntry   `json:"proposals,omitempty"`
+	Inbox     *AgentInboxSummary     `json:"inbox,omitempty"`
 }
 
 // AgentActivitySummary is the system activity snapshot from the bus registry.
@@ -147,11 +148,12 @@ func (sa *ServeAgent) Status() AgentStatusResponse {
 		resp.LastCycle = sa.lastRun.Format(time.RFC3339)
 	}
 
-	// Enrich with activity, memory, and proposals (best-effort, outside lock)
+	// Enrich with activity, memory, proposals, and inbox (best-effort, outside lock)
 	sa.mu.RUnlock()
 	resp.Activity = sa.getActivityForAPI()
 	resp.Memory = sa.getMemoryForAPI()
 	resp.Proposals = sa.getProposalsForAPI()
+	resp.Inbox = buildInboxSummaryForAPI(sa.root)
 	sa.mu.RLock() // re-acquire for deferred unlock
 
 	return resp
@@ -365,6 +367,9 @@ func (sa *ServeAgent) Start() error {
 
 	// Watch proposals directory for file changes → wake agent
 	go sa.watchProposals()
+
+	// Watch inbox/links/ for new links → wake agent
+	go sa.watchInboxLinks()
 
 	return nil
 }
@@ -789,6 +794,12 @@ func (sa *ServeAgent) gatherObservation() string {
 		cachedProposalCount = strings.Count(proposals, "[")
 	}
 
+	// Inject link feed status
+	sb.WriteString(sa.gatherLinkFeedStatus())
+
+	// Inject inbox summary
+	sb.WriteString(sa.gatherInboxSummary())
+
 	// Update observation cache for the cheap checks gate
 	sa.updateObservationCache(cachedGitCount, cachedCoherenceOK, cachedProposalCount)
 
@@ -1070,6 +1081,95 @@ func (sa *ServeAgent) gatherPendingProposals() string {
 	}
 
 	return sb.String()
+}
+
+// gatherLinkFeedStatus returns the link feed timing status for observation injection.
+func (sa *ServeAgent) gatherLinkFeedStatus() string {
+	_, err := readDiscordAuth(sa.root)
+	if err != nil {
+		return "\n=== Link Feed ===\nNot configured (missing auth)\n"
+	}
+
+	ago, err := linkFeedLastPull(sa.root)
+	if err != nil {
+		return "\n=== Link Feed ===\nLast pull: never\n"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n=== Link Feed ===\n")
+	if ago > linkFeedCheckInterval {
+		sb.WriteString(fmt.Sprintf("Last pull: %s ago (overdue)\n", formatAgo(ago)))
+	} else {
+		remaining := linkFeedCheckInterval - ago
+		sb.WriteString(fmt.Sprintf("Last pull: %s ago (next in %s)\n", formatAgo(ago), formatAgo(remaining)))
+	}
+	return sb.String()
+}
+
+// gatherInboxSummary returns the inbox status for observation injection.
+func (sa *ServeAgent) gatherInboxSummary() string {
+	inbox := scanInbox(sa.root)
+	if inbox.TotalCount == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n=== Inbox ===\n")
+	if inbox.RawCount > 0 {
+		sb.WriteString(fmt.Sprintf("Raw items: %d new links awaiting enrichment\n", inbox.RawCount))
+		for _, f := range inbox.NewestRaw {
+			sb.WriteString(fmt.Sprintf("  - %s\n", f))
+		}
+	}
+	sb.WriteString(fmt.Sprintf("Enriched: %d | Failed: %d | Total: %d\n", inbox.EnrichedCount, inbox.FailedCount, inbox.TotalCount))
+	return sb.String()
+}
+
+// watchInboxLinks uses fsnotify to watch the inbox/links/ directory and wake
+// the agent when new links arrive. Runs alongside watchProposals.
+func (sa *ServeAgent) watchInboxLinks() {
+	dir := filepath.Join(sa.root, inboxLinksRelPath)
+	os.MkdirAll(dir, 0o755)
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("[agent] inbox watcher failed: %v", err)
+		return
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(dir); err != nil {
+		log.Printf("[agent] cannot watch inbox dir: %v", err)
+		return
+	}
+
+	log.Printf("[agent] watching inbox directory: %s", dir)
+
+	var debounceTimer *time.Timer
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
+				if debounceTimer != nil {
+					debounceTimer.Stop()
+				}
+				debounceTimer = time.AfterFunc(2*time.Second, func() {
+					log.Printf("[agent] inbox changed, waking agent")
+					sa.Wake()
+				})
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("[agent] inbox watcher error: %v", err)
+		case <-sa.stopCh:
+			return
+		}
+	}
 }
 
 // handleAgentStatus serves GET /v1/agent/status.
