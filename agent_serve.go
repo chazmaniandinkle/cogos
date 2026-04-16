@@ -38,17 +38,51 @@ const (
 
 // AgentStatusResponse is the JSON payload for GET /v1/agent/status.
 type AgentStatusResponse struct {
-	Alive      bool    `json:"alive"`
-	Uptime     string  `json:"uptime"`
-	UptimeSec  int64   `json:"uptime_sec"`
-	CycleCount int64   `json:"cycle_count"`
-	LastCycle  string  `json:"last_cycle,omitempty"`  // RFC3339
-	LastAction string  `json:"last_action,omitempty"`
+	Alive       bool    `json:"alive"`
+	Uptime      string  `json:"uptime"`
+	UptimeSec   int64   `json:"uptime_sec"`
+	CycleCount  int64   `json:"cycle_count"`
+	LastCycle   string  `json:"last_cycle,omitempty"` // RFC3339
+	LastAction  string  `json:"last_action,omitempty"`
 	LastUrgency float64 `json:"last_urgency"`
-	LastReason string  `json:"last_reason,omitempty"`
-	LastDurMs  int64   `json:"last_duration_ms"`
-	Interval   string  `json:"interval"`
-	Model      string  `json:"model"`
+	LastReason  string  `json:"last_reason,omitempty"`
+	LastDurMs   int64   `json:"last_duration_ms"`
+	Interval    string  `json:"interval"`
+	Model       string  `json:"model"`
+
+	// Activity awareness (enriched)
+	Activity *AgentActivitySummary  `json:"activity,omitempty"`
+	Memory   []AgentMemoryEntry     `json:"memory,omitempty"`
+	Proposals []AgentProposalEntry  `json:"proposals,omitempty"`
+}
+
+// AgentActivitySummary is the system activity snapshot from the bus registry.
+type AgentActivitySummary struct {
+	UserPresence     string `json:"user_presence"`      // "active", "recent", "idle", "unknown"
+	UserLastEventAgo string `json:"user_last_event_ago"` // "3m", "2h"
+	ClaudeCodeActive int    `json:"claude_code_active"`
+	ClaudeCodeEvents int64  `json:"claude_code_events"`
+	TotalEventDelta  int64  `json:"total_event_delta"`
+	HottestBus       string `json:"hottest_bus,omitempty"`
+	HottestDelta     int64  `json:"hottest_delta"`
+}
+
+// AgentMemoryEntry is a rolling memory item for the API.
+type AgentMemoryEntry struct {
+	Cycle    int64   `json:"cycle"`
+	Action   string  `json:"action"`
+	Urgency  float64 `json:"urgency"`
+	Sentence string  `json:"sentence"`
+	Ago      string  `json:"ago"` // "5m", "2h"
+}
+
+// AgentProposalEntry is a pending proposal for the API.
+type AgentProposalEntry struct {
+	File    string `json:"file"`
+	Title   string `json:"title"`
+	Type    string `json:"type"`
+	Urgency string `json:"urgency"`
+	Created string `json:"created"`
 }
 
 // ServeAgent runs the homeostatic agent loop inside cog serve.
@@ -103,7 +137,132 @@ func (sa *ServeAgent) Status() AgentStatusResponse {
 	if !sa.lastRun.IsZero() {
 		resp.LastCycle = sa.lastRun.Format(time.RFC3339)
 	}
+
+	// Enrich with activity, memory, and proposals (best-effort, outside lock)
+	sa.mu.RUnlock()
+	resp.Activity = sa.getActivityForAPI()
+	resp.Memory = sa.getMemoryForAPI()
+	resp.Proposals = sa.getProposalsForAPI()
+	sa.mu.RLock() // re-acquire for deferred unlock
+
 	return resp
+}
+
+// getActivityForAPI computes the activity summary for the status API.
+func (sa *ServeAgent) getActivityForAPI() *AgentActivitySummary {
+	if sa.bus == nil {
+		return nil
+	}
+	registry := sa.bus.loadRegistry()
+	if len(registry) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	summary := &AgentActivitySummary{UserPresence: "unknown"}
+	var latestEventTime time.Time
+
+	for _, entry := range registry {
+		seq := int64(entry.LastEventSeq)
+		prevSeq := sa.lastRegistrySnapshot[entry.BusID]
+		delta := seq - prevSeq
+		if delta < 0 {
+			delta = 0
+		}
+
+		if delta > 0 {
+			summary.TotalEventDelta += delta
+			if delta > summary.HottestDelta {
+				summary.HottestDelta = delta
+				summary.HottestBus = entry.BusID
+				if len(summary.HottestBus) > 40 {
+					summary.HottestBus = summary.HottestBus[:37] + "..."
+				}
+			}
+		}
+
+		if entry.LastEventAt != "" {
+			if t, err := time.Parse(time.RFC3339Nano, entry.LastEventAt); err == nil {
+				if t.After(latestEventTime) {
+					latestEventTime = t
+				}
+			}
+		}
+
+		bid := entry.BusID
+		if strings.HasPrefix(bid, "claude-code-") && delta > 0 {
+			summary.ClaudeCodeActive++
+			summary.ClaudeCodeEvents += delta
+		}
+	}
+
+	if !latestEventTime.IsZero() {
+		ago := now.Sub(latestEventTime)
+		summary.UserLastEventAgo = formatAgo(ago)
+		if ago < 5*time.Minute {
+			summary.UserPresence = "active"
+		} else if ago < time.Hour {
+			summary.UserPresence = "recent"
+		} else {
+			summary.UserPresence = "idle"
+		}
+	}
+
+	return summary
+}
+
+// getMemoryForAPI returns the rolling memory entries for the status API.
+func (sa *ServeAgent) getMemoryForAPI() []AgentMemoryEntry {
+	if sa.cycleMemory == nil {
+		return nil
+	}
+	entries := sa.cycleMemory.recent(maxRollingMemory)
+	if len(entries) == 0 {
+		return nil
+	}
+	now := time.Now()
+	result := make([]AgentMemoryEntry, len(entries))
+	for i, e := range entries {
+		result[i] = AgentMemoryEntry{
+			Cycle:    e.Cycle,
+			Action:   e.Action,
+			Urgency:  e.Urgency,
+			Sentence: e.Sentence,
+			Ago:      formatAgo(now.Sub(e.Timestamp)),
+		}
+	}
+	return result
+}
+
+// getProposalsForAPI returns pending proposals for the status API.
+func (sa *ServeAgent) getProposalsForAPI() []AgentProposalEntry {
+	dir := filepath.Join(sa.root, proposalsDir)
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var result []AgentProposalEntry
+	for _, e := range dirEntries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		contentStr := string(content)
+		if !strings.Contains(contentStr, "status: pending") {
+			continue
+		}
+		result = append(result, AgentProposalEntry{
+			File:    e.Name(),
+			Title:   extractFMField(contentStr, "title"),
+			Type:    extractFMField(contentStr, "type"),
+			Urgency: extractFMField(contentStr, "urgency"),
+			Created: extractFMField(contentStr, "created"),
+		})
+	}
+	return result
 }
 
 // agentFormatDuration returns a human-readable duration like "4h 23m".
