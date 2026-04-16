@@ -177,19 +177,19 @@ func (sa *ServeAgent) getActivityForAPI() *AgentActivitySummary {
 			delta = 0
 		}
 
-		if delta > 0 {
+		bid := entry.BusID
+		isSystem := apiBusExclude[bid]
+
+		if delta > 0 && !isSystem {
 			summary.TotalEventDelta += delta
 			if delta > summary.HottestDelta {
 				summary.HottestDelta = delta
-				summary.HottestBus = entry.BusID
+				summary.HottestBus = bid
 				if len(summary.HottestBus) > 40 {
 					summary.HottestBus = summary.HottestBus[:37] + "..."
 				}
 			}
 		}
-
-		bid := entry.BusID
-		isSystem := apiBusExclude[bid]
 
 		if !isSystem && entry.LastEventAt != "" {
 			if t, err := time.Parse(time.RFC3339Nano, entry.LastEventAt); err == nil {
@@ -443,8 +443,10 @@ func (sa *ServeAgent) safeCycle(ctx context.Context) (action string) {
 }
 
 // updateSleepCount returns the new consecutive sleep counter.
+// Errors count as sleeps — a failed cycle didn't do useful work,
+// so the interval should keep doubling, not reset to minimum.
 func (sa *ServeAgent) updateSleepCount(action string, current int) int {
-	if action == "sleep" {
+	if action == "sleep" || action == "error" {
 		return current + 1
 	}
 	return 0
@@ -716,16 +718,17 @@ func (sa *ServeAgent) gatherActivitySummary() string {
 			delta = seq - prevSeq
 		}
 
-		if delta > 0 {
+		bid := entry.BusID
+		isSystem := systemBuses[bid]
+
+		// Only count non-system bus events in the activity delta
+		if delta > 0 && !isSystem {
 			totalDelta += delta
 			if delta > hottestDelta {
 				hottestDelta = delta
-				hottestBus = entry.BusID
+				hottestBus = bid
 			}
 		}
-
-		bid := entry.BusID
-		isSystem := systemBuses[bid]
 
 		// Track user presence only from user-initiated buses (not kernel system buses)
 		if !isSystem && entry.LastEventAt != "" {

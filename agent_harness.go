@@ -127,7 +127,7 @@ func NewAgentHarness(cfg AgentHarnessConfig) *AgentHarness {
 		tools:     nil,
 		toolFuncs: make(map[string]ToolFunc),
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 180 * time.Second,
 		},
 		maxTurns: maxTurns,
 	}

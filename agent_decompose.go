@@ -29,7 +29,7 @@ const (
 
 	// decompTimeoutSec is the maximum time to spend on per-cycle decomposition.
 	// Must be short enough not to delay the next cycle.
-	decompTimeoutSec = 30
+	decompTimeoutSec = 60
 )
 
 // cycleMemoryEntry is one cycle's compressed memory.
