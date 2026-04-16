@@ -227,13 +227,12 @@ func readProposalDef() ToolDefinition {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        "read_proposal",
-			Description: "Read the full content of a specific proposal by filename.",
+			Description: "Read pending proposals. With no arguments, returns ALL pending proposals with full content. With a filename, returns that specific proposal.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
 				"properties": {
-					"filename": {"type": "string", "description": "Proposal filename (from list_proposals)"}
-				},
-				"required": ["filename"]
+					"filename": {"type": "string", "description": "Optional: specific proposal filename. If omitted, returns all pending proposals."}
+				}
 			}`),
 		},
 	}
@@ -244,17 +243,53 @@ func newReadProposalFunc(root string) ToolFunc {
 		var p struct {
 			Filename string `json:"filename"`
 		}
-		if err := json.Unmarshal(args, &p); err != nil {
-			return nil, fmt.Errorf("parse args: %w", err)
+		if args != nil {
+			json.Unmarshal(args, &p)
 		}
 
-		path := filepath.Join(root, proposalsDir, filepath.Base(p.Filename))
-		content, err := os.ReadFile(path)
+		// If a specific filename is given, read just that one
+		if p.Filename != "" {
+			path := filepath.Join(root, proposalsDir, filepath.Base(p.Filename))
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return json.Marshal(map[string]string{"error": "not found: " + err.Error()})
+			}
+			return json.Marshal(map[string]string{"content": string(content)})
+		}
+
+		// No filename — return ALL pending proposals with full content
+		dir := filepath.Join(root, proposalsDir)
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			return json.Marshal(map[string]string{"error": "not found: " + err.Error()})
+			if os.IsNotExist(err) {
+				return json.Marshal(map[string]interface{}{"proposals": []string{}, "count": 0})
+			}
+			return nil, err
 		}
 
-		return json.Marshal(map[string]string{"content": string(content)})
+		var proposals []map[string]string
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+				continue
+			}
+			content, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			if err != nil {
+				continue
+			}
+			contentStr := string(content)
+			if !strings.Contains(contentStr, "status: pending") {
+				continue
+			}
+			proposals = append(proposals, map[string]string{
+				"file":    e.Name(),
+				"content": contentStr,
+			})
+		}
+
+		return json.Marshal(map[string]interface{}{
+			"proposals": proposals,
+			"count":     len(proposals),
+		})
 	}
 }
 
