@@ -74,6 +74,12 @@ type ServeAgent struct {
 	// Decomposition-fed rolling memory (the first hypercycle wire)
 	cycleMemory     *agentCycleMemory
 	lastObservation string // cached for decomposition context
+
+	// Activity tracking for cheap checks gate and delta computation
+	lastRegistrySnapshot map[string]int64 // busID → LastEventSeq at last cycle
+	lastGitFileCount     int              // modified file count at last cycle
+	lastCoherenceOK      bool             // coherence status at last cycle
+	lastProposalCount    int              // pending proposal count at last cycle
 }
 
 // Status returns the current agent loop status for the API.
@@ -143,11 +149,12 @@ func NewServeAgent(root string) *ServeAgent {
 	RegisterCoreTools(harness, root)
 
 	sa := &ServeAgent{
-		root:        root,
-		interval:    interval,
-		harness:     harness,
-		stopCh:      make(chan struct{}),
-		cycleMemory: newAgentCycleMemory(maxRollingMemory),
+		root:                 root,
+		interval:             interval,
+		harness:              harness,
+		stopCh:               make(chan struct{}),
+		cycleMemory:          newAgentCycleMemory(maxRollingMemory),
+		lastRegistrySnapshot: make(map[string]int64),
 	}
 	sa.loadCycleMemory()
 	return sa
@@ -286,6 +293,33 @@ func (sa *ServeAgent) runCycle(ctx context.Context) string {
 
 	log.Printf("[agent] cycle %d: starting", cycle)
 
+	// Cheap checks gate: skip model call if nothing changed
+	if skip, reason := sa.shouldSkipModel(); skip {
+		log.Printf("[agent] cycle %d: skipped (%s)", cycle, reason)
+
+		sa.mu.Lock()
+		sa.lastRun = time.Now()
+		sa.lastAction = "skip"
+		sa.lastUrgency = 0
+		sa.lastReason = reason
+		sa.lastDurMs = 0
+		sa.mu.Unlock()
+
+		sa.emitEvent("agent.skip", map[string]interface{}{
+			"cycle":  cycle,
+			"reason": reason,
+		})
+
+		// Feed skip into rolling memory so the agent knows it was skipped
+		go sa.decomposeAndStore(ctx, cycle, &Assessment{
+			Action:  "sleep",
+			Reason:  "Cycle skipped: " + reason,
+			Urgency: 0,
+		})
+
+		return "sleep"
+	}
+
 	// Build observation from workspace state
 	observation := sa.gatherObservation()
 
@@ -305,7 +339,12 @@ Actions:
 - repair: propose fixes for coherence drift or broken state
 - escalate: beyond local capability, needs cloud model or human attention
 
-Important: Check your Recent Cycle Memory. If you've been taking the same action repeatedly without effect, consider a different action. If you've already proposed something about an issue, check your Pending Proposals before proposing again.`, sa.root)
+Important:
+- Check your Recent Cycle Memory. If you've been taking the same action repeatedly without effect, consider a different action.
+- If you've already proposed something about an issue, check your Pending Proposals before proposing again.
+- The System Activity section shows what's happening across the workspace since your last cycle. "User presence: active" means someone is working. When the user is active, prefer observing over acting — don't disrupt their flow.
+- If you were skipped (no model call because nothing changed), your memory will show "Cycle skipped". This is normal during idle periods.
+- When the workspace has been idle for a long time with no user activity, consider whether it's time to sleep or whether proposals are warranted.`, sa.root)
 
 	assessment, executeResult, err := sa.harness.RunCycle(ctx, systemPrompt, observation)
 	duration := time.Since(start)
@@ -362,8 +401,12 @@ Important: Check your Recent Cycle Memory. If you've been taking the same action
 }
 
 // gatherObservation builds a compact observation string from workspace state.
+// Also updates the observation cache for the cheap checks gate.
 func (sa *ServeAgent) gatherObservation() string {
 	var sb strings.Builder
+	var cachedGitCount int
+	var cachedCoherenceOK bool
+	var cachedProposalCount int
 
 	sb.WriteString("=== Workspace Observation ===\n")
 	sb.WriteString(fmt.Sprintf("Time: %s\n", time.Now().Format(time.RFC3339)))
@@ -373,7 +416,8 @@ func (sa *ServeAgent) gatherObservation() string {
 	if status, err := runQuietCommand(sa.root, "git", "status", "--porcelain"); err == nil {
 		lines := strings.Split(strings.TrimSpace(status), "\n")
 		if len(lines) > 0 && lines[0] != "" {
-			sb.WriteString(fmt.Sprintf("Git: %d modified files\n", len(lines)))
+			cachedGitCount = len(lines)
+			sb.WriteString(fmt.Sprintf("Git: %d modified files\n", cachedGitCount))
 		} else {
 			sb.WriteString("Git: clean\n")
 		}
@@ -381,7 +425,6 @@ func (sa *ServeAgent) gatherObservation() string {
 
 	// Recent memory activity
 	if recent, err := runQuietCommand(sa.root, "./scripts/cog", "memory", "search", "--recent", "1h"); err == nil && recent != "" {
-		// Just note whether there was recent activity
 		lines := strings.Split(strings.TrimSpace(recent), "\n")
 		sb.WriteString(fmt.Sprintf("Memory: %d recent docs\n", len(lines)))
 	}
@@ -390,8 +433,10 @@ func (sa *ServeAgent) gatherObservation() string {
 	if coh, err := runQuietCommand(sa.root, "./scripts/cog", "coherence", "check"); err == nil {
 		if strings.Contains(coh, "coherent") {
 			sb.WriteString("Coherence: OK\n")
+			cachedCoherenceOK = true
 		} else {
 			sb.WriteString(fmt.Sprintf("Coherence: DRIFT — %s\n", strings.TrimSpace(coh)))
+			cachedCoherenceOK = false
 		}
 	}
 
@@ -404,6 +449,11 @@ func (sa *ServeAgent) gatherObservation() string {
 		sb.WriteString(fmt.Sprintf("Last cycle: %s ago\n", time.Since(sa.lastRun).Round(time.Second)))
 	}
 
+	// Inject system activity summary from bus registry
+	if activity := sa.gatherActivitySummary(); activity != "" {
+		sb.WriteString(activity)
+	}
+
 	// Inject rolling compressed memory from previous cycles (the hypercycle wire)
 	if sa.cycleMemory != nil {
 		if mem := sa.cycleMemory.formatForObservation(); mem != "" {
@@ -414,11 +464,220 @@ func (sa *ServeAgent) gatherObservation() string {
 	// Inject pending proposals so the agent sees what it's already proposed
 	if proposals := sa.gatherPendingProposals(); proposals != "" {
 		sb.WriteString(proposals)
+		// Count proposals for cache
+		cachedProposalCount = strings.Count(proposals, "[")
 	}
+
+	// Update observation cache for the cheap checks gate
+	sa.updateObservationCache(cachedGitCount, cachedCoherenceOK, cachedProposalCount)
 
 	obs := sb.String()
 	sa.lastObservation = obs // cache for decomposition context
 	return obs
+}
+
+// gatherActivitySummary reads the bus registry and computes an activity summary.
+// Cost: ~1-2ms (single file read of registry.json).
+func (sa *ServeAgent) gatherActivitySummary() string {
+	if sa.bus == nil {
+		return ""
+	}
+
+	registry := sa.bus.loadRegistry()
+	if len(registry) == 0 {
+		return ""
+	}
+
+	now := time.Now()
+	var (
+		claudeCodeActive   int
+		claudeCodeEvents   int64
+		chatActive         int
+		mcpActive          int
+		voiceActive        int
+		totalDelta         int64
+		hottestBus         string
+		hottestDelta       int64
+		latestEventTime    time.Time
+		newSnapshot        = make(map[string]int64, len(registry))
+	)
+
+	for _, entry := range registry {
+		seq := int64(entry.LastEventSeq)
+		newSnapshot[entry.BusID] = seq
+
+		// Compute delta from last cycle
+		prevSeq, hasPrev := sa.lastRegistrySnapshot[entry.BusID]
+		delta := int64(0)
+		if hasPrev {
+			delta = seq - prevSeq
+		}
+
+		if delta > 0 {
+			totalDelta += delta
+			if delta > hottestDelta {
+				hottestDelta = delta
+				hottestBus = entry.BusID
+			}
+		}
+
+		// Parse last event time for recency
+		if entry.LastEventAt != "" {
+			if t, err := time.Parse(time.RFC3339Nano, entry.LastEventAt); err == nil {
+				if t.After(latestEventTime) {
+					latestEventTime = t
+				}
+			}
+		}
+
+		// Classify by prefix
+		bid := entry.BusID
+		switch {
+		case strings.HasPrefix(bid, "claude-code-"):
+			if delta > 0 || (entry.State == "active" && entry.LastEventAt != "") {
+				claudeCodeActive++
+				claudeCodeEvents += delta
+			}
+		case strings.HasPrefix(bid, "bus_chat_"):
+			if delta > 0 {
+				chatActive++
+			}
+		case strings.HasPrefix(bid, "bus_mcp_"):
+			if delta > 0 {
+				mcpActive++
+			}
+		case strings.Contains(bid, "voice"):
+			if delta > 0 {
+				voiceActive++
+			}
+		}
+	}
+
+	// Update snapshot for next cycle's delta
+	sa.lastRegistrySnapshot = newSnapshot
+
+	// Build summary
+	var sb strings.Builder
+	sb.WriteString("\n=== System Activity (since last cycle) ===\n")
+
+	// User presence
+	if !latestEventTime.IsZero() {
+		ago := now.Sub(latestEventTime).Round(time.Second)
+		if ago < 5*time.Minute {
+			sb.WriteString(fmt.Sprintf("User presence: active (last event %s ago)\n", ago))
+		} else if ago < time.Hour {
+			sb.WriteString(fmt.Sprintf("User presence: recent (last event %s ago)\n", formatAgo(ago)))
+		} else {
+			sb.WriteString(fmt.Sprintf("User presence: idle (last event %s ago)\n", formatAgo(ago)))
+		}
+	} else {
+		sb.WriteString("User presence: unknown\n")
+	}
+
+	// Session counts
+	if claudeCodeActive > 0 {
+		sb.WriteString(fmt.Sprintf("Claude Code sessions: %d active (%d new events)\n", claudeCodeActive, claudeCodeEvents))
+	} else {
+		sb.WriteString("Claude Code sessions: 0 active\n")
+	}
+
+	if chatActive > 0 {
+		sb.WriteString(fmt.Sprintf("Chat buses: %d with activity\n", chatActive))
+	}
+	if mcpActive > 0 {
+		sb.WriteString(fmt.Sprintf("MCP sessions: %d active\n", mcpActive))
+	}
+	if voiceActive > 0 {
+		sb.WriteString(fmt.Sprintf("Voice sessions: %d active\n", voiceActive))
+	}
+
+	// Overall activity
+	sb.WriteString(fmt.Sprintf("Total event delta: %d events since last cycle\n", totalDelta))
+	if hottestBus != "" && hottestDelta > 0 {
+		// Truncate long bus IDs for readability
+		displayBus := hottestBus
+		if len(displayBus) > 40 {
+			displayBus = displayBus[:37] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("Hottest bus: %s (%d events)\n", displayBus, hottestDelta))
+	}
+
+	return sb.String()
+}
+
+// shouldSkipModel returns true if nothing has changed since the last cycle,
+// meaning we can skip the expensive E4B call and just sleep.
+// This is the "cheap checks first" gate from the OpenClaw community pattern.
+func (sa *ServeAgent) shouldSkipModel() (skip bool, reason string) {
+	// Never skip the first few cycles — let the model establish a baseline
+	sa.mu.RLock()
+	cycles := sa.cycleCount
+	sa.mu.RUnlock()
+	if cycles < 3 {
+		return false, ""
+	}
+
+	// Check 1: Rolling memory — was last action already "sleep"?
+	lastEntries := sa.cycleMemory.recent(1)
+	if len(lastEntries) == 0 || lastEntries[0].Action != "sleep" {
+		return false, ""
+	}
+
+	// Check 2: Git status changed?
+	gitCount := 0
+	if status, err := runQuietCommand(sa.root, "git", "status", "--porcelain"); err == nil {
+		lines := strings.Split(strings.TrimSpace(status), "\n")
+		if len(lines) > 0 && lines[0] != "" {
+			gitCount = len(lines)
+		}
+	}
+	if gitCount != sa.lastGitFileCount {
+		return false, "git status changed"
+	}
+
+	// Check 3: Bus events since last cycle?
+	if sa.bus != nil {
+		registry := sa.bus.loadRegistry()
+		for _, entry := range registry {
+			prevSeq, hasPrev := sa.lastRegistrySnapshot[entry.BusID]
+			if hasPrev && int64(entry.LastEventSeq) > prevSeq {
+				// Ignore our own agent harness bus — our own events shouldn't wake us
+				if entry.BusID == agentBusID {
+					continue
+				}
+				return false, fmt.Sprintf("bus activity: %s", entry.BusID)
+			}
+		}
+	}
+
+	// Check 4: Coherence drift?
+	if !sa.lastCoherenceOK {
+		return false, "coherence drift"
+	}
+
+	// Check 5: New proposals to review?
+	proposalDir := filepath.Join(sa.root, proposalsDir)
+	if entries, err := os.ReadDir(proposalDir); err == nil {
+		count := 0
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".md") {
+				count++
+			}
+		}
+		if count != sa.lastProposalCount {
+			return false, "proposal count changed"
+		}
+	}
+
+	// All checks passed — nothing changed
+	return true, "no changes since last cycle"
+}
+
+// updateObservationCache stores current state for the next cycle's delta checks.
+func (sa *ServeAgent) updateObservationCache(gitCount int, coherenceOK bool, proposalCount int) {
+	sa.lastGitFileCount = gitCount
+	sa.lastCoherenceOK = coherenceOK
+	sa.lastProposalCount = proposalCount
 }
 
 // emitEvent sends an event to the CogBus (best-effort).
