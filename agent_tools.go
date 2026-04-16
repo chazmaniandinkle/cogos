@@ -176,7 +176,21 @@ func coherenceCheckDef() ToolDefinition {
 
 func newCoherenceCheckFunc(root string) ToolFunc {
 	return func(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
-		return runCogCommand(ctx, root, "coherence", "check")
+		result, err := runCogCommand(ctx, root, "coherence", "check")
+		if err != nil {
+			return result, err
+		}
+		// Truncate very large drift reports to prevent context window explosion.
+		// Full coherence output can be 600KB+ when many files are in drift.
+		const maxBytes = 4096
+		if len(result) > maxBytes {
+			truncated := string(result[:maxBytes])
+			return json.Marshal(map[string]string{
+				"output":    truncated,
+				"truncated": fmt.Sprintf("Output truncated from %d to %d bytes. Run `cog coherence check` for full report.", len(result), maxBytes),
+			})
+		}
+		return result, nil
 	}
 }
 

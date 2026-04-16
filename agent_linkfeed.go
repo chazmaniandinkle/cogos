@@ -88,6 +88,80 @@ type discordMessage struct {
 func RegisterLinkFeedTools(h *AgentHarness, workspaceRoot string) {
 	h.RegisterTool(pullLinkFeedDef(), newPullLinkFeedFunc(workspaceRoot))
 	h.RegisterTool(enrichLinkDef(), newEnrichLinkFunc(h, workspaceRoot))
+	h.RegisterTool(listInboxDef(), newListInboxFunc(workspaceRoot))
+}
+
+// --- list_inbox tool ---
+
+func listInboxDef() ToolDefinition {
+	return ToolDefinition{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "list_inbox",
+			Description: "List raw (unenriched) inbox files. Returns filenames you can pass to enrich_link. Use this to find items to enrich.",
+			Parameters: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"limit": {"type": "integer", "description": "Max files to return (default 10)"}
+				},
+				"required": []
+			}`),
+		},
+	}
+}
+
+func newListInboxFunc(root string) ToolFunc {
+	return func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+		var p struct {
+			Limit int `json:"limit"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			p.Limit = 10
+		}
+		if p.Limit <= 0 {
+			p.Limit = 10
+		}
+		if p.Limit > 50 {
+			p.Limit = 50
+		}
+
+		// Read inbox directory directly for the requested limit
+		dir := filepath.Join(root, inboxLinksRelPath)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return json.Marshal(map[string]string{"error": "cannot read inbox: " + err.Error()})
+		}
+
+		var rawFiles []string
+		var rawCount, enrichedCount int
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".cog.md") {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			status := extractFMField(string(data), "status")
+			switch status {
+			case "enriched":
+				enrichedCount++
+			case "raw", "":
+				rawCount++
+				if len(rawFiles) < p.Limit {
+					rawFiles = append(rawFiles, e.Name())
+				}
+			}
+		}
+
+		return json.Marshal(map[string]interface{}{
+			"raw_count":      rawCount,
+			"enriched_count": enrichedCount,
+			"files":          rawFiles,
+			"showing":        len(rawFiles),
+		})
+	}
 }
 
 // --- pull_link_feed tool ---

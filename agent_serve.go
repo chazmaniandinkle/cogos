@@ -34,8 +34,8 @@ import (
 )
 
 const (
-	agentIntervalMin     = 10 * time.Minute // start moderate; events wake us sooner
-	agentIntervalMax     = 60 * time.Minute // relax to this after consecutive sleeps
+	agentIntervalMin     = 3 * time.Minute  // fast cycles now that num_ctx=8192 makes assess ~7s
+	agentIntervalMax     = 30 * time.Minute // relax to this after consecutive sleeps
 	agentBusID           = "bus_agent_harness"
 )
 
@@ -482,21 +482,47 @@ func (sa *ServeAgent) runLoop(ctx context.Context) {
 	defer sa.wg.Done()
 
 	consecutiveSleeps := 0
+	var action string
 
 	// Run initial cycle after a short delay (let the kernel fully initialize)
 	select {
 	case <-time.After(60 * time.Second):
-		action := sa.safeCycle(ctx)
+		action = sa.safeCycle(ctx)
 		consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
 	case <-sa.wakeCh:
 		log.Printf("[agent] woke by event (during init delay)")
-		action := sa.safeCycle(ctx)
+		action = sa.safeCycle(ctx)
 		consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
 	case <-sa.stopCh:
 		return
 	}
 
 	for {
+		// Self-chaining: if last cycle was "execute" and inbox still has work,
+		// skip the sleep and immediately re-cycle. Cap at 5 consecutive chains
+		// to prevent runaway loops.
+		chainCount := 0
+		const maxChains = 5
+		for action != "sleep" && action != "error" && action != "skip" && chainCount < maxChains {
+			inbox := scanInbox(sa.root)
+			if inbox.RawCount == 0 {
+				break
+			}
+			chainCount++
+			log.Printf("[agent] self-chain %d/%d: %d raw inbox items remaining, continuing immediately", chainCount, maxChains, inbox.RawCount)
+			// Brief pause to let GPU cool and prevent tight-looping
+			select {
+			case <-time.After(10 * time.Second):
+			case <-sa.stopCh:
+				return
+			}
+			action = sa.safeCycle(ctx)
+			consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
+		}
+		if chainCount > 0 {
+			log.Printf("[agent] self-chain complete: %d cycles chained", chainCount)
+		}
+
 		// Adaptive interval: double on each consecutive sleep, cap at max
 		interval := sa.interval
 		for i := 0; i < consecutiveSleeps && interval < agentIntervalMax; i++ {
@@ -510,11 +536,11 @@ func (sa *ServeAgent) runLoop(ctx context.Context) {
 
 		select {
 		case <-time.After(interval):
-			action := sa.safeCycle(ctx)
+			action = sa.safeCycle(ctx)
 			consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
 		case <-sa.wakeCh:
 			log.Printf("[agent] woke by event")
-			action := sa.safeCycle(ctx)
+			action = sa.safeCycle(ctx)
 			consecutiveSleeps = sa.updateSleepCount(action, consecutiveSleeps)
 		case <-sa.stopCh:
 			return
@@ -593,22 +619,24 @@ func (sa *ServeAgent) runCycle(ctx context.Context) string {
 
 Respond ONLY with a JSON object. No markdown, no explanation, no thinking.
 
-{"action": "<sleep|observe|propose|escalate>", "reason": "<brief reason>", "urgency": <0.0-1.0>, "target": "<URI or path or empty>"}
+{"action": "<sleep|observe|propose|execute|escalate>", "reason": "<brief reason>", "urgency": <0.0-1.0>, "target": "<URI or path or empty>"}
 
 Actions:
 - sleep: nothing needs attention, rest until next cycle
 - observe: gather more info using tools (memory_search, memory_read, workspace_status, coherence_check)
-- propose: write a proposal using the propose tool — this is your primary way of acting. Proposals are safe, lightweight, and never disrupt the user. Use them freely.
+- propose: write a proposal using the propose tool — for suggesting new plans or changes
+- execute: do approved work using your tools — enrich links, pull link feed, process inbox items. Choose this when you have an approved plan or known tasks to complete.
 - escalate: something needs human or cloud-model attention
 
 You are an observer and advisor. Your proposals are staged in a directory — they do not modify anything. The user reviews them at their convenience. You cannot interrupt anyone. Act confidently.
 
 Rules:
-- You may ONLY return one of these actions: sleep, observe, propose, escalate. No other values.
-- Look at your Recent Cycle Memory. If the last 3+ entries show the same action, you MUST pick a DIFFERENT one. For example: if you see observe,observe,observe then pick propose or sleep. If you see propose,propose,propose then pick sleep or observe.
-- If you have already read the pending proposals (check your memory — did a recent cycle mention reading them?), do NOT read them again. Instead propose your response or sleep.
-- After reading a proposal's content, acknowledge it with the acknowledge_proposal tool so you don't re-process it on future cycles. This is how you close the loop on proposals.
-- When nothing needs attention, sleep. Sleeping is good — it saves compute and the adaptive interval will wake you when something changes.`, sa.root)
+- You may ONLY return one of these actions: sleep, observe, propose, execute, escalate. No other values.
+- PRIORITY: If the inbox has raw items (Raw items > 0), choose "execute" and process them with enrich_link. This is your primary job right now.
+- Only choose "propose" if you have a genuinely NEW idea. Do not re-propose plans about things you've already proposed.
+- Look at your Recent Cycle Memory. If the last 3+ entries show the same action, you MUST pick a DIFFERENT one.
+- After reading a proposal's content, acknowledge it with acknowledge_proposal so you don't re-process it.
+- When nothing needs attention, sleep. Sleeping is good.`, sa.root)
 
 	// Run assessment phase (JSON mode)
 	assessment, err := sa.harness.Assess(ctx, systemPrompt, observation)
@@ -625,20 +653,53 @@ Rules:
 				switch old {
 				case "observe":
 					if sa.lastProposalCount > 0 {
-						assessment.Action = "propose"
-						assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → propose (pending proposals exist)", old)
+						assessment.Action = "execute"
+						assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → execute (approved work exists)", old)
 					} else {
 						assessment.Action = "sleep"
 						assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → sleep", old)
 					}
 				case "propose":
-					assessment.Action = "sleep"
-					assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → sleep", old)
+					assessment.Action = "execute"
+					assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → execute (stop proposing, start doing)", old)
+				case "execute":
+					// Don't break execute chains if there's still inbox work
+					inbox := scanInbox(sa.root)
+					if inbox.RawCount > 0 {
+						// Let it keep executing — the self-chain will handle it
+						log.Printf("[agent] cycle %d: hard loop break suppressed: execute×3 but %d raw inbox items remain", cycle, inbox.RawCount)
+					} else {
+						assessment.Action = "sleep"
+						assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → sleep (rest after work)", old)
+					}
 				default:
 					assessment.Action = "sleep"
 					assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → sleep", old)
 				}
 				log.Printf("[agent] cycle %d: hard loop break: %s → %s", cycle, old, assessment.Action)
+			}
+		}
+	}
+
+	// Work nudge (runs LAST — overrides both LLM choice and hard loop breaker):
+	// If the inbox has raw items and no recent execute, force execute.
+	// This is the highest priority override because real work exists.
+	if err == nil && sa.cycleMemory != nil && assessment.Action != "execute" {
+		inbox := scanInbox(sa.root)
+		if inbox.RawCount > 0 {
+			recent := sa.cycleMemory.recent(2)
+			noRecentExecute := true
+			for _, r := range recent {
+				if r.Action == "execute" {
+					noRecentExecute = false
+					break
+				}
+			}
+			if noRecentExecute && len(recent) >= 2 {
+				old := assessment.Action
+				assessment.Action = "execute"
+				assessment.Reason = fmt.Sprintf("Work nudge: %d raw inbox items waiting, overriding %s → execute", inbox.RawCount, old)
+				log.Printf("[agent] cycle %d: work nudge: %s → execute (%d raw inbox items)", cycle, old, inbox.RawCount)
 			}
 		}
 	}
@@ -655,6 +716,8 @@ Now execute this using your tools. You may call MULTIPLE tools in sequence:
 - Call propose to write new proposals in response to what you read
 - Call memory_search to find docs, then call memory_read to read them
 - Call coherence_check, then propose a fix if needed
+- Call list_inbox to see raw inbox filenames, then call enrich_link with each filename to process them
+- Call pull_link_feed to pull new links from Discord
 
 Do not just describe what you would do — actually call the tools. When you are finished acting, respond with a brief summary of what you did.`, sa.root, assessment.Action, assessment.Reason, assessment.Target)
 
@@ -755,13 +818,15 @@ func (sa *ServeAgent) gatherObservation() string {
 		sb.WriteString(fmt.Sprintf("Memory: %d recent docs\n", len(lines)))
 	}
 
-	// Coherence check
+	// Coherence check (truncate output — full drift reports can be 600KB+)
 	if coh, err := runQuietCommand(sa.root, "./scripts/cog", "coherence", "check"); err == nil {
 		if strings.Contains(coh, "coherent") {
 			sb.WriteString("Coherence: OK\n")
 			cachedCoherenceOK = true
 		} else {
-			sb.WriteString(fmt.Sprintf("Coherence: DRIFT — %s\n", strings.TrimSpace(coh)))
+			// Just note the drift; don't dump the full report into observation
+			lines := strings.Split(strings.TrimSpace(coh), "\n")
+			sb.WriteString(fmt.Sprintf("Coherence: DRIFT detected (%d lines in report). Use coherence_check tool for details.\n", len(lines)))
 			cachedCoherenceOK = false
 		}
 	}

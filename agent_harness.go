@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -35,6 +36,7 @@ type agentChatRequest struct {
 	Stream   bool               `json:"stream"`
 	Think    bool               `json:"think"`              // explicit thinking control
 	Format   string             `json:"format,omitempty"`   // "json" for structured output
+	Options  map[string]interface{} `json:"options,omitempty"` // Ollama model options (num_ctx, temperature, etc.)
 }
 
 // agentChatMessage is a single message in the conversation.
@@ -63,8 +65,16 @@ type agentChatResponse struct {
 		Content   string          `json:"content"`
 		ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
 	} `json:"message"`
-	Done       bool `json:"done"`
+	Done       bool   `json:"done"`
 	DoneReason string `json:"done_reason,omitempty"`
+
+	// Ollama performance metrics (nanoseconds)
+	TotalDuration    int64 `json:"total_duration,omitempty"`
+	LoadDuration     int64 `json:"load_duration,omitempty"`
+	PromptEvalCount  int   `json:"prompt_eval_count,omitempty"`
+	PromptEvalDuration int64 `json:"prompt_eval_duration,omitempty"`
+	EvalCount        int   `json:"eval_count,omitempty"`
+	EvalDuration     int64 `json:"eval_duration,omitempty"`
 }
 
 // --- Tool definition types ---
@@ -153,11 +163,21 @@ func (h *AgentHarness) Assess(ctx context.Context, systemPrompt, observation str
 		Stream:   false,
 		Think:    false, // disable thinking — we want clean JSON output
 		Format:   "json",
+		Options:  map[string]interface{}{"num_ctx": 8192}, // 8K context is plenty for assessment
 	}
 
 	resp, err := h.chatCompletion(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("assess: %w", err)
+	}
+
+	// Log Ollama performance metrics
+	if resp.PromptEvalCount > 0 {
+		promptTokS := float64(resp.PromptEvalCount) / (float64(resp.PromptEvalDuration) / 1e9)
+		evalTokS := float64(resp.EvalCount) / (float64(resp.EvalDuration) / 1e9)
+		totalS := float64(resp.TotalDuration) / 1e9
+		log.Printf("[agent] assess metrics: %d prompt tok (%.0f tok/s) + %d eval tok (%.0f tok/s) = %.1fs total",
+			resp.PromptEvalCount, promptTokS, resp.EvalCount, evalTokS, totalS)
 	}
 
 	content := resp.Message.Content
@@ -186,11 +206,19 @@ func (h *AgentHarness) Execute(ctx context.Context, systemPrompt, task string) (
 			Tools:    h.tools,
 			Stream:   false,
 			Think:    false, // disable thinking for tool loop
+			Options:  map[string]interface{}{"num_ctx": 8192}, // 8K context for tool loop
 		}
 
 		resp, err := h.chatCompletion(ctx, req)
 		if err != nil {
 			return "", fmt.Errorf("execute turn %d: %w", turn, err)
+		}
+
+		// Log per-turn metrics
+		if resp.PromptEvalCount > 0 {
+			totalS := float64(resp.TotalDuration) / 1e9
+			log.Printf("[agent] execute turn %d: %d prompt tok + %d eval tok = %.1fs",
+				turn, resp.PromptEvalCount, resp.EvalCount, totalS)
 		}
 
 		msg := resp.Message
