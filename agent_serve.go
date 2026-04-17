@@ -636,7 +636,9 @@ Rules:
 - Only choose "propose" if you have a genuinely NEW idea. Do not re-propose plans about things you've already proposed.
 - Look at your Recent Cycle Memory. If the last 3+ entries show the same action, you MUST pick a DIFFERENT one.
 - After reading a proposal's content, acknowledge it with acknowledge_proposal so you don't re-process it.
-- When nothing needs attention, sleep. Sleeping is good.`, sa.root)
+- When nothing needs attention, sleep. Sleeping is good.
+
+You also have a wait tool available in the execute phase. Use it when an observation warrants no proposal, no bus event, and no further investigation — nothing needs doing right now. Prefer wait over fabricating plans or rationalizing in prose. It ends the current cycle cleanly.`, sa.root)
 
 	// Run assessment phase (JSON mode)
 	assessment, err := sa.harness.Assess(ctx, systemPrompt, observation)
@@ -718,6 +720,7 @@ Now execute this using your tools. You may call MULTIPLE tools in sequence:
 - Call coherence_check, then propose a fix if needed
 - Call list_inbox to see raw inbox filenames, then call enrich_link with each filename to process them
 - Call pull_link_feed to pull new links from Discord
+- Call wait when nothing needs doing — no proposal, no bus event, no further investigation. Prefer wait over fabricating plans or rationalizing in prose. It ends the current cycle cleanly.
 
 Do not just describe what you would do — actually call the tools. When you are finished acting, respond with a brief summary of what you did.`, sa.root, assessment.Action, assessment.Reason, assessment.Target)
 

@@ -234,18 +234,33 @@ func (h *AgentHarness) Execute(ctx context.Context, systemPrompt, task string) (
 			ToolCalls: msg.ToolCalls,
 		})
 
-		// Dispatch each tool call and collect results.
+		// Dispatch each tool call and collect results. Track whether the
+		// sanctioned `wait` tool was invoked — if so, we terminate the loop
+		// after this turn's dispatch rather than asking the model for another
+		// round. This gives the model a clean "nothing to do" exit.
+		var waitInvoked bool
+		var waitReason string
 		for _, tc := range msg.ToolCalls {
 			result, err := h.dispatchTool(ctx, tc)
 			if err != nil {
 				// Tool errors go back to the model as content, not Go errors.
 				result = []byte(fmt.Sprintf(`{"error": %q}`, err.Error()))
 			}
+			if tc.Function.Name == waitToolName {
+				waitInvoked = true
+				if r := extractWaitReason(result); r != "" {
+					waitReason = r
+				}
+			}
 			messages = append(messages, agentChatMessage{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Content:    string(result),
 			})
+		}
+
+		if waitInvoked {
+			return fmt.Sprintf("waited: %s", waitReason), nil
 		}
 	}
 

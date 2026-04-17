@@ -24,6 +24,10 @@ func RegisterCoreTools(h *AgentHarness, workspaceRoot string) {
 	h.RegisterTool(coherenceCheckDef(), newCoherenceCheckFunc(workspaceRoot))
 	h.RegisterTool(workspaceStatusDef(), newWorkspaceStatusFunc(workspaceRoot))
 
+	// Sanctioned no-op — lets the agent exit the tool loop cleanly
+	// when nothing warrants action.
+	RegisterWaitTool(h, workspaceRoot)
+
 	// Propose-only write tools (no direct memory modification)
 	RegisterProposalTools(h, workspaceRoot)
 
