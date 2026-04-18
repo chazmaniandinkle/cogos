@@ -28,6 +28,12 @@ func RegisterCoreTools(h *AgentHarness, workspaceRoot string) {
 	// when nothing warrants action.
 	RegisterWaitTool(h, workspaceRoot)
 
+	// Dashboard response — lets the metabolic cycle's agent reply to
+	// user_message events observed via agent_bus_inlet.go. Safe to
+	// register unconditionally: the tool returns a non-fatal error at
+	// invocation time if the dashboard inlet hasn't been installed.
+	RegisterRespondTool(h)
+
 	// Propose-only write tools (no direct memory modification)
 	RegisterProposalTools(h, workspaceRoot)
 

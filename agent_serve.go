@@ -30,7 +30,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cogos-dev/cogos/internal/engine"
+	"github.com/cogos-dev/cogos/trace"
 	"github.com/fsnotify/fsnotify"
+	"github.com/google/uuid"
 )
 
 const (
@@ -585,33 +588,105 @@ func (sa *ServeAgent) runCycle(ctx context.Context) string {
 	cycle := sa.cycleCount
 	sa.mu.Unlock()
 
-	log.Printf("[agent] cycle %d: starting", cycle)
+	// Mint a fresh cycle-trace ID for this iteration so all downstream events
+	// (assessment + tool dispatches inside Execute) share the same cycle_id.
+	cycleID := uuid.NewString()
+	ctx = WithCycleID(ctx, cycleID)
 
-	// Cheap checks gate: skip model call if nothing changed
-	if skip, reason := sa.shouldSkipModel(); skip {
-		log.Printf("[agent] cycle %d: skipped (%s)", cycle, reason)
+	log.Printf("[agent] cycle %d: starting (trace=%s)", cycle, cycleID)
 
-		sa.mu.Lock()
-		sa.lastRun = time.Now()
-		sa.lastAction = "skip"
-		sa.lastUrgency = 0
-		sa.lastReason = reason
-		sa.lastDurMs = 0
-		sa.mu.Unlock()
-
-		sa.emitEvent("agent.skip", map[string]interface{}{
-			"cycle":  cycle,
-			"reason": reason,
-		})
-
-		// Skips don't write to rolling memory — only real assessments do.
-		// This prevents error/skip noise from diluting the compressed narrative.
-
-		return "sleep"
+	// Drain any pending dashboard user messages the bus inlet has queued.
+	// Greedy semantics (v1): drained messages are consumed by this cycle's
+	// observation even if the model ultimately doesn't call `respond`. That
+	// keeps the plumbing simple; missed replies are missed. Peek-and-ack can
+	// replace this later if that becomes a problem in practice.
+	pendingMsgs := drainPendingUserMessages()
+	if len(pendingMsgs) > 0 {
+		log.Printf("[agent] cycle %s: observing %d pending user message(s)", cycleID, len(pendingMsgs))
 	}
 
-	// Build observation from workspace state
-	observation := sa.gatherObservation()
+	// Cheap checks gate: skip model call if nothing changed. Pending user
+	// messages always bypass the gate — a user is waiting for a reply.
+	if len(pendingMsgs) == 0 {
+		if skip, reason := sa.shouldSkipModel(); skip {
+			log.Printf("[agent] cycle %d: skipped (%s)", cycle, reason)
+
+			sa.mu.Lock()
+			sa.lastRun = time.Now()
+			sa.lastAction = "skip"
+			sa.lastUrgency = 0
+			sa.lastReason = reason
+			sa.lastDurMs = 0
+			sa.mu.Unlock()
+
+			sa.emitEvent("agent.skip", map[string]interface{}{
+				"cycle":  cycle,
+				"reason": reason,
+			})
+
+			// Skips don't write to rolling memory — only real assessments do.
+			// This prevents error/skip noise from diluting the compressed narrative.
+
+			return "sleep"
+		}
+	}
+
+	// Build the baseline prose observation (git/coherence/activity/etc).
+	// This is still used as the decomposition context (sa.lastObservation).
+	proseObservation := sa.gatherObservation()
+
+	// Fetch the foveated-context manifest via HTTP loopback. The anchor query
+	// is drawn from the first pending user message when present; otherwise
+	// a generic "current workspace state" prompt so the manifest still falls
+	// back to salience-only scoring and returns something useful.
+	//
+	// This is the substrate seam: the manifest already knows content hashes,
+	// tiers, and salience per source — we surface all of it as typed records
+	// so the Assess phase sees "what matters" as structured data rather than
+	// having to infer it from prose.
+	anchorPrompt := firstUserMessageText(pendingMsgs)
+	if anchorPrompt == "" {
+		anchorPrompt = "current workspace state"
+	}
+	manifest, mfErr := fetchFoveatedManifest(ctx, anchorPrompt)
+	if mfErr != nil {
+		// Non-fatal — the cycle still runs on the prose baseline + user msgs.
+		log.Printf("[agent] cycle %s: foveated manifest fetch failed: %v (falling back to prose-only observation)", cycleID, mfErr)
+	}
+
+	// Build typed observation records. Pending user messages carry salience
+	// 1.0 (always highest); foveated blocks inherit their max source salience;
+	// the prose baseline is elided from the JSON envelope and attached after
+	// it as a low-salience `workspace_summary` section so the model gets both
+	// the substrate signal (top) and the narrative context (bottom).
+	records := buildObservationRecords(
+		pendingMsgs,
+		manifest,
+		"",                      // gitSummary — already in prose baseline
+		"",                      // coherenceSummary — already in prose baseline
+		"",                      // busSummary — already in prose baseline
+	)
+
+	anchor := ""
+	goal := ""
+	if manifest != nil {
+		anchor = manifest.Anchor
+		goal = manifest.Goal
+	}
+	recordsJSON := renderObservationRecords(records, anchor, goal)
+
+	// Compose the final observation: typed records on top (substrate-grade
+	// signal, JSON), prose baseline below (legacy narrative). The JSON header
+	// is labeled so the model can anchor on it; deletion of the old
+	// `=== PRIORITY` prepend is intentional — salience is now carried by
+	// record.salience, not by English.
+	var obsBuf strings.Builder
+	obsBuf.WriteString("=== Observation Records (typed, salience-ordered) ===\n")
+	obsBuf.WriteString(recordsJSON)
+	obsBuf.WriteString("\n\n")
+	obsBuf.WriteString("=== Workspace Summary (prose, low-salience) ===\n")
+	obsBuf.WriteString(proseObservation)
+	observation := obsBuf.String()
 
 	// System prompt: concise, no thinking tags (Gemma E4B doesn't need them).
 	// JSON mode is enforced by the harness via response_format.
@@ -706,6 +781,27 @@ You also have a wait tool available in the execute phase. Use it when an observa
 		}
 	}
 
+	// Emit a cycle.assessment trace event as soon as the (possibly overridden)
+	// assessment is final. Mapping note: Assessment.Urgency → CycleEvent
+	// Confidence, Assessment.Reason → CycleEvent Rationale. Best-effort.
+	if err == nil && assessment != nil {
+		if ev, bErr := trace.NewAssessment(
+			engine.TraceIdentity(),
+			cycleID,
+			assessment.Action,
+			assessment.Urgency,
+			assessment.Reason,
+		); bErr == nil {
+			emitCycleEvent(ev)
+		}
+	}
+
+	// Snapshot the respond-tool invocation count before entering Execute so
+	// the auto-fallback publisher below can tell whether the model already
+	// called respond this turn. If it did, we must NOT also publish
+	// executeResult — that would double-reply on the dashboard bus.
+	respondSnap := respondInvokeSnapshot()
+
 	var executeResult string
 	if err == nil && assessment.Action != "sleep" {
 		// Execute phase gets a different prompt that encourages tool chaining
@@ -757,6 +853,33 @@ Do not just describe what you would do — actually call the tools. When you are
 
 	if executeResult != "" {
 		log.Printf("[agent] cycle %d: execute result: %s", cycle, agentTruncate(executeResult, 500))
+	}
+
+	// Dashboard-chat fallback: if this cycle drained pending user messages
+	// but the model narrated a reply in prose instead of invoking the
+	// `respond` tool, auto-publish the execute result onto
+	// bus_dashboard_response so the user still sees an answer. This makes
+	// the loop robust to Gemma E4B's tool-calling flakiness. Publishing is
+	// best-effort and non-blocking.
+	//
+	// Respond-dedup: skip the fallback if the respond tool already landed
+	// this turn (snapshot delta > 0). Otherwise the dashboard sees two
+	// replies — the structured one from respond, and a prose echo from the
+	// Execute-phase final content. The snapshot check is the authoritative
+	// signal because the respond tool bumps atomically on successful publish.
+	if len(pendingMsgs) > 0 && executeResult != "" && !respondInvokedSince(respondSnap) {
+		pubText := strings.TrimSpace(executeResult)
+		if pubText != "" {
+			go func(text string) {
+				if _, err := publishDashboardResponse(text, "auto-fallback: model did not invoke respond tool"); err != nil {
+					log.Printf("[dashboard-inlet] auto-fallback publish failed: %v", err)
+				} else {
+					log.Printf("[dashboard-inlet] auto-fallback published agent response (%d chars) on bus_dashboard_response", len(text))
+				}
+			}(pubText)
+		}
+	} else if len(pendingMsgs) > 0 && respondInvokedSince(respondSnap) {
+		log.Printf("[dashboard-inlet] auto-fallback suppressed: respond tool already published this turn")
 	}
 
 	sa.emitEvent("agent.cycle", map[string]interface{}{

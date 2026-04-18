@@ -28,8 +28,31 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cogos-dev/cogos/trace"
 	"github.com/google/uuid"
 )
+
+// TraceEmitter is the bus-publish hook for cycle-trace events. The main
+// package sets this at startup; engine calls it best-effort (never blocks
+// the metabolic cycle on a nil hook or a slow consumer).
+var TraceEmitter func(ev trace.CycleEvent)
+
+// TraceIdentity returns the identity name stamped as the `source` field on
+// emitted events. Set by the main package at startup; defaults to "cog".
+var TraceIdentity = func() string { return "cog" }
+
+// emitTrace is a best-effort wrapper around TraceEmitter that swallows
+// construction errors and never blocks the cycle.
+func emitTrace(ev trace.CycleEvent, err error) {
+	if err != nil {
+		slog.Debug("process: trace event build failed", "err", err)
+		return
+	}
+	if TraceEmitter == nil {
+		return
+	}
+	TraceEmitter(ev)
+}
 
 // ProcessState represents the four operational states of the v3 process.
 type ProcessState int
@@ -129,6 +152,16 @@ type Process struct {
 	// lastIndexHEAD tracks the HEAD hash at last index rebuild, so we skip
 	// rebuilding when nothing has changed.
 	lastIndexHEAD string
+
+	// currentCycleID correlates all cycle-trace events emitted during one
+	// iteration of the metabolic cycle (external event handling or a
+	// consolidation tick). Set fresh at the start of each iteration;
+	// protected by mu.
+	currentCycleID string
+
+	// hookRegistry holds ADR-072 state-transition hooks loaded from
+	// .cog/hooks/transitions/*.yaml. May be nil if the directory is missing.
+	hookRegistry *stateHookRegistry
 }
 
 // NewProcess constructs and initialises the process.
@@ -157,7 +190,16 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 		lastMaintenanceTick: now,
 		nodeHealth:          NewNodeHealth(),
 		nodeManifest:        loadManifestQuiet(cfg),
+		hookRegistry:        loadStateHookRegistry(workspaceRootFromCfg(cfg)),
 	}
+}
+
+// workspaceRootFromCfg returns the workspace root from the config, or "" if nil.
+func workspaceRootFromCfg(cfg *Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.WorkspaceRoot
 }
 
 // loadManifestQuiet loads the node manifest, returning nil if not found.
@@ -261,6 +303,23 @@ func (p *Process) SetTRM(trm *MambaTRM, idx *EmbeddingIndex) {
 // Send delivers an external event to the process loop (non-blocking).
 // Returns false if the channel is full.
 func (p *Process) Send(evt *GateEvent) bool {
+	select {
+	case p.externalCh <- evt:
+		return true
+	default:
+		return false
+	}
+}
+
+// SubmitExternal is the canonical entry point for external perturbations
+// (dashboard chat, modality inlets, etc.) into the metabolic cycle. It is a
+// non-blocking alias of Send(): the external channel has bounded capacity and
+// the cycle must never stall on a slow or noisy producer. Callers that need
+// backpressure should observe the returned bool and drop/log accordingly.
+func (p *Process) SubmitExternal(evt *GateEvent) bool {
+	if p == nil || evt == nil {
+		return false
+	}
 	select {
 	case p.externalCh <- evt:
 		return true
@@ -414,8 +473,9 @@ func (p *Process) handleTailerBlock(block CogBlock) {
 
 // handleExternal processes an external perturbation.
 func (p *Process) handleExternal(evt *GateEvent) {
+	p.beginCycle()
 	result := p.gate.Process(evt)
-	p.transition(result.StateTransition)
+	p.transitionWithReason(result.StateTransition, fmt.Sprintf("external:%s", evt.Type))
 	slog.Debug("process: external event",
 		"type", evt.Type,
 		"state", p.State(),
@@ -430,7 +490,8 @@ func (p *Process) handleExternal(evt *GateEvent) {
 //	Loop 2: the TrajectoryModel is updated (prediction + error computation)
 //	Loop 3: the model acts on the field (pre-warm, attenuate, coherence signal)
 func (p *Process) runConsolidation() {
-	p.transition(StateConsolidating)
+	p.beginCycle()
+	p.transitionWithReason(StateConsolidating, "consolidation.tick")
 
 	// Record the current tick window before updating the maintenance watermark.
 	now := time.Now()
@@ -534,7 +595,7 @@ func (p *Process) runConsolidation() {
 		"surprise":              surprise,
 	})
 
-	p.transition(StateReceptive)
+	p.transitionWithReason(StateReceptive, "consolidation.complete")
 }
 
 // NodeHealth returns the current node health state (for use by the serve layer).
@@ -572,7 +633,8 @@ func (p *Process) emitHeartbeat() {
 	p.TrustState.CoherenceFingerprint = coherenceHash
 	p.mu.Unlock()
 
-	p.transition(StateDormant)
+	p.beginCycle()
+	p.transitionWithReason(StateDormant, "heartbeat")
 	state := p.State().String()
 	fieldSize := p.field.Len()
 	fingerprint := p.Fingerprint()
@@ -663,13 +725,51 @@ func (p *Process) emitHeartbeat() {
 
 // transition moves the process to a new state (with logging).
 func (p *Process) transition(next ProcessState) {
+	p.transitionWithReason(next, "")
+}
+
+// transitionWithReason is transition() with a human-readable reason string
+// that is attached to the emitted cycle-trace event. Best-effort emission:
+// a nil TraceEmitter or a build error never blocks the cycle.
+func (p *Process) transitionWithReason(next ProcessState, reason string) {
 	p.mu.Lock()
 	prev := p.state
 	p.state = next
+	cycleID := p.currentCycleID
 	p.mu.Unlock()
-	if prev != next {
-		slog.Debug("process: state transition", "from", prev, "to", next)
+	if prev == next {
+		return
 	}
+	slog.Debug("process: state transition", "from", prev, "to", next, "reason", reason)
+	if cycleID == "" {
+		// Fall back to a one-shot ID so events remain correlatable at least
+		// within this single transition; real iterations mint their own.
+		cycleID = uuid.NewString()
+	}
+	emitTrace(trace.NewStateTransition(TraceIdentity(), cycleID, prev, next, reason))
+	// ADR-072: dispatch per-state enter handlers + declarative StateHooks on a
+	// goroutine so transition() never blocks the caller (may hold p.mu upstream).
+	go p.dispatchEnterHandler(prev, next)
+}
+
+// beginCycle mints a new cycle ID for the start of a metabolic-cycle
+// iteration (consolidation tick or external event). All trace events emitted
+// during the iteration share this ID. Returns the new ID.
+func (p *Process) beginCycle() string {
+	id := uuid.NewString()
+	p.mu.Lock()
+	p.currentCycleID = id
+	p.mu.Unlock()
+	return id
+}
+
+// CurrentCycleID returns the current iteration's cycle ID (may be empty
+// between iterations). Exported so the agent harness and tool dispatch paths
+// can correlate their own trace events with the running kernel cycle.
+func (p *Process) CurrentCycleID() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.currentCycleID
 }
 
 // emitEvent records a ledger event for the process session.

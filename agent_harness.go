@@ -18,7 +18,31 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/cogos-dev/cogos/internal/engine"
+	"github.com/cogos-dev/cogos/trace"
 )
+
+// cycleIDFromContext extracts a cycle-trace correlation ID from ctx, or
+// returns "" if none. See trace_emit.go for the key type.
+func cycleIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(cycleIDKey{}).(string)
+	return v
+}
+
+// WithCycleID returns ctx carrying the given cycle-trace ID. Callers (e.g.
+// ServeAgent.runCycle) should wrap ctx with this before invoking Assess /
+// Execute so tool-dispatch emission can correlate events across the
+// iteration.
+func WithCycleID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, cycleIDKey{}, id)
+}
 
 // --- Wire protocol types (Ollama native /api/chat) ---
 //
@@ -241,7 +265,24 @@ func (h *AgentHarness) Execute(ctx context.Context, systemPrompt, task string) (
 		var waitInvoked bool
 		var waitReason string
 		for _, tc := range msg.ToolCalls {
+			// Dispatch with timing so we can emit a cycle.tool_dispatch trace
+			// event. Emission is best-effort and never blocks the tool loop.
+			toolStart := time.Now()
 			result, err := h.dispatchTool(ctx, tc)
+			toolDuration := time.Since(toolStart)
+			if cycleID := cycleIDFromContext(ctx); cycleID != "" {
+				ev, bErr := trace.NewToolDispatch(
+					engine.TraceIdentity(),
+					cycleID,
+					tc.Function.Name,
+					tc.Function.Arguments,
+					toolDuration,
+					err,
+				)
+				if bErr == nil {
+					emitCycleEvent(ev)
+				}
+			}
 			if err != nil {
 				// Tool errors go back to the model as content, not Go errors.
 				result = []byte(fmt.Sprintf(`{"error": %q}`, err.Error()))
