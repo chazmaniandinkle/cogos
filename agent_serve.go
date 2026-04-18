@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/cogos-dev/cogos/internal/engine"
+	"github.com/cogos-dev/cogos/internal/linkfeed"
 	"github.com/cogos-dev/cogos/trace"
 	"github.com/fsnotify/fsnotify"
 	"github.com/google/uuid"
@@ -61,7 +62,7 @@ type AgentStatusResponse struct {
 	Activity  *AgentActivitySummary  `json:"activity,omitempty"`
 	Memory    []AgentMemoryEntry     `json:"memory,omitempty"`
 	Proposals []AgentProposalEntry   `json:"proposals,omitempty"`
-	Inbox     *AgentInboxSummary     `json:"inbox,omitempty"`
+	Inbox     *linkfeed.AgentInboxSummary `json:"inbox,omitempty"`
 }
 
 // AgentActivitySummary is the system activity snapshot from the bus registry.
@@ -156,7 +157,7 @@ func (sa *ServeAgent) Status() AgentStatusResponse {
 	resp.Activity = sa.getActivityForAPI()
 	resp.Memory = sa.getMemoryForAPI()
 	resp.Proposals = sa.getProposalsForAPI()
-	resp.Inbox = buildInboxSummaryForAPI(sa.root)
+	resp.Inbox = linkfeed.BuildInboxSummaryForAPI(sa.root)
 	sa.mu.RLock() // re-acquire for deferred unlock
 
 	return resp
@@ -507,7 +508,7 @@ func (sa *ServeAgent) runLoop(ctx context.Context) {
 		chainCount := 0
 		const maxChains = 5
 		for action != "sleep" && action != "error" && action != "skip" && chainCount < maxChains {
-			inbox := scanInbox(sa.root)
+			inbox := linkfeed.ScanInbox(sa.root)
 			if inbox.RawCount == 0 {
 				break
 			}
@@ -741,7 +742,7 @@ You also have a wait tool available in the execute phase. Use it when an observa
 					assessment.Reason = fmt.Sprintf("Hard loop break: %s×3 → execute (stop proposing, start doing)", old)
 				case "execute":
 					// Don't break execute chains if there's still inbox work
-					inbox := scanInbox(sa.root)
+					inbox := linkfeed.ScanInbox(sa.root)
 					if inbox.RawCount > 0 {
 						// Let it keep executing — the self-chain will handle it
 						log.Printf("[agent] cycle %d: hard loop break suppressed: execute×3 but %d raw inbox items remain", cycle, inbox.RawCount)
@@ -762,7 +763,7 @@ You also have a wait tool available in the execute phase. Use it when an observa
 	// If the inbox has raw items and no recent execute, force execute.
 	// This is the highest priority override because real work exists.
 	if err == nil && sa.cycleMemory != nil && assessment.Action != "execute" {
-		inbox := scanInbox(sa.root)
+		inbox := linkfeed.ScanInbox(sa.root)
 		if inbox.RawCount > 0 {
 			recent := sa.cycleMemory.recent(2)
 			noRecentExecute := true
@@ -1276,22 +1277,22 @@ func (sa *ServeAgent) gatherPendingProposals() string {
 
 // gatherLinkFeedStatus returns the link feed timing status for observation injection.
 func (sa *ServeAgent) gatherLinkFeedStatus() string {
-	_, err := readDiscordAuth(sa.root)
+	_, err := linkfeed.ReadDiscordAuth(sa.root)
 	if err != nil {
 		return "\n=== Link Feed ===\nNot configured (missing auth)\n"
 	}
 
-	ago, err := linkFeedLastPull(sa.root)
+	ago, err := linkfeed.LinkFeedLastPull(sa.root)
 	if err != nil {
 		return "\n=== Link Feed ===\nLast pull: never\n"
 	}
 
 	var sb strings.Builder
 	sb.WriteString("\n=== Link Feed ===\n")
-	if ago > linkFeedCheckInterval {
+	if ago > linkfeed.LinkFeedCheckInterval {
 		sb.WriteString(fmt.Sprintf("Last pull: %s ago (overdue)\n", formatAgo(ago)))
 	} else {
-		remaining := linkFeedCheckInterval - ago
+		remaining := linkfeed.LinkFeedCheckInterval - ago
 		sb.WriteString(fmt.Sprintf("Last pull: %s ago (next in %s)\n", formatAgo(ago), formatAgo(remaining)))
 	}
 	return sb.String()
@@ -1299,7 +1300,7 @@ func (sa *ServeAgent) gatherLinkFeedStatus() string {
 
 // gatherInboxSummary returns the inbox status for observation injection.
 func (sa *ServeAgent) gatherInboxSummary() string {
-	inbox := scanInbox(sa.root)
+	inbox := linkfeed.ScanInbox(sa.root)
 	if inbox.TotalCount == 0 {
 		return ""
 	}
@@ -1319,7 +1320,7 @@ func (sa *ServeAgent) gatherInboxSummary() string {
 // watchInboxLinks uses fsnotify to watch the inbox/links/ directory and wake
 // the agent when new links arrive. Runs alongside watchProposals.
 func (sa *ServeAgent) watchInboxLinks() {
-	dir := filepath.Join(sa.root, inboxLinksRelPath)
+	dir := filepath.Join(sa.root, linkfeed.InboxLinksRelPath)
 	os.MkdirAll(dir, 0o755)
 
 	watcher, err := fsnotify.NewWatcher()

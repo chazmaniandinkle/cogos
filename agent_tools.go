@@ -13,7 +13,34 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/cogos-dev/cogos/internal/linkfeed"
 )
+
+// linkfeedHarnessAdapter adapts *AgentHarness to linkfeed.Harness.
+// The adapter flattens linkfeed's RegisterTool(name, description, params, fn)
+// surface into main's RegisterTool(ToolDefinition, ToolFunc) surface, so
+// linkfeed stays a leaf package that does not import main's types.
+type linkfeedHarnessAdapter struct{ h *AgentHarness }
+
+func (a linkfeedHarnessAdapter) RegisterTool(
+	name, description string,
+	parameters json.RawMessage,
+	fn func(ctx context.Context, args json.RawMessage) (json.RawMessage, error),
+) {
+	a.h.RegisterTool(ToolDefinition{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        name,
+			Description: description,
+			Parameters:  parameters,
+		},
+	}, ToolFunc(fn))
+}
+
+func (a linkfeedHarnessAdapter) GenerateJSON(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	return a.h.GenerateJSON(ctx, systemPrompt, userPrompt)
+}
 
 // RegisterCoreTools adds the standard kernel tools to the harness.
 // workspaceRoot is the absolute path to the .cog workspace.
@@ -41,7 +68,7 @@ func RegisterCoreTools(h *AgentHarness, workspaceRoot string) {
 	h.RegisterTool(busEmitDef(), newBusEmitFunc(workspaceRoot))
 
 	// Link feed tools (Discord pull + enrichment)
-	RegisterLinkFeedTools(h, workspaceRoot)
+	linkfeed.RegisterLinkFeedTools(linkfeedHarnessAdapter{h: h}, workspaceRoot)
 
 	// NOTE: memory_write is deliberately excluded.
 	// The agent proposes changes via the propose tool; a human or

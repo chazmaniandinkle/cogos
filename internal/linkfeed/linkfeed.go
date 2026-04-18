@@ -1,13 +1,18 @@
-// agent_linkfeed.go — Discord link feed ingestion + enrichment tools.
+// Package linkfeed implements Discord link-feed ingestion + enrichment.
 //
 // Layer 1: pullDiscordLinkFeed() — scheduled Discord pull with pagination,
 //   deduplication, and CogDoc creation.
 // Layer 2: enrichLink() — lightweight URL fetch + decomposition + cross-ref.
 //
-// Both are registered as agent tools (pull_link_feed, enrich_link) and
-// also called from the observation pipeline for inbox awareness.
-
-package main
+// Both are registered as agent tools (pull_link_feed, enrich_link) via
+// RegisterLinkFeedTools, and the helpers (ScanInbox, LinkFeedLastPull,
+// BuildInboxSummaryForAPI) are called directly from the observation
+// pipeline for inbox awareness.
+//
+// Extracted from apps/cogos/agent_linkfeed.go as wave 1a of ADR-085.
+// The file retains its original logic; only the package boundary and the
+// Harness interface (to decouple from *main.AgentHarness) are new.
+package linkfeed
 
 import (
 	"context"
@@ -18,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -27,20 +33,42 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// linkFeedChannelID is the Discord channel for #link-feed.
-const linkFeedChannelID = "1366246672275083375"
+// LinkFeedChannelID is the Discord channel for #link-feed.
+const LinkFeedChannelID = "1366246672275083375"
 
-// linkFeedCheckInterval is how often the agent should pull new links.
-const linkFeedCheckInterval = 2 * time.Hour
+// LinkFeedCheckInterval is how often the agent should pull new links.
+const LinkFeedCheckInterval = 2 * time.Hour
 
-// inboxLinksRelPath is the memory-relative path to the inbox.
-const inboxLinksRelPath = ".cog/mem/semantic/inbox/links"
+// InboxLinksRelPath is the memory-relative path to the inbox.
+const InboxLinksRelPath = ".cog/mem/semantic/inbox/links"
 
 // linkFeedStateRelPath is the state file for tracking last_message_id.
 const linkFeedStateRelPath = ".cog/mem/semantic/research/link-feed-state.json"
 
 // discordAuthRelPath is the Discord auth config.
 const discordAuthRelPath = ".cog/config/discord/auth.yaml"
+
+// --- Harness coupling ---
+
+// Harness is the minimal surface linkfeed needs from the agent harness.
+// The main package adapts its *AgentHarness to this interface. Using an
+// interface (rather than importing the concrete type) keeps linkfeed a
+// leaf package: main depends on linkfeed, not vice versa.
+//
+// RegisterTool takes flat arguments (not ToolDefinition/ToolFunc structs)
+// so main's adapter can translate into its own types without linkfeed
+// needing to agree on a shared struct layout.
+type Harness interface {
+	// RegisterTool registers a callable tool with the agent's tool loop.
+	RegisterTool(name, description string, parameters json.RawMessage,
+		fn func(ctx context.Context, args json.RawMessage) (json.RawMessage, error))
+	// GenerateJSON sends a prompt to the model in JSON mode and returns
+	// the raw JSON content.
+	GenerateJSON(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+}
+
+// toolFn is the signature for a registered tool function.
+type toolFn func(ctx context.Context, args json.RawMessage) (json.RawMessage, error)
 
 // --- Types ---
 
@@ -85,32 +113,49 @@ type discordMessage struct {
 // --- Tool Registration ---
 
 // RegisterLinkFeedTools adds link feed tools to the agent harness.
-func RegisterLinkFeedTools(h *AgentHarness, workspaceRoot string) {
-	h.RegisterTool(pullLinkFeedDef(), newPullLinkFeedFunc(workspaceRoot))
-	h.RegisterTool(enrichLinkDef(), newEnrichLinkFunc(h, workspaceRoot))
-	h.RegisterTool(listInboxDef(), newListInboxFunc(workspaceRoot))
+func RegisterLinkFeedTools(h Harness, workspaceRoot string) {
+	h.RegisterTool(
+		"pull_link_feed",
+		"Pull new links from the Discord #link-feed channel. Reads config from disk, fetches new messages since last pull, extracts URLs, deduplicates, and writes raw CogDocs to the inbox.",
+		json.RawMessage(`{
+			"type": "object",
+			"properties": {},
+			"required": []
+		}`),
+		newPullLinkFeedFunc(workspaceRoot),
+	)
+	h.RegisterTool(
+		"enrich_link",
+		"Enrich a raw link CogDoc in the inbox. Fetches URL content, extracts metadata, runs Tier 0+1 decomposition, searches for cross-references, and updates the CogDoc status to enriched.",
+		json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"filename": {
+					"type": "string",
+					"description": "Filename of the raw CogDoc in inbox/links/ to enrich"
+				}
+			},
+			"required": ["filename"]
+		}`),
+		newEnrichLinkFunc(h, workspaceRoot),
+	)
+	h.RegisterTool(
+		"list_inbox",
+		"List raw (unenriched) inbox files. Returns filenames you can pass to enrich_link. Use this to find items to enrich.",
+		json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"limit": {"type": "integer", "description": "Max files to return (default 10)"}
+			},
+			"required": []
+		}`),
+		newListInboxFunc(workspaceRoot),
+	)
 }
 
 // --- list_inbox tool ---
 
-func listInboxDef() ToolDefinition {
-	return ToolDefinition{
-		Type: "function",
-		Function: ToolFunction{
-			Name:        "list_inbox",
-			Description: "List raw (unenriched) inbox files. Returns filenames you can pass to enrich_link. Use this to find items to enrich.",
-			Parameters: json.RawMessage(`{
-				"type": "object",
-				"properties": {
-					"limit": {"type": "integer", "description": "Max files to return (default 10)"}
-				},
-				"required": []
-			}`),
-		},
-	}
-}
-
-func newListInboxFunc(root string) ToolFunc {
+func newListInboxFunc(root string) toolFn {
 	return func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 		var p struct {
 			Limit int `json:"limit"`
@@ -126,7 +171,7 @@ func newListInboxFunc(root string) ToolFunc {
 		}
 
 		// Read inbox directory directly for the requested limit
-		dir := filepath.Join(root, inboxLinksRelPath)
+		dir := filepath.Join(root, InboxLinksRelPath)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			return json.Marshal(map[string]string{"error": "cannot read inbox: " + err.Error()})
@@ -166,22 +211,7 @@ func newListInboxFunc(root string) ToolFunc {
 
 // --- pull_link_feed tool ---
 
-func pullLinkFeedDef() ToolDefinition {
-	return ToolDefinition{
-		Type: "function",
-		Function: ToolFunction{
-			Name:        "pull_link_feed",
-			Description: "Pull new links from the Discord #link-feed channel. Reads config from disk, fetches new messages since last pull, extracts URLs, deduplicates, and writes raw CogDocs to the inbox.",
-			Parameters: json.RawMessage(`{
-				"type": "object",
-				"properties": {},
-				"required": []
-			}`),
-		},
-	}
-}
-
-func newPullLinkFeedFunc(root string) ToolFunc {
+func newPullLinkFeedFunc(root string) toolFn {
 	return func(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
 		items, err := pullDiscordLinkFeed(ctx, root)
 		if err != nil {
@@ -198,27 +228,7 @@ func newPullLinkFeedFunc(root string) ToolFunc {
 
 // --- enrich_link tool ---
 
-func enrichLinkDef() ToolDefinition {
-	return ToolDefinition{
-		Type: "function",
-		Function: ToolFunction{
-			Name:        "enrich_link",
-			Description: "Enrich a raw link CogDoc in the inbox. Fetches URL content, extracts metadata, runs Tier 0+1 decomposition, searches for cross-references, and updates the CogDoc status to enriched.",
-			Parameters: json.RawMessage(`{
-				"type": "object",
-				"properties": {
-					"filename": {
-						"type": "string",
-						"description": "Filename of the raw CogDoc in inbox/links/ to enrich"
-					}
-				},
-				"required": ["filename"]
-			}`),
-		},
-	}
-}
-
-func newEnrichLinkFunc(h *AgentHarness, root string) ToolFunc {
+func newEnrichLinkFunc(h Harness, root string) toolFn {
 	return func(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 		var p struct {
 			Filename string `json:"filename"`
@@ -246,7 +256,7 @@ func newEnrichLinkFunc(h *AgentHarness, root string) ToolFunc {
 // deduplicates, and writes raw CogDocs. Returns the list of new items.
 func pullDiscordLinkFeed(ctx context.Context, root string) ([]LinkFeedItem, error) {
 	// 1. Read auth
-	auth, err := readDiscordAuth(root)
+	auth, err := ReadDiscordAuth(root)
 	if err != nil {
 		return nil, fmt.Errorf("discord auth: %w", err)
 	}
@@ -256,7 +266,7 @@ func pullDiscordLinkFeed(ctx context.Context, root string) ([]LinkFeedItem, erro
 	if err != nil {
 		// Fresh start — no state file yet
 		state = &linkFeedState{
-			ChannelID: linkFeedChannelID,
+			ChannelID: LinkFeedChannelID,
 		}
 	}
 
@@ -271,7 +281,7 @@ func pullDiscordLinkFeed(ctx context.Context, root string) ([]LinkFeedItem, erro
 	var allMessages []discordMessage
 	afterID := state.LastMessageID
 	for {
-		messages, err := fetchDiscordMessages(ctx, auth.Token, linkFeedChannelID, afterID)
+		messages, err := fetchDiscordMessages(ctx, auth.Token, LinkFeedChannelID, afterID)
 		if err != nil {
 			return nil, fmt.Errorf("discord API: %w", err)
 		}
@@ -292,7 +302,7 @@ func pullDiscordLinkFeed(ctx context.Context, root string) ([]LinkFeedItem, erro
 	}
 
 	// 5. Extract URLs and write CogDocs
-	inboxDir := filepath.Join(root, inboxLinksRelPath)
+	inboxDir := filepath.Join(root, InboxLinksRelPath)
 	if err := os.MkdirAll(inboxDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create inbox dir: %w", err)
 	}
@@ -399,12 +409,12 @@ type enrichResult struct {
 }
 
 // enrichLink fetches, decomposes, and cross-references a raw inbox link.
-func enrichLink(ctx context.Context, h *AgentHarness, root, filename string) (*enrichResult, error) {
+func enrichLink(ctx context.Context, h Harness, root, filename string) (*enrichResult, error) {
 	// 30-second timeout for the entire enrichment
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	path := filepath.Join(root, inboxLinksRelPath, filepath.Base(filename))
+	path := filepath.Join(root, InboxLinksRelPath, filepath.Base(filename))
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read cogdoc: %w", err)
@@ -515,9 +525,9 @@ type InboxSummary struct {
 	NewestRaw     []string `json:"newest_raw,omitempty"`
 }
 
-// scanInbox reads the inbox directory and returns a summary.
-func scanInbox(root string) *InboxSummary {
-	dir := filepath.Join(root, inboxLinksRelPath)
+// ScanInbox reads the inbox directory and returns a summary.
+func ScanInbox(root string) *InboxSummary {
+	dir := filepath.Join(root, InboxLinksRelPath)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return &InboxSummary{}
@@ -576,8 +586,8 @@ func scanInbox(root string) *InboxSummary {
 	return summary
 }
 
-// linkFeedLastPull returns how long ago the last pull happened.
-func linkFeedLastPull(root string) (time.Duration, error) {
+// LinkFeedLastPull returns how long ago the last pull happened.
+func LinkFeedLastPull(root string) (time.Duration, error) {
 	state, err := readLinkFeedState(root)
 	if err != nil {
 		return 0, err
@@ -594,7 +604,9 @@ func linkFeedLastPull(root string) (time.Duration, error) {
 
 // --- Helpers ---
 
-func readDiscordAuth(root string) (*discordAuth, error) {
+// ReadDiscordAuth reads the bot token from .cog/config/discord/auth.yaml.
+// Exported so the observation pipeline can probe "configured?" status.
+func ReadDiscordAuth(root string) (*discordAuth, error) {
 	path := filepath.Join(root, discordAuthRelPath)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -633,7 +645,7 @@ func writeLinkFeedState(root string, state *linkFeedState) error {
 }
 
 func buildExistingURLSet(root string) (map[string]bool, error) {
-	dir := filepath.Join(root, inboxLinksRelPath)
+	dir := filepath.Join(root, InboxLinksRelPath)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -844,14 +856,14 @@ func updateCogDocEnriched(content string, r *enrichResult) string {
 
 // AgentInboxSummary is the enrichment data for the status API.
 type AgentInboxSummary struct {
-	RawCount            int                    `json:"raw_count"`
-	EnrichedCount       int                    `json:"enriched_count"`
-	FailedCount         int                    `json:"failed_count"`
-	TotalCount          int                    `json:"total_count"`
-	LastPull            string                 `json:"last_pull,omitempty"`
-	LastPullAgo         string                 `json:"last_pull_ago,omitempty"`
-	NextPullIn          string                 `json:"next_pull_in,omitempty"`
-	RecentEnrichments   []RecentEnrichmentItem `json:"recent_enrichments,omitempty"`
+	RawCount          int                    `json:"raw_count"`
+	EnrichedCount     int                    `json:"enriched_count"`
+	FailedCount       int                    `json:"failed_count"`
+	TotalCount        int                    `json:"total_count"`
+	LastPull          string                 `json:"last_pull,omitempty"`
+	LastPullAgo       string                 `json:"last_pull_ago,omitempty"`
+	NextPullIn        string                 `json:"next_pull_in,omitempty"`
+	RecentEnrichments []RecentEnrichmentItem `json:"recent_enrichments,omitempty"`
 }
 
 // RecentEnrichmentItem is a single recent enrichment for the dashboard.
@@ -861,9 +873,9 @@ type RecentEnrichmentItem struct {
 	Ago         string `json:"ago"`
 }
 
-// buildInboxSummaryForAPI constructs the inbox summary for the status endpoint.
-func buildInboxSummaryForAPI(root string) *AgentInboxSummary {
-	inbox := scanInbox(root)
+// BuildInboxSummaryForAPI constructs the inbox summary for the status endpoint.
+func BuildInboxSummaryForAPI(root string) *AgentInboxSummary {
+	inbox := ScanInbox(root)
 	summary := &AgentInboxSummary{
 		RawCount:      inbox.RawCount,
 		EnrichedCount: inbox.EnrichedCount,
@@ -872,10 +884,10 @@ func buildInboxSummaryForAPI(root string) *AgentInboxSummary {
 	}
 
 	// Last pull timing
-	ago, err := linkFeedLastPull(root)
+	ago, err := LinkFeedLastPull(root)
 	if err == nil {
 		summary.LastPullAgo = formatAgo(ago)
-		remaining := linkFeedCheckInterval - ago
+		remaining := LinkFeedCheckInterval - ago
 		if remaining > 0 {
 			summary.NextPullIn = formatAgo(remaining)
 		} else {
@@ -892,4 +904,66 @@ func buildInboxSummaryForAPI(root string) *AgentInboxSummary {
 	}
 
 	return summary
+}
+
+// --- Private helpers duplicated from main (kept local to break cycle) ---
+
+// extractFMField pulls a simple field value from YAML frontmatter.
+// Duplicated from main's agent_tools_propose.go to keep linkfeed a leaf
+// package. The original stays in main for its many other callers.
+func extractFMField(content, field string) string {
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, field+":") {
+			val := strings.TrimSpace(strings.TrimPrefix(line, field+":"))
+			val = strings.Trim(val, `"`)
+			return val
+		}
+	}
+	return ""
+}
+
+// sanitizeFilename makes a string safe for use as a filename.
+// Duplicated from main's agent_tools_propose.go for the same reason as
+// extractFMField.
+func sanitizeFilename(s string) string {
+	s = strings.ToLower(s)
+	s = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		if r == ' ' {
+			return '-'
+		}
+		return -1
+	}, s)
+	if len(s) > 50 {
+		s = s[:50]
+	}
+	return s
+}
+
+// runCogCommand executes ./scripts/cog with the given arguments and returns
+// the output as JSON. Duplicated from main's agent_tools.go.
+func runCogCommand(ctx context.Context, root string, args ...string) (json.RawMessage, error) {
+	cogScript := filepath.Join(root, "scripts", "cog")
+	cmd := exec.CommandContext(ctx, cogScript, args...)
+	cmd.Dir = root
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return json.Marshal(map[string]string{
+			"error":  err.Error(),
+			"output": string(out),
+		})
+	}
+	return json.Marshal(map[string]string{"output": string(out)})
+}
+
+// formatAgo produces a human-readable duration like "5m" or "2h".
+// Duplicated from main's agent_decompose.go.
+func formatAgo(d time.Duration) string {
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 }
