@@ -1,12 +1,19 @@
-// component_provider.go — Reconciliation provider for workspace components.
+// Package component provides the Reconcilable provider for workspace
+// components.
+//
 // Part of ADR-060 Phase 1: report-only drift detection.
 //
-// Implements Reconcilable to detect drift between the declared component
-// registry (.cog/conf/components.cog.md) and live on-disk state (indexed blobs).
+// The provider detects drift between the declared component registry
+// (.cog/conf/components.cog.md) and live on-disk state (indexed blobs).
 // Phase 1 is report-only — ApplyPlan prints what it would do but does not
 // execute destructive actions.
-
-package main
+//
+// Extracted from apps/cogos root in Wave 1a of ADR-085 (subpackage
+// decomposition). The component registry/indexer types and helpers still
+// live in the main package; this package reaches them through the DI
+// function variables declared below. The main package wires them in an
+// init() hook (see apps/cogos/component_wiring.go).
+package component
 
 import (
 	"context"
@@ -14,15 +21,73 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/cogos-dev/cogos/internal/workspace"
+	"github.com/cogos-dev/cogos/pkg/reconcile"
 )
 
-// ComponentProvider implements Reconcilable for workspace component management.
+// --- Dependency-injection seams ----------------------------------------------
+//
+// These variables are set by the main package in an init() hook so the
+// provider can reach the component registry / indexer machinery that still
+// lives at the apps/cogos root. If any are nil at call time the provider
+// returns an explanatory error rather than panicking.
+
+// RegistryDecl describes a single declared component. Mirrors the fields
+// component_provider.go reads from the main-package ComponentDecl type.
+type RegistryDecl struct {
+	Kind     string
+	Required bool
+}
+
+// ReconcilerConfig mirrors the reconciler sub-config the provider reads.
+type ReconcilerConfig struct {
+	PruneUnregistered bool
+}
+
+// Registry is the structural view of the component registry the provider
+// needs. The concrete main-package ComponentRegistry is converted into this
+// shape by LoadRegistry.
+type Registry struct {
+	Reconciler ReconcilerConfig
+	Components map[string]RegistryDecl
+}
+
+// Blob is the structural view of a single indexed component blob.
+type Blob struct {
+	Kind        string
+	TreeHash    string
+	CommitHash  string
+	BlobHash    string
+	Dirty       bool
+	Language    string
+	BuildSystem string
+	IndexedAt   string
+}
+
+var (
+	// LoadRegistry loads and returns the declared component registry.
+	LoadRegistry func(root string) (*Registry, error)
+	// IndexComponentPaths runs the indexer and returns the list of known
+	// component paths (keys of the Merkle index).
+	IndexComponentPaths func(root string) ([]string, error)
+	// LoadBlob loads a single indexed blob for the given component path.
+	LoadBlob func(root, path string) (*Blob, error)
+	// EncodePath produces the stable reconcile address fragment for a
+	// component path.
+	EncodePath func(path string) string
+	// NowISO returns the current timestamp in ISO-8601 form.
+	NowISO func() string
+)
+
+// ComponentProvider implements reconcile.Reconcilable for workspace
+// component management.
 type ComponentProvider struct {
 	root string
 }
 
 func init() {
-	RegisterProvider("component", &ComponentProvider{})
+	reconcile.RegisterProvider("component", &ComponentProvider{})
 }
 
 func (c *ComponentProvider) Type() string { return "component" }
@@ -30,27 +95,31 @@ func (c *ComponentProvider) Type() string { return "component" }
 // LoadConfig loads the component registry from .cog/conf/components.cog.md.
 func (c *ComponentProvider) LoadConfig(root string) (any, error) {
 	c.root = root
-	return loadComponentRegistry(root)
+	if LoadRegistry == nil {
+		return nil, fmt.Errorf("component provider: LoadRegistry dependency not wired")
+	}
+	return LoadRegistry(root)
 }
 
-// FetchLive runs the component indexer and loads individual blobs for comparison.
-// Returns map[string]*ComponentBlob keyed by component path.
+// FetchLive runs the component indexer and loads individual blobs for
+// comparison. Returns map[string]*Blob keyed by component path.
 func (c *ComponentProvider) FetchLive(ctx context.Context, config any) (any, error) {
 	root := c.root
 	if root == "" {
 		return nil, fmt.Errorf("component provider: root not set (call LoadConfig first)")
 	}
+	if IndexComponentPaths == nil || LoadBlob == nil {
+		return nil, fmt.Errorf("component provider: indexer dependencies not wired")
+	}
 
-	// Run the indexer to refresh all blobs and the Merkle index.
-	idx, err := indexComponents(root)
+	paths, err := IndexComponentPaths(root)
 	if err != nil {
 		return nil, fmt.Errorf("component index: %w", err)
 	}
 
-	// Load each blob for detailed comparison.
-	blobs := make(map[string]*ComponentBlob, len(idx.Components))
-	for path := range idx.Components {
-		blob, err := loadComponentBlob(root, path)
+	blobs := make(map[string]*Blob, len(paths))
+	for _, path := range paths {
+		blob, err := LoadBlob(root, path)
 		if err != nil {
 			// Non-fatal: log and skip this component.
 			fmt.Fprintf(os.Stderr, "warning: could not load blob for %s: %v\n", path, err)
@@ -64,11 +133,11 @@ func (c *ComponentProvider) FetchLive(ctx context.Context, config any) (any, err
 
 // ComputePlan compares declared config (registry) against live state (blobs)
 // and produces a reconciliation plan.
-func (c *ComponentProvider) ComputePlan(config any, live any, state *ReconcileState) (*ReconcilePlan, error) {
-	reg := config.(*ComponentRegistry)
-	blobs := live.(map[string]*ComponentBlob)
+func (c *ComponentProvider) ComputePlan(config any, live any, state *reconcile.State) (*reconcile.Plan, error) {
+	reg := config.(*Registry)
+	blobs := live.(map[string]*Blob)
 
-	plan := &ReconcilePlan{
+	plan := &reconcile.Plan{
 		ResourceType: "component",
 		GeneratedAt:  nowISO(),
 		ConfigPath:   ".cog/conf/components.cog.md",
@@ -91,8 +160,8 @@ func (c *ComponentProvider) ComputePlan(config any, live any, state *ReconcileSt
 		blob, exists := blobs[path]
 		if !exists {
 			// Declared but not on disk — no blob was produced.
-			action := ReconcileAction{
-				Action:       ActionCreate,
+			action := reconcile.Action{
+				Action:       reconcile.ActionCreate,
 				ResourceType: "component",
 				Name:         path,
 				Details: map[string]any{
@@ -123,7 +192,7 @@ func (c *ComponentProvider) ComputePlan(config any, live any, state *ReconcileSt
 
 		// Check tree hash against previous state (if we have one).
 		if state != nil {
-			stateIdx := ReconcileResourceIndex(state)
+			stateIdx := reconcile.ResourceIndex(state)
 			addr := "component." + encodePath(path)
 			if prev, ok := stateIdx[addr]; ok {
 				if prev.ExternalID != "" && blob.TreeHash != prev.ExternalID {
@@ -141,8 +210,8 @@ func (c *ComponentProvider) ComputePlan(config any, live any, state *ReconcileSt
 		}
 
 		if drifted {
-			action := ReconcileAction{
-				Action:       ActionUpdate,
+			action := reconcile.Action{
+				Action:       reconcile.ActionUpdate,
 				ResourceType: "component",
 				Name:         path,
 				Details: map[string]any{
@@ -154,8 +223,8 @@ func (c *ComponentProvider) ComputePlan(config any, live any, state *ReconcileSt
 			plan.Actions = append(plan.Actions, action)
 			plan.Summary.Updates++
 		} else {
-			action := ReconcileAction{
-				Action:       ActionSkip,
+			action := reconcile.Action{
+				Action:       reconcile.ActionSkip,
 				ResourceType: "component",
 				Name:         path,
 				Details: map[string]any{
@@ -180,8 +249,8 @@ func (c *ComponentProvider) ComputePlan(config any, live any, state *ReconcileSt
 	for _, path := range undeclaredPaths {
 		// Add as warnings — prune_unregistered defaults to false.
 		if reg.Reconciler.PruneUnregistered {
-			action := ReconcileAction{
-				Action:       ActionDelete,
+			action := reconcile.Action{
+				Action:       reconcile.ActionDelete,
 				ResourceType: "component",
 				Name:         path,
 				Details: map[string]any{
@@ -201,19 +270,19 @@ func (c *ComponentProvider) ComputePlan(config any, live any, state *ReconcileSt
 
 // ApplyPlan is Phase 1: report-only. Prints what would be done but does not
 // execute any destructive actions.
-func (c *ComponentProvider) ApplyPlan(ctx context.Context, plan *ReconcilePlan) ([]ReconcileResult, error) {
-	var results []ReconcileResult
+func (c *ComponentProvider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]reconcile.Result, error) {
+	var results []reconcile.Result
 	for _, action := range plan.Actions {
-		if action.Action == ActionSkip {
+		if action.Action == reconcile.ActionSkip {
 			continue
 		}
 		reason, _ := action.Details["reason"].(string)
 		fmt.Printf("  [dry-run] %s %s: %s\n", action.Action, action.Name, reason)
-		results = append(results, ReconcileResult{
+		results = append(results, reconcile.Result{
 			Phase:  "component",
 			Action: string(action.Action),
 			Name:   action.Name,
-			Status: ApplySkipped,
+			Status: reconcile.ApplySkipped,
 			Error:  "phase 1: report-only mode",
 		})
 	}
@@ -221,10 +290,10 @@ func (c *ComponentProvider) ApplyPlan(ctx context.Context, plan *ReconcilePlan) 
 }
 
 // BuildState constructs reconcile state from live blobs.
-func (c *ComponentProvider) BuildState(config any, live any, existing *ReconcileState) (*ReconcileState, error) {
-	blobs := live.(map[string]*ComponentBlob)
+func (c *ComponentProvider) BuildState(config any, live any, existing *reconcile.State) (*reconcile.State, error) {
+	blobs := live.(map[string]*Blob)
 
-	state := &ReconcileState{
+	state := &reconcile.State{
 		Version:      1,
 		ResourceType: "component",
 		GeneratedAt:  nowISO(),
@@ -238,10 +307,10 @@ func (c *ComponentProvider) BuildState(config any, live any, existing *Reconcile
 	}
 
 	for path, blob := range blobs {
-		resource := ReconcileResource{
+		resource := reconcile.Resource{
 			Address:       "component." + encodePath(path),
 			Type:          blob.Kind,
-			Mode:          ModeManaged,
+			Mode:          reconcile.ModeManaged,
 			ExternalID:    blob.TreeHash,
 			Name:          path,
 			LastRefreshed: blob.IndexedAt,
@@ -265,23 +334,30 @@ func (c *ComponentProvider) BuildState(config any, live any, existing *Reconcile
 }
 
 // Health returns the current three-axis status of the component subsystem.
-func (c *ComponentProvider) Health() ResourceStatus {
+func (c *ComponentProvider) Health() reconcile.ResourceStatus {
 	root := c.root
 	if root == "" {
 		var err error
-		root, _, err = ResolveWorkspace()
+		root, _, err = workspace.ResolveWorkspace()
 		if err != nil {
-			return ResourceStatus{
-				Sync: SyncStatusUnknown, Health: HealthMissing, Operation: OperationIdle,
+			return reconcile.ResourceStatus{
+				Sync: reconcile.SyncStatusUnknown, Health: reconcile.HealthMissing, Operation: reconcile.OperationIdle,
 				Message: "workspace not found",
 			}
 		}
 	}
 
-	reg, err := loadComponentRegistry(root)
+	if LoadRegistry == nil {
+		return reconcile.ResourceStatus{
+			Sync: reconcile.SyncStatusUnknown, Health: reconcile.HealthDegraded, Operation: reconcile.OperationIdle,
+			Message: "component registry loader not wired",
+		}
+	}
+
+	reg, err := LoadRegistry(root)
 	if err != nil {
-		return ResourceStatus{
-			Sync: SyncStatusUnknown, Health: HealthDegraded, Operation: OperationIdle,
+		return reconcile.ResourceStatus{
+			Sync: reconcile.SyncStatusUnknown, Health: reconcile.HealthDegraded, Operation: reconcile.OperationIdle,
 			Message: "component registry not found",
 		}
 	}
@@ -298,16 +374,34 @@ func (c *ComponentProvider) Health() ResourceStatus {
 	}
 
 	if missing > 0 {
-		return ResourceStatus{
-			Sync: SyncStatusOutOfSync, Health: HealthDegraded, Operation: OperationIdle,
+		return reconcile.ResourceStatus{
+			Sync: reconcile.SyncStatusOutOfSync, Health: reconcile.HealthDegraded, Operation: reconcile.OperationIdle,
 			Message: fmt.Sprintf("%d required components missing", missing),
 		}
 	}
 
-	return NewResourceStatus(SyncStatusSynced, HealthHealthy)
+	return reconcile.NewResourceStatus(reconcile.SyncStatusSynced, reconcile.HealthHealthy)
 }
 
 // --- helpers ----------------------------------------------------------------
+
+// nowISO returns the current timestamp, delegating to the main-package
+// NowISO if it is wired and falling back to a sentinel otherwise.
+func nowISO() string {
+	if NowISO != nil {
+		return NowISO()
+	}
+	return ""
+}
+
+// encodePath delegates to the main-package EncodePath if wired; otherwise
+// returns the path unchanged (safe fallback for the trivial cases).
+func encodePath(path string) string {
+	if EncodePath != nil {
+		return EncodePath(path)
+	}
+	return path
+}
 
 // truncHash shortens a hash for display, keeping the first 12 characters.
 func truncHash(h string) string {
