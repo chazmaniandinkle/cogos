@@ -35,7 +35,7 @@ type ServiceCRDMeta struct {
 
 // ServiceCRDSpec defines the service specification.
 type ServiceCRDSpec struct {
-	Image     string           `yaml:"image"`
+	Image     string           `yaml:"image,omitempty"`
 	Platform  string           `yaml:"platform,omitempty"`
 	Ports     []ServicePort    `yaml:"ports,omitempty"`
 	Env       []string         `yaml:"env,omitempty"`
@@ -46,6 +46,20 @@ type ServiceCRDSpec struct {
 	Tools      []ServiceTool    `yaml:"tools,omitempty"`
 	Modalities []string         `yaml:"modalities,omitempty"` // e.g. ["voice"]
 	Bus        ServiceBus       `yaml:"bus,omitempty"`
+	Local      *ServiceLocal    `yaml:"local,omitempty"`
+}
+
+// ServiceLocal describes bare-metal execution for a service, used when the
+// container runtime is unavailable or when the service must run natively
+// (e.g. Apple Silicon workloads without an OCI image). Supervision is handled
+// by the reconcile loop: the service is restarted on the next cycle if it
+// exits. No per-service watcher goroutines.
+type ServiceLocal struct {
+	Command string            `yaml:"command"`           // Executable name or absolute path
+	Args    []string          `yaml:"args,omitempty"`
+	Workdir string            `yaml:"workdir,omitempty"` // Absolute or workspace-relative
+	Venv    string            `yaml:"venv,omitempty"`    // Python venv whose bin/ is prepended to PATH
+	Env     map[string]string `yaml:"env,omitempty"`     // KEY: value map appended to process env
 }
 
 // ServicePort maps a container port to a host port.
@@ -157,8 +171,11 @@ func LoadServiceCRD(root, name string) (*ServiceCRD, error) {
 			name, crd.Metadata.Name)
 	}
 
-	if crd.Spec.Image == "" {
-		return nil, fmt.Errorf("service CRD %q: spec.image is required", name)
+	if crd.Spec.Image == "" && crd.Spec.Local == nil {
+		return nil, fmt.Errorf("service CRD %q: spec.image or spec.local is required", name)
+	}
+	if crd.Spec.Local != nil && crd.Spec.Local.Command == "" {
+		return nil, fmt.Errorf("service CRD %q: spec.local.command is required when spec.local is set", name)
 	}
 
 	// Apply defaults
