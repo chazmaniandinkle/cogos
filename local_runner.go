@@ -17,25 +17,35 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
 // LocalProcess captures the live state of a supervised bare-metal service.
+//
+// Cmd and Args record the *resolved* argv that LocalStart actually invoked.
+// They exist so LocalStop can verify the live process at PID still matches
+// what we started before sending signals — without that check, PID reuse
+// after a crash or reboot can land an unrelated user process at this PID
+// and we'd kill it (and its whole process group, since we use Setsid).
 type LocalProcess struct {
-	Name      string `json:"name"`
-	PID       int    `json:"pid"`
-	StartedAt string `json:"started_at"`
-	CmdHash   string `json:"cmd_hash"`
-	Workdir   string `json:"workdir"`
-	LogPath   string `json:"log_path"`
-	Running   bool   `json:"running"` // populated by LocalStatus, not persisted
+	Name      string   `json:"name"`
+	PID       int      `json:"pid"`
+	StartedAt string   `json:"started_at"`
+	CmdHash   string   `json:"cmd_hash"`
+	Workdir   string   `json:"workdir"`
+	LogPath   string   `json:"log_path"`
+	Cmd       string   `json:"cmd,omitempty"`  // resolved executable path (post-venv lookup)
+	Args      []string `json:"args,omitempty"` // argv after Cmd
+	Running   bool     `json:"running"`        // populated by LocalStatus, not persisted
 }
 
 // localServicesDir returns the directory holding PID/log files for local services.
@@ -53,9 +63,15 @@ func localLogPath(root, name string) string {
 
 // ─── Command construction ───────────────────────────────────────────────────────
 
-// localCmdHash produces a stable hash of the command + args + workdir so we
-// can detect drift between declared spec and a running process without
-// comparing argv verbatim (which is noisy across shell escaping variations).
+// localCmdHash produces a stable hash of the command + args + workdir + venv
+// + env so we can detect drift between declared spec and a running process
+// without comparing argv verbatim (which is noisy across shell escaping
+// variations).
+//
+// Venv is included because the same Command (e.g. "python3") resolves to a
+// different interpreter under a different venv — without it, swapping the
+// venv field leaves reconcile reporting "in sync" while running the wrong
+// binary.
 func localCmdHash(local *ServiceLocal, workdir string) string {
 	h := sha256.New()
 	h.Write([]byte(local.Command))
@@ -65,6 +81,10 @@ func localCmdHash(local *ServiceLocal, workdir string) string {
 		h.Write([]byte{0})
 	}
 	h.Write([]byte(workdir))
+	h.Write([]byte{0})
+	// Venv influences which binary `Command` resolves to (see LocalStart's
+	// venv lookup); changing it must invalidate the hash.
+	h.Write([]byte(local.Venv))
 	h.Write([]byte{0})
 	// Sort env keys so hash is stable across map iteration orders.
 	keys := make([]string, 0, len(local.Env))
@@ -187,22 +207,97 @@ func processAlive(pid int) bool {
 	return proc.Signal(syscall.Signal(0)) == nil
 }
 
+// psLookup is the seam used by verifyOwnership to read a process's argv.
+// Tests override it; the production implementation shells out to `ps`.
+//
+// Returns the verbatim argv string (single line, fields joined by spaces)
+// or an error if the process is gone or ps fails.
+var psLookup = func(pid int) (string, error) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// verifyOwnership reports whether the live process at pid is the one we
+// started for this service, by comparing its argv against the cmd/args we
+// recorded at LocalStart time. Used as a guard before sending signals so we
+// don't kill an unrelated process that reused this PID after a crash or
+// reboot.
+//
+// Returns:
+//   - (true,  nil) when argv matches recorded cmd+args.
+//   - (false, nil) when the process is gone, ps refuses to look it up, or
+//     argv differs from what we expect (PID reuse, replacement, etc.).
+//   - (false, err) only on unexpected internal errors. Callers should treat
+//     non-nil err as "do not signal" — same as a false ownership result.
+//
+// The expectedCmd is the resolved binary path LocalStart used (post-venv
+// lookup), and expectedArgs is the argv tail. An empty expectedCmd is
+// treated as a legacy / unrecorded PID file; we refuse ownership in that
+// case so the caller declines to signal — restart the service to repopulate.
+//
+// On Windows, ps is unavailable so we fall back to the liveness check.
+func verifyOwnership(pid int, expectedCmd string, expectedArgs []string) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	if runtime.GOOS == "windows" {
+		// No portable ps; fall back to liveness — windows is not a primary
+		// platform for the local runner today, but we don't want to leak
+		// processes there either.
+		return processAlive(pid), nil
+	}
+	if expectedCmd == "" {
+		// Legacy PID file with no recorded argv — we can't verify, and the
+		// safe default is to refuse signals. The caller will log + clear.
+		return false, nil
+	}
+
+	actual, err := psLookup(pid)
+	if err != nil {
+		// Most common case: process doesn't exist → ps exits non-zero.
+		// Treat as "not ours" so the caller stops without signaling.
+		return false, nil
+	}
+	if actual == "" {
+		return false, nil
+	}
+
+	expected := expectedCmd
+	for _, a := range expectedArgs {
+		expected += " " + a
+	}
+	return actual == strings.TrimSpace(expected), nil
+}
+
 // ─── Public API ─────────────────────────────────────────────────────────────────
 
 // LocalStatus returns the tracked process for the named service, or nil if
 // no PID file exists. The Running field is populated by verifying the PID
-// is alive. Stale PID files (process dead) are cleaned up automatically.
+// is alive AND that its argv matches what we recorded — protecting against
+// PID reuse misreporting an unrelated process as our service.
+//
+// Stale PID files (dead process or argv mismatch) are cleaned up
+// automatically so the next reconcile treats this as a create.
 func LocalStatus(root, name string) (*LocalProcess, error) {
 	p, err := readLocalProcess(root, name)
 	if err != nil || p == nil {
 		return p, err
 	}
-	p.Running = processAlive(p.PID)
-	if !p.Running {
-		// Stale — clean up so next reconcile treats this as a create.
+	if !processAlive(p.PID) {
 		removeLocalPID(root, name)
 		return p, nil
 	}
+	owns, _ := verifyOwnership(p.PID, p.Cmd, p.Args)
+	if !owns {
+		log.Printf("[local-runner] warn: PID %d for service %s does not match recorded argv (cmd=%q); clearing stale PID file",
+			p.PID, name, p.Cmd)
+		removeLocalPID(root, name)
+		return p, nil
+	}
+	p.Running = true
 	return p, nil
 }
 
@@ -276,6 +371,8 @@ func LocalStart(root string, crd *ServiceCRD) (*LocalProcess, error) {
 		CmdHash:   localCmdHash(local, workdir),
 		Workdir:   workdir,
 		LogPath:   localLogPath(root, crd.Metadata.Name),
+		Cmd:       command,
+		Args:      append([]string(nil), local.Args...),
 		Running:   true,
 	}
 	if err := writeLocalProcess(root, proc); err != nil {
@@ -289,6 +386,12 @@ func LocalStart(root string, crd *ServiceCRD) (*LocalProcess, error) {
 // LocalStop sends SIGTERM, waits up to 10s, then SIGKILL. The PID file is
 // removed regardless of outcome — either the process is gone or we've lost
 // confidence that it is ours.
+//
+// Before signaling, the live process's argv is verified against the recorded
+// cmd+args. If they don't match (PID reuse after a crash/reboot, manual
+// replacement, etc.), we log a warning and clear the stale PID file *without
+// sending any signal* — otherwise we'd kill an unrelated user process and,
+// worse, its whole process group, since we start with Setsid.
 func LocalStop(root, name string) error {
 	p, err := readLocalProcess(root, name)
 	if err != nil {
@@ -300,6 +403,13 @@ func LocalStop(root, name string) error {
 	defer removeLocalPID(root, name)
 
 	if !processAlive(p.PID) {
+		return nil
+	}
+
+	owns, _ := verifyOwnership(p.PID, p.Cmd, p.Args)
+	if !owns {
+		log.Printf("[local-runner] warn: refusing to signal PID %d for service %s — argv does not match recorded cmd=%q (likely PID reuse). Clearing stale PID file without signaling.",
+			p.PID, name, p.Cmd)
 		return nil
 	}
 

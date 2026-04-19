@@ -44,6 +44,33 @@ func WithCycleID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, cycleIDKey{}, id)
 }
 
+// sessionIDKey is the context key that carries the dashboard session_id of
+// the user turn currently being processed. The respond tool reads this so
+// its reply can be tagged with the originating session, letting Mod³ filter
+// broadcasts and avoid cross-talk between simultaneously-connected clients.
+type sessionIDKey struct{}
+
+// sessionIDFromContext extracts the dashboard session_id from ctx, or "" if
+// none. Empty string is the explicit "no session" signal — publishers treat
+// it as a broadcast to anyone listening (the legacy behavior).
+func sessionIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(sessionIDKey{}).(string)
+	return v
+}
+
+// WithSessionID returns ctx carrying the given dashboard session_id. Set by
+// ServeAgent.runCycle when a pending user message is being observed so the
+// downstream respond tool can stamp its reply with the correct session.
+func WithSessionID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, sessionIDKey{}, id)
+}
+
 // --- Wire protocol types (Ollama native /api/chat) ---
 //
 // Uses Ollama's native API instead of the OpenAI-compatible shim because:

@@ -277,7 +277,14 @@ func extractDashboardText(block *CogBlock) string {
 // structured agent_response onto bus_dashboard_response for Mod³ to consume.
 // Exposed to the respond tool in agent_tools_respond.go; kept in this file so
 // the two directions of the chat channel sit next to each other.
-func publishDashboardResponse(text, reasoning string) (int, error) {
+//
+// sessionID, when non-empty, is included in the payload so subscribers can
+// filter on it — without it Mod³ broadcasts replies to every connected
+// client and multi-client setups see cross-talk. Pair with the dashboard
+// inlet's per-turn session_id capture (handleDashboardChatEvent populates
+// pendingUserMsg.SessionID; ServeAgent.runCycle threads it through ctx via
+// WithSessionID, the respond tool reads it back here).
+func publishDashboardResponse(text, reasoning, sessionID string) (int, error) {
 	mgr := dashboardInletBusMgr.Load()
 	if mgr == nil {
 		return 0, errDashboardNotInstalled
@@ -294,6 +301,9 @@ func publishDashboardResponse(text, reasoning string) (int, error) {
 	}
 	if reasoning != "" {
 		payload["reasoning"] = reasoning
+	}
+	if sessionID != "" {
+		payload["session_id"] = sessionID
 	}
 
 	raw, err := json.Marshal(payload)

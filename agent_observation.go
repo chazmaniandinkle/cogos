@@ -300,3 +300,15 @@ func firstUserMessageText(pending []pendingUserMsg) string {
 	}
 	return ""
 }
+
+// firstUserMessageSessionID returns the first pending user message's
+// session_id, or "" if none. Used to tag the cycle's reply so Mod³ can
+// route it to the originating client instead of broadcasting.
+func firstUserMessageSessionID(pending []pendingUserMsg) string {
+	for _, m := range pending {
+		if m.SessionID != "" {
+			return m.SessionID
+		}
+	}
+	return ""
+}

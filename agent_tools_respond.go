@@ -107,7 +107,10 @@ func newRespondFunc() ToolFunc {
 			})
 		}
 
-		n, err := publishDashboardResponse(p.Text, p.Reasoning)
+		// sessionIDFromContext returns "" when the cycle isn't replying to a
+		// dashboard turn — publishDashboardResponse omits the field in that
+		// case, preserving the legacy broadcast behavior.
+		n, err := publishDashboardResponse(p.Text, p.Reasoning, sessionIDFromContext(ctx))
 		if err != nil {
 			return json.Marshal(map[string]interface{}{
 				"ok":    false,

@@ -580,6 +580,85 @@ func (sa *ServeAgent) updateSleepCount(action string, current int) int {
 	return 0
 }
 
+// publishUserTurnReply is the seam used by ensureUserTurnReply to actually
+// emit a dashboard response. Tests override this to capture calls without
+// standing up a live bus manager; production points it at the bus-publishing
+// implementation in agent_bus_inlet.go.
+var publishUserTurnReply = publishDashboardResponse
+
+// ensureUserTurnReply guarantees that *something* gets published to the
+// dashboard response bus when a cycle consumed pending user message(s).
+//
+// This closes the BLOCKER from PR #7 review: the inlet drains the queue
+// eagerly, so if the cycle errors during assessment, hits a sleep, or
+// produces an empty execute result, the user turn would be silently lost
+// without this guarantee. The chosen design (b-from-the-review): always
+// publish; pick the most informative payload available; never drop.
+//
+// Skipped when:
+//   - pendingMsgs is empty (nothing to reply to).
+//   - The respond tool already published this turn (tracked atomically via
+//     respondInvokedSince) — re-publishing would double-reply.
+//
+// Otherwise picks payload by priority:
+//  1. cycle error  → "(cycle failed: <reason>)" so the user knows why
+//  2. executeResult non-empty → the model's prose narration of the action
+//     (the original auto-fallback path; preserves existing UX)
+//  3. else → "(no reply: <action> — <reason>)" so a sleep/empty cycle
+//     still acknowledges the user instead of vanishing
+//
+// Publication is best-effort and non-blocking (goroutine); failures only log.
+func ensureUserTurnReply(
+	pendingMsgs []pendingUserMsg,
+	respondSnap uint64,
+	cycleErr error,
+	assessment *Assessment,
+	executeResult string,
+) {
+	if len(pendingMsgs) == 0 {
+		return
+	}
+	if respondInvokedSince(respondSnap) {
+		log.Printf("[dashboard-inlet] auto-fallback suppressed: respond tool already published this turn")
+		return
+	}
+
+	var pubText, reasoning string
+	switch {
+	case cycleErr != nil:
+		pubText = fmt.Sprintf("(cycle failed: %s)", cycleErr.Error())
+		reasoning = "auto-fallback: cycle errored before reply"
+	case strings.TrimSpace(executeResult) != "":
+		pubText = strings.TrimSpace(executeResult)
+		reasoning = "auto-fallback: model did not invoke respond tool"
+	default:
+		action, reason := "unknown", ""
+		if assessment != nil {
+			action = assessment.Action
+			reason = assessment.Reason
+		}
+		if reason != "" {
+			pubText = fmt.Sprintf("(no reply: %s — %s)", action, reason)
+		} else {
+			pubText = fmt.Sprintf("(no reply: %s)", action)
+		}
+		reasoning = "auto-fallback: cycle produced no reply"
+	}
+
+	if pubText == "" {
+		return
+	}
+	sessionID := firstUserMessageSessionID(pendingMsgs)
+
+	go func(text, reason, sid string) {
+		if _, err := publishUserTurnReply(text, reason, sid); err != nil {
+			log.Printf("[dashboard-inlet] auto-fallback publish failed: %v", err)
+			return
+		}
+		log.Printf("[dashboard-inlet] auto-fallback published agent response (%d chars, session=%q) on bus_dashboard_response", len(text), sid)
+	}(pubText, reasoning, sessionID)
+}
+
 // runCycle executes a single observe-assess-execute pass.
 // Returns the assessment action string for adaptive interval logic.
 func (sa *ServeAgent) runCycle(ctx context.Context) string {
@@ -597,13 +676,25 @@ func (sa *ServeAgent) runCycle(ctx context.Context) string {
 	log.Printf("[agent] cycle %d: starting (trace=%s)", cycle, cycleID)
 
 	// Drain any pending dashboard user messages the bus inlet has queued.
-	// Greedy semantics (v1): drained messages are consumed by this cycle's
-	// observation even if the model ultimately doesn't call `respond`. That
-	// keeps the plumbing simple; missed replies are missed. Peek-and-ack can
-	// replace this later if that becomes a problem in practice.
+	// Greedy semantics (v1): drained messages are consumed by this cycle even
+	// if the model doesn't call `respond`. The reply guarantee is upheld by
+	// the auto-fallback below, which always emits *something* whenever
+	// pendingMsgs is non-empty — even on cycle errors, sleep-action, or
+	// timeouts — so a consumed user turn never produces silence.
 	pendingMsgs := drainPendingUserMessages()
 	if len(pendingMsgs) > 0 {
 		log.Printf("[agent] cycle %s: observing %d pending user message(s)", cycleID, len(pendingMsgs))
+	}
+
+	// Stamp ctx with the originating session_id (first pending message) so
+	// the respond tool can tag its reply with the correct session and Mod³
+	// can route it back to the originating client instead of broadcasting.
+	// Multi-session interleaving in a single cycle is rare; if it happens,
+	// the first session wins for tool-tagging and the auto-fallback will
+	// publish per-session replies (see ensureUserTurnReply below).
+	turnSessionID := firstUserMessageSessionID(pendingMsgs)
+	if turnSessionID != "" {
+		ctx = WithSessionID(ctx, turnSessionID)
 	}
 
 	// Cheap checks gate: skip model call if nothing changed. Pending user
@@ -830,6 +921,16 @@ Do not just describe what you would do — actually call the tools. When you are
 	}
 	duration := time.Since(start)
 
+	// Reply guarantee for consumed user turns. If pendingMsgs was non-empty,
+	// we owe the dashboard a reply — even on cycle errors, sleep-action, or
+	// timeouts. Run this BEFORE the err short-circuit below; otherwise an
+	// assessment error drains the user turn and silently drops the reply
+	// (the original BLOCKER from PR #7 review).
+	//
+	// Skip when respond already landed this turn (snapshot delta > 0):
+	// publishing again would double-reply on the dashboard bus.
+	ensureUserTurnReply(pendingMsgs, respondSnap, err, assessment, executeResult)
+
 	if err != nil {
 		log.Printf("[agent] cycle %d: error: %v (%s)", cycle, err, duration.Round(time.Millisecond))
 		sa.emitEvent("agent.error", map[string]interface{}{
@@ -854,33 +955,6 @@ Do not just describe what you would do — actually call the tools. When you are
 
 	if executeResult != "" {
 		log.Printf("[agent] cycle %d: execute result: %s", cycle, agentTruncate(executeResult, 500))
-	}
-
-	// Dashboard-chat fallback: if this cycle drained pending user messages
-	// but the model narrated a reply in prose instead of invoking the
-	// `respond` tool, auto-publish the execute result onto
-	// bus_dashboard_response so the user still sees an answer. This makes
-	// the loop robust to Gemma E4B's tool-calling flakiness. Publishing is
-	// best-effort and non-blocking.
-	//
-	// Respond-dedup: skip the fallback if the respond tool already landed
-	// this turn (snapshot delta > 0). Otherwise the dashboard sees two
-	// replies — the structured one from respond, and a prose echo from the
-	// Execute-phase final content. The snapshot check is the authoritative
-	// signal because the respond tool bumps atomically on successful publish.
-	if len(pendingMsgs) > 0 && executeResult != "" && !respondInvokedSince(respondSnap) {
-		pubText := strings.TrimSpace(executeResult)
-		if pubText != "" {
-			go func(text string) {
-				if _, err := publishDashboardResponse(text, "auto-fallback: model did not invoke respond tool"); err != nil {
-					log.Printf("[dashboard-inlet] auto-fallback publish failed: %v", err)
-				} else {
-					log.Printf("[dashboard-inlet] auto-fallback published agent response (%d chars) on bus_dashboard_response", len(text))
-				}
-			}(pubText)
-		}
-	} else if len(pendingMsgs) > 0 && respondInvokedSince(respondSnap) {
-		log.Printf("[dashboard-inlet] auto-fallback suppressed: respond tool already published this turn")
 	}
 
 	sa.emitEvent("agent.cycle", map[string]interface{}{
