@@ -15,9 +15,101 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
+
+	"github.com/cogos-dev/cogos/internal/engine"
+	"github.com/cogos-dev/cogos/trace"
 )
+
+// cycleIDFromContext extracts a cycle-trace correlation ID from ctx, or
+// returns "" if none. See trace_emit.go for the key type.
+func cycleIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(cycleIDKey{}).(string)
+	return v
+}
+
+// WithCycleID returns ctx carrying the given cycle-trace ID. Callers (e.g.
+// ServeAgent.runCycle) should wrap ctx with this before invoking Assess /
+// Execute so tool-dispatch emission can correlate events across the
+// iteration.
+func WithCycleID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, cycleIDKey{}, id)
+}
+
+// sessionIDKey is the context key that carries the dashboard session_id of
+// the user turn currently being processed. The respond tool reads this so
+// its reply can be tagged with the originating session, letting Mod³ filter
+// broadcasts and avoid cross-talk between simultaneously-connected clients.
+type sessionIDKey struct{}
+
+// sessionIDFromContext extracts the dashboard session_id from ctx, or "" if
+// none. Empty string is the explicit "no session" signal — publishers treat
+// it as a broadcast to anyone listening (the legacy behavior).
+func sessionIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(sessionIDKey{}).(string)
+	return v
+}
+
+// WithSessionID returns ctx carrying the given dashboard session_id. Set by
+// ServeAgent.runCycle when a pending user message is being observed so the
+// downstream respond tool can stamp its reply with the correct session.
+func WithSessionID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, sessionIDKey{}, id)
+}
+
+// sessionIDsKey carries the de-duplicated list of dashboard session_ids for a
+// cycle that drained multiple user messages. The respond tool fans out its
+// reply across this list so every originating session/tab sees the response —
+// without it, a cycle consuming messages from N clients would only reply on
+// whichever session_id happened to be first in the pending queue.
+//
+// When absent (or empty), publishers fall back to sessionIDFromContext — the
+// single-session path preserved for the common case of one message per cycle.
+type sessionIDsKey struct{}
+
+// sessionIDsFromContext returns the fan-out list of session_ids for the
+// current cycle's reply, or nil if none was set. An empty slice is treated as
+// no-list (callers should use the single-id path).
+func sessionIDsFromContext(ctx context.Context) []string {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(sessionIDsKey{}).([]string)
+	if len(v) == 0 {
+		return nil
+	}
+	return v
+}
+
+// WithSessionIDs returns ctx carrying the given fan-out list of session_ids.
+// Set by ServeAgent.runCycle after draining the pending queue so downstream
+// publishers (respond tool, auto-fallback) can emit one reply per unique
+// session. Nil/empty ids are ignored — callers keep WithSessionID for the
+// single-session case.
+func WithSessionIDs(ctx context.Context, ids []string) context.Context {
+	if len(ids) == 0 {
+		return ctx
+	}
+	// Copy so later mutations on the caller's slice can't alter the stored
+	// list — ctx values are treated as immutable by convention.
+	cp := make([]string, len(ids))
+	copy(cp, ids)
+	return context.WithValue(ctx, sessionIDsKey{}, cp)
+}
 
 // --- Wire protocol types (Ollama native /api/chat) ---
 //
@@ -35,6 +127,7 @@ type agentChatRequest struct {
 	Stream   bool               `json:"stream"`
 	Think    bool               `json:"think"`              // explicit thinking control
 	Format   string             `json:"format,omitempty"`   // "json" for structured output
+	Options  map[string]interface{} `json:"options,omitempty"` // Ollama model options (num_ctx, temperature, etc.)
 }
 
 // agentChatMessage is a single message in the conversation.
@@ -63,8 +156,16 @@ type agentChatResponse struct {
 		Content   string          `json:"content"`
 		ToolCalls []agentToolCall `json:"tool_calls,omitempty"`
 	} `json:"message"`
-	Done       bool `json:"done"`
+	Done       bool   `json:"done"`
 	DoneReason string `json:"done_reason,omitempty"`
+
+	// Ollama performance metrics (nanoseconds)
+	TotalDuration    int64 `json:"total_duration,omitempty"`
+	LoadDuration     int64 `json:"load_duration,omitempty"`
+	PromptEvalCount  int   `json:"prompt_eval_count,omitempty"`
+	PromptEvalDuration int64 `json:"prompt_eval_duration,omitempty"`
+	EvalCount        int   `json:"eval_count,omitempty"`
+	EvalDuration     int64 `json:"eval_duration,omitempty"`
 }
 
 // --- Tool definition types ---
@@ -127,7 +228,7 @@ func NewAgentHarness(cfg AgentHarnessConfig) *AgentHarness {
 		tools:     nil,
 		toolFuncs: make(map[string]ToolFunc),
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 180 * time.Second,
 		},
 		maxTurns: maxTurns,
 	}
@@ -153,11 +254,21 @@ func (h *AgentHarness) Assess(ctx context.Context, systemPrompt, observation str
 		Stream:   false,
 		Think:    false, // disable thinking — we want clean JSON output
 		Format:   "json",
+		Options:  map[string]interface{}{"num_ctx": 8192}, // 8K context is plenty for assessment
 	}
 
 	resp, err := h.chatCompletion(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("assess: %w", err)
+	}
+
+	// Log Ollama performance metrics
+	if resp.PromptEvalCount > 0 {
+		promptTokS := float64(resp.PromptEvalCount) / (float64(resp.PromptEvalDuration) / 1e9)
+		evalTokS := float64(resp.EvalCount) / (float64(resp.EvalDuration) / 1e9)
+		totalS := float64(resp.TotalDuration) / 1e9
+		log.Printf("[agent] assess metrics: %d prompt tok (%.0f tok/s) + %d eval tok (%.0f tok/s) = %.1fs total",
+			resp.PromptEvalCount, promptTokS, resp.EvalCount, evalTokS, totalS)
 	}
 
 	content := resp.Message.Content
@@ -186,11 +297,19 @@ func (h *AgentHarness) Execute(ctx context.Context, systemPrompt, task string) (
 			Tools:    h.tools,
 			Stream:   false,
 			Think:    false, // disable thinking for tool loop
+			Options:  map[string]interface{}{"num_ctx": 8192}, // 8K context for tool loop
 		}
 
 		resp, err := h.chatCompletion(ctx, req)
 		if err != nil {
 			return "", fmt.Errorf("execute turn %d: %w", turn, err)
+		}
+
+		// Log per-turn metrics
+		if resp.PromptEvalCount > 0 {
+			totalS := float64(resp.TotalDuration) / 1e9
+			log.Printf("[agent] execute turn %d: %d prompt tok + %d eval tok = %.1fs",
+				turn, resp.PromptEvalCount, resp.EvalCount, totalS)
 		}
 
 		msg := resp.Message
@@ -206,18 +325,50 @@ func (h *AgentHarness) Execute(ctx context.Context, systemPrompt, task string) (
 			ToolCalls: msg.ToolCalls,
 		})
 
-		// Dispatch each tool call and collect results.
+		// Dispatch each tool call and collect results. Track whether the
+		// sanctioned `wait` tool was invoked — if so, we terminate the loop
+		// after this turn's dispatch rather than asking the model for another
+		// round. This gives the model a clean "nothing to do" exit.
+		var waitInvoked bool
+		var waitReason string
 		for _, tc := range msg.ToolCalls {
+			// Dispatch with timing so we can emit a cycle.tool_dispatch trace
+			// event. Emission is best-effort and never blocks the tool loop.
+			toolStart := time.Now()
 			result, err := h.dispatchTool(ctx, tc)
+			toolDuration := time.Since(toolStart)
+			if cycleID := cycleIDFromContext(ctx); cycleID != "" {
+				ev, bErr := trace.NewToolDispatch(
+					engine.TraceIdentity(),
+					cycleID,
+					tc.Function.Name,
+					tc.Function.Arguments,
+					toolDuration,
+					err,
+				)
+				if bErr == nil {
+					emitCycleEvent(ev)
+				}
+			}
 			if err != nil {
 				// Tool errors go back to the model as content, not Go errors.
 				result = []byte(fmt.Sprintf(`{"error": %q}`, err.Error()))
+			}
+			if tc.Function.Name == waitToolName {
+				waitInvoked = true
+				if r := extractWaitReason(result); r != "" {
+					waitReason = r
+				}
 			}
 			messages = append(messages, agentChatMessage{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Content:    string(result),
 			})
+		}
+
+		if waitInvoked {
+			return fmt.Sprintf("waited: %s", waitReason), nil
 		}
 	}
 

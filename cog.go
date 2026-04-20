@@ -30,6 +30,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/cogos-dev/cogos/internal/workspace"
 	"github.com/cogos-dev/cogos/pkg/coordination"
 )
 
@@ -1157,115 +1158,36 @@ func gitRoot() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// workspaceCache caches the result of workspace resolution.
-// ResolveWorkspace() is called 25+ times per process; caching avoids
-// redundant config reads and git operations.
-var workspaceCache struct {
-	once   sync.Once
-	root   string
-	source string
-	err    error
-}
-
-// ResolveWorkspace determines the workspace root based on precedence:
-// 1. COG_ROOT environment variable (explicit)
-// 2. COG_WORKSPACE env var (lookup in global config)
-// 3. Local git repo detection (if inside a workspace)
-// 4. current-workspace from ~/.cog/config
-// Returns (workspaceRoot, source, error) where source describes how it was resolved.
+// ResolveWorkspace is aliased to the internal/workspace package implementation.
+// See internal/workspace/workspace.go for the resolution algorithm. The alias
+// keeps the ~100 existing call sites compiling unchanged while providers can
+// now import the workspace package directly.
 //
-// Results are cached for the lifetime of the process since resolution is
-// deterministic within a single invocation.
-func ResolveWorkspace() (string, string, error) {
-	workspaceCache.once.Do(func() {
-		workspaceCache.root, workspaceCache.source, workspaceCache.err = resolveWorkspaceUncached()
-	})
-	return workspaceCache.root, workspaceCache.source, workspaceCache.err
+// Dependency wiring (LoadConfig, GitRoot) is installed in init() below.
+var ResolveWorkspace = workspace.ResolveWorkspace
+
+// globalConfigAdapter adapts *GlobalConfig to workspace.ConfigProvider.
+type globalConfigAdapter struct{ cfg *GlobalConfig }
+
+func (a globalConfigAdapter) CurrentWorkspace() string { return a.cfg.CurrentWorkspace }
+
+func (a globalConfigAdapter) WorkspacePath(name string) (string, bool) {
+	ws, ok := a.cfg.Workspaces[name]
+	if !ok || ws == nil {
+		return "", false
+	}
+	return ws.Path, true
 }
 
-// isRealWorkspace checks if dir has a .cog/ directory that looks like a real
-// CogOS workspace (has config/ or mem/), not just a bare .cog/ with .state/ only
-// (which submodules sometimes have).
-func isRealWorkspace(dir string) bool {
-	cogDir := filepath.Join(dir, ".cog")
-	info, err := os.Stat(cogDir)
-	if err != nil || !info.IsDir() {
-		return false
-	}
-	// A real workspace has config/ subdirectory (not just mem/ or .state/)
-	if info, err := os.Stat(filepath.Join(cogDir, "config")); err == nil && info.IsDir() {
-		return true
-	}
-	return false
-}
-
-// resolveWorkspaceUncached implements the actual workspace resolution logic.
-// Called once per process via ResolveWorkspace().
-func resolveWorkspaceUncached() (string, string, error) {
-	// 1. Explicit COG_ROOT (set by wrapper for --root flag)
-	if root := os.Getenv("COG_ROOT"); root != "" {
-		cogDir := filepath.Join(root, ".cog")
-		if info, err := os.Stat(cogDir); err == nil && info.IsDir() {
-			return root, "explicit", nil
+func init() {
+	workspace.LoadConfig = func() (workspace.ConfigProvider, error) {
+		cfg, err := loadGlobalConfig()
+		if err != nil {
+			return nil, err
 		}
-		return "", "", fmt.Errorf("COG_ROOT=%s is not a valid workspace (no .cog/ directory)", root)
+		return globalConfigAdapter{cfg: cfg}, nil
 	}
-
-	// 2. COG_WORKSPACE env var (lookup by name in global config)
-	// Graceful degradation: fall through to tier 3 if config fails or workspace not found
-	if wsName := os.Getenv("COG_WORKSPACE"); wsName != "" {
-		config, err := loadGlobalConfig()
-		if err == nil { // Only proceed if config loaded successfully
-			if ws, ok := config.Workspaces[wsName]; ok {
-				cogDir := filepath.Join(ws.Path, ".cog")
-				if _, err := os.Stat(cogDir); err != nil {
-					return "", "", fmt.Errorf("workspace '%s' at %s is invalid (no .cog/ directory)", wsName, ws.Path)
-				}
-				return ws.Path, "env", nil
-			}
-		}
-		// Fall through to tier 3 (local git detection) silently
-	}
-
-	// 3. Local git detection (if inside a workspace)
-	// Walk up through git roots — a submodule might have a bare .cog/ directory
-	// (with only .state/) but the real workspace is the parent repo with config/ and mem/.
-	if root, err := gitRoot(); err == nil {
-		if isRealWorkspace(root) {
-			return root, "local", nil
-		}
-		// If git root has a .cog/ but it's not a real workspace (e.g. submodule),
-		// check the parent directory's git root (the superproject).
-		parentDir := filepath.Dir(root)
-		if parentDir != root { // not filesystem root
-			// Walk up looking for a real workspace
-			for dir := parentDir; dir != "/" && dir != "."; dir = filepath.Dir(dir) {
-				if isRealWorkspace(dir) {
-					return dir, "local", nil
-				}
-			}
-		}
-	}
-
-	// 4. Fall back to global current-workspace
-	config, err := loadGlobalConfig()
-	if err != nil {
-		return "", "", fmt.Errorf("failed to load global config: %w", err)
-	}
-
-	if config.CurrentWorkspace != "" {
-		if ws, ok := config.Workspaces[config.CurrentWorkspace]; ok {
-			cogDir := filepath.Join(ws.Path, ".cog")
-			if _, err := os.Stat(cogDir); err != nil {
-				return "", "", fmt.Errorf("workspace '%s' at %s is invalid (no .cog/ directory)", config.CurrentWorkspace, ws.Path)
-			}
-			return ws.Path, "global", nil
-		}
-		// Current workspace is set but doesn't exist in config
-		return "", "", fmt.Errorf("current workspace '%s' not found in config", config.CurrentWorkspace)
-	}
-
-	return "", "", fmt.Errorf("no workspace found (run 'cog workspace add' or cd into a workspace)")
+	workspace.GitRoot = gitRoot
 }
 
 func gitTreeHash() (string, error) {
@@ -5828,6 +5750,8 @@ func main() {
 		code = cmdOCI(os.Args[2:])
 	case "service":
 		code = cmdService(os.Args[2:])
+	case "decompose":
+		code = cmdDecompose(os.Args[2:])
 	case "version", "-v", "--version":
 		code = cmdVersion()
 	case "info":

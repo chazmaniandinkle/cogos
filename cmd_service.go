@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"time"
@@ -78,21 +79,23 @@ func cmdServiceList(args []string) int {
 	runtime := NewDockerClient("")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	runtimeAvailable := runtime.Ping(ctx) == nil
 
-	fmt.Printf("%-20s %-40s %-12s %-8s %s\n", "NAME", "IMAGE", "STATUS", "HEALTH", "PORTS")
-	fmt.Printf("%-20s %-40s %-12s %-8s %s\n",
-		strings.Repeat("─", 20), strings.Repeat("─", 40),
+	fmt.Printf("%-20s %-8s %-40s %-12s %-8s %s\n", "NAME", "MODE", "IMAGE / COMMAND", "STATUS", "HEALTH", "PORTS")
+	fmt.Printf("%-20s %-8s %-40s %-12s %-8s %s\n",
+		strings.Repeat("─", 20), strings.Repeat("─", 8), strings.Repeat("─", 40),
 		strings.Repeat("─", 12), strings.Repeat("─", 8), strings.Repeat("─", 20))
 
 	for _, crd := range crds {
+		mode := serviceMode(&crd, runtimeAvailable)
 		status := "not running"
 		health := "—"
 		ports := formatPorts(crd.Spec.Ports)
-		image := truncateString(crd.Spec.Image, 40)
+		var target string
 
-		if runtimeAvailable {
+		switch mode {
+		case modeDocker:
+			target = truncateString(crd.Spec.Image, 40)
 			entry, _ := runtime.FindManagedContainer(ctx, crd.Metadata.Name)
 			if entry != nil {
 				status = entry.State
@@ -100,12 +103,20 @@ func cmdServiceList(args []string) int {
 					health = checkServiceHealth(ctx, &crd)
 				}
 			}
-		} else {
-			status = "runtime n/a"
+		case modeLocal:
+			target = truncateString(crd.Spec.Local.Command+" "+strings.Join(crd.Spec.Local.Args, " "), 40)
+			proc, _ := LocalStatus(root, crd.Metadata.Name)
+			if proc != nil && proc.Running {
+				status = fmt.Sprintf("pid %d", proc.PID)
+				health = checkServiceHealth(ctx, &crd)
+			}
+		case modeNone:
+			target = truncateString(crd.Spec.Image, 40)
+			status = "no executor"
 		}
 
-		fmt.Printf("%-20s %-40s %-12s %-8s %s\n",
-			crd.Metadata.Name, image, status, health, ports)
+		fmt.Printf("%-20s %-8s %-40s %-12s %-8s %s\n",
+			crd.Metadata.Name, mode, target, status, health, ports)
 	}
 
 	return 0
@@ -274,9 +285,34 @@ func cmdServiceStart(args []string) int {
 	runtime := NewDockerClient("")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	runtimeAvailable := runtime.Ping(ctx) == nil
 
-	if err := runtime.Ping(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: container runtime not available: %v\n", err)
+	// Dispatch to local runner for local-mode services.
+	if serviceMode(crd, runtimeAvailable) == modeLocal {
+		if proc, _ := LocalStatus(root, name); proc != nil && proc.Running {
+			fmt.Printf("Service %s is already running (pid %d)\n", name, proc.PID)
+			return 0
+		}
+		proc, err := LocalStart(root, crd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error starting local service: %v\n", err)
+			return 1
+		}
+		fmt.Printf("Started %s as pid %d (logs: %s)\n", name, proc.PID, proc.LogPath)
+		if crd.Spec.Health.Endpoint != "" && crd.Spec.Health.Port > 0 {
+			fmt.Printf("Waiting for health check (localhost:%d%s)...\n",
+				crd.Spec.Health.Port, crd.Spec.Health.Endpoint)
+			if err := waitForHealth(ctx, crd); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: health check did not pass: %v\n", err)
+			} else {
+				fmt.Println("Health check passed.")
+			}
+		}
+		return 0
+	}
+
+	if !runtimeAvailable {
+		fmt.Fprintf(os.Stderr, "Error: container runtime not available and no spec.local defined\n")
 		return 1
 	}
 
@@ -363,8 +399,8 @@ func cmdServiceStop(args []string) int {
 	}
 
 	name := args[0]
-	// Validate service exists
-	if _, err := LoadServiceCRD(root, name); err != nil {
+	crd, err := LoadServiceCRD(root, name)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
@@ -372,9 +408,25 @@ func cmdServiceStop(args []string) int {
 	runtime := NewDockerClient("")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	runtimeAvailable := runtime.Ping(ctx) == nil
 
-	if err := runtime.Ping(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: container runtime not available: %v\n", err)
+	if serviceMode(crd, runtimeAvailable) == modeLocal {
+		proc, _ := LocalStatus(root, name)
+		if proc == nil || !proc.Running {
+			fmt.Printf("Service %s is not running (local).\n", name)
+			return 0
+		}
+		fmt.Printf("Stopping %s (pid %d)...\n", name, proc.PID)
+		if err := LocalStop(root, name); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		fmt.Printf("Service %s stopped.\n", name)
+		return 0
+	}
+
+	if !runtimeAvailable {
+		fmt.Fprintf(os.Stderr, "Error: container runtime not available and no spec.local defined\n")
 		return 1
 	}
 
@@ -435,7 +487,8 @@ func cmdServiceLogs(args []string) int {
 	}
 
 	name := remaining[0]
-	if _, err := LoadServiceCRD(root, name); err != nil {
+	crd, err := LoadServiceCRD(root, name)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
@@ -444,6 +497,11 @@ func cmdServiceLogs(args []string) int {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	runtimeAvailable := runtime.Ping(ctx) == nil
+
+	if serviceMode(crd, runtimeAvailable) == modeLocal {
+		return tailLocalLog(localLogPath(root, name), *follow, *tail)
+	}
 
 	// Handle Ctrl-C gracefully
 	sigCh := make(chan os.Signal, 1)
@@ -457,8 +515,8 @@ func cmdServiceLogs(args []string) int {
 		}
 	}()
 
-	if err := runtime.Ping(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: container runtime not available: %v\n", err)
+	if !runtimeAvailable {
+		fmt.Fprintf(os.Stderr, "Error: container runtime not available\n")
 		return 1
 	}
 
@@ -607,6 +665,33 @@ func waitForHealth(ctx context.Context, crd *ServiceCRD) error {
 			}
 		}
 	}
+}
+
+// tailLocalLog shells out to `tail` for the local-service log file. Keeps
+// follow/tail semantics consistent with the docker path without reimplementing
+// them. Returns 0 on clean exit or 1 on unexpected error.
+func tailLocalLog(path string, follow bool, n string) int {
+	if _, err := os.Stat(path); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: no log file at %s\n", path)
+		return 1
+	}
+	args := []string{"-n", n}
+	if follow {
+		args = append(args, "-F")
+	}
+	args = append(args, path)
+	cmd := exec.Command("tail", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		// `tail -F` is cancelled by Ctrl-C via exit(130); don't surface as failure.
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 130 {
+			return 0
+		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // stripDockerLogHeaders removes the 8-byte Docker multiplexed stream headers

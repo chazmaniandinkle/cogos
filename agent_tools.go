@@ -13,17 +13,66 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/cogos-dev/cogos/internal/linkfeed"
 )
+
+// linkfeedHarnessAdapter adapts *AgentHarness to linkfeed.Harness.
+// The adapter flattens linkfeed's RegisterTool(name, description, params, fn)
+// surface into main's RegisterTool(ToolDefinition, ToolFunc) surface, so
+// linkfeed stays a leaf package that does not import main's types.
+type linkfeedHarnessAdapter struct{ h *AgentHarness }
+
+func (a linkfeedHarnessAdapter) RegisterTool(
+	name, description string,
+	parameters json.RawMessage,
+	fn func(ctx context.Context, args json.RawMessage) (json.RawMessage, error),
+) {
+	a.h.RegisterTool(ToolDefinition{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        name,
+			Description: description,
+			Parameters:  parameters,
+		},
+	}, ToolFunc(fn))
+}
+
+func (a linkfeedHarnessAdapter) GenerateJSON(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	return a.h.GenerateJSON(ctx, systemPrompt, userPrompt)
+}
 
 // RegisterCoreTools adds the standard kernel tools to the harness.
 // workspaceRoot is the absolute path to the .cog workspace.
 func RegisterCoreTools(h *AgentHarness, workspaceRoot string) {
+	// Read-only observation tools
 	h.RegisterTool(memorySearchDef(), newMemorySearchFunc(workspaceRoot))
 	h.RegisterTool(memoryReadDef(), newMemoryReadFunc(workspaceRoot))
-	h.RegisterTool(memoryWriteDef(), newMemoryWriteFunc(workspaceRoot))
 	h.RegisterTool(coherenceCheckDef(), newCoherenceCheckFunc(workspaceRoot))
-	h.RegisterTool(busEmitDef(), newBusEmitFunc(workspaceRoot))
 	h.RegisterTool(workspaceStatusDef(), newWorkspaceStatusFunc(workspaceRoot))
+
+	// Sanctioned no-op — lets the agent exit the tool loop cleanly
+	// when nothing warrants action.
+	RegisterWaitTool(h, workspaceRoot)
+
+	// Dashboard response — lets the metabolic cycle's agent reply to
+	// user_message events observed via agent_bus_inlet.go. Safe to
+	// register unconditionally: the tool returns a non-fatal error at
+	// invocation time if the dashboard inlet hasn't been installed.
+	RegisterRespondTool(h)
+
+	// Propose-only write tools (no direct memory modification)
+	RegisterProposalTools(h, workspaceRoot)
+
+	// Bus events (observable side-effects only)
+	h.RegisterTool(busEmitDef(), newBusEmitFunc(workspaceRoot))
+
+	// Link feed tools (Discord pull + enrichment)
+	linkfeed.RegisterLinkFeedTools(linkfeedHarnessAdapter{h: h}, workspaceRoot)
+
+	// NOTE: memory_write is deliberately excluded.
+	// The agent proposes changes via the propose tool; a human or
+	// cloud-tier agent authorizes them before they take effect.
 }
 
 // --- memory_search ---
@@ -164,7 +213,21 @@ func coherenceCheckDef() ToolDefinition {
 
 func newCoherenceCheckFunc(root string) ToolFunc {
 	return func(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
-		return runCogCommand(ctx, root, "coherence", "check")
+		result, err := runCogCommand(ctx, root, "coherence", "check")
+		if err != nil {
+			return result, err
+		}
+		// Truncate very large drift reports to prevent context window explosion.
+		// Full coherence output can be 600KB+ when many files are in drift.
+		const maxBytes = 4096
+		if len(result) > maxBytes {
+			truncated := string(result[:maxBytes])
+			return json.Marshal(map[string]string{
+				"output":    truncated,
+				"truncated": fmt.Sprintf("Output truncated from %d to %d bytes. Run `cog coherence check` for full report.", len(result), maxBytes),
+			})
+		}
+		return result, nil
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -373,6 +374,47 @@ func TestAgentHarness_DefaultMaxTurns(t *testing.T) {
 	})
 	if h.maxTurns != 10 {
 		t.Errorf("expected default maxTurns=10, got %d", h.maxTurns)
+	}
+}
+
+// --- Test: wait tool terminates the Execute loop after a single round-trip ---
+//
+// This is the structural fix for the justification-loop pathology: when the
+// model invokes `wait`, Execute returns cleanly without asking for another
+// turn. See cog://mem/semantic/research/cogos-vs-agent-corpus-comparison-2026-04-16
+// (Gap 1) for context.
+
+func TestAgentHarness_Execute_WaitTerminates(t *testing.T) {
+	var callCount atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		// Every call returns a wait tool call — if the loop doesn't terminate,
+		// this server gets hit more than once and the assertion below catches it.
+		resp := makeToolCallResponse("call_wait", "wait", `{"reason":"observation handled"}`)
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	h := NewAgentHarness(AgentHarnessConfig{
+		OllamaURL: server.URL,
+		Model:     "test",
+	})
+	RegisterWaitTool(h, "/tmp/unused-workspace-root")
+
+	result, err := h.Execute(context.Background(), "system", "observe quietly")
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("expected server to be called exactly once (loop should terminate on wait), got %d calls", got)
+	}
+	if !strings.Contains(result, "waited") {
+		t.Errorf("expected result to contain 'waited', got %q", result)
+	}
+	if !strings.Contains(result, "observation handled") {
+		t.Errorf("expected result to include the wait reason, got %q", result)
 	}
 }
 

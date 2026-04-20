@@ -566,13 +566,45 @@ func cmdServeForeground(port int) int {
 			defer reconciler.Stop()
 		}
 
+		// 7b. Install cycle-trace emitter (ADR-083). Wires the engine's
+		// TraceEmitter hook to the bus and stamps events with the active
+		// identity. Safe to call once; subsequent calls overwrite.
+		InstallTraceEmitter(server.busChat.manager, root)
+
+		// 7c. Install dashboard chat inlet. Subscribes in-process to
+		// bus_dashboard_chat and forwards user messages into the engine's
+		// external-event channel. process is nil here — this daemon does
+		// not own an *engine.Process; the chat path becomes live once a
+		// process is bound via RebindDashboardInlet. The outbound response
+		// bus is ensured now so the respond tool can publish immediately.
+		InstallDashboardInlet(server.busChat.manager, nil)
+
 		// 8. Homeostatic agent loop (E4B via Ollama, 30-min cycle)
 		agent := NewServeAgent(root)
 		agent.SetBus(server.busChat.manager)
+		server.agent = agent // expose to status API
 		if startErr := agent.Start(); startErr != nil {
 			log.Printf("[agent] failed to start: %v", startErr)
 		} else {
 			defer agent.Stop()
+		}
+
+		// 8b. Wake agent on non-system bus events
+		{
+			systemBusSet := map[string]bool{
+				"bus_chat_system_capabilities": true,
+				"bus_chat_http":                true,
+				"bus_agent_harness":            true,
+				"bus_index":                    true,
+				"decompose":                    true,
+			}
+			server.busChat.manager.AddEventHandler("agent-waker", func(busID string, block *CogBlock) {
+				if systemBusSet[busID] {
+					return
+				}
+				agent.Wake()
+			})
+			defer server.busChat.manager.RemoveEventHandler("agent-waker")
 		}
 
 		// 6b. Service health monitor: polls container health every 30s, emits bus events
@@ -763,6 +795,31 @@ func cmdServeForeground(port int) int {
 				kernel:  kernel,
 				busChat: server.busChat,
 			}
+		}
+	}
+
+	// 7c-bis. Install dashboard-chat inlet handler on each workspace's busChat
+	// manager as well. The primary workspace already shares server.busChat
+	// (handler registered above at step 7c), but non-primary workspaces each
+	// get their own newBusChat(), and HTTP POST routes to whichever workspace
+	// resolves from the request. Without this, events on non-primary-workspace
+	// busChat managers would write to disk but never invoke the in-process
+	// handler. Dedupe by manager pointer so we don't double-register.
+	{
+		seen := map[*busSessionManager]bool{}
+		if server.busChat != nil {
+			seen[server.busChat.manager] = true
+		}
+		for wsName, ws := range server.workspaces {
+			if ws == nil || ws.busChat == nil || ws.busChat.manager == nil {
+				continue
+			}
+			if seen[ws.busChat.manager] {
+				continue
+			}
+			seen[ws.busChat.manager] = true
+			InstallDashboardInlet(ws.busChat.manager, nil)
+			log.Printf("[dashboard-inlet] registered on workspace %q manager", wsName)
 		}
 	}
 

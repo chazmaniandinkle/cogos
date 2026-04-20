@@ -50,26 +50,52 @@ func (s *ServiceProvider) LoadConfig(root string) (any, error) {
 
 // ─── FetchLive ──────────────────────────────────────────────────────────────────
 
-// ServiceLiveState holds the runtime state of managed containers.
+// ServiceLiveState holds the runtime state of managed services across both
+// execution modes. `Available` reports whether the container runtime is up;
+// local-mode reconciliation works regardless.
 type ServiceLiveState struct {
-	Available  bool
+	Available  bool                      // container runtime reachable
 	Containers map[string]*ContainerInfo // keyed by service name
+	LocalProcs map[string]*LocalProcess  // keyed by service name
 }
 
-// FetchLive queries the Docker daemon for all cogos-managed containers.
+// FetchLive queries both the Docker daemon and local PID files for the
+// current live state of all services.
 func (s *ServiceProvider) FetchLive(ctx context.Context, config any) (any, error) {
 	s.mu.Lock()
 	if s.runtime == nil {
 		s.runtime = NewDockerClient("")
 	}
+	root := s.root
 	s.mu.Unlock()
 
 	live := &ServiceLiveState{
 		Containers: make(map[string]*ContainerInfo),
+		LocalProcs: make(map[string]*LocalProcess),
+	}
+
+	// Build a name→CRD lookup so ListLocalProcessesWithCRDs can adopt legacy
+	// PID files whose argv matches the current CRD's expected command. The
+	// reconcile harness passes the LoadConfig output through as `config`;
+	// when it's the expected shape we forward it, otherwise we fall back to
+	// the strict (non-adopting) scan.
+	var crdMap map[string]*ServiceCRD
+	if crds, ok := config.([]ServiceCRD); ok {
+		crdMap = make(map[string]*ServiceCRD, len(crds))
+		for i := range crds {
+			crdMap[crds[i].Metadata.Name] = &crds[i]
+		}
+	}
+
+	// Local processes are discoverable whether or not Docker is up.
+	if procs, err := ListLocalProcessesWithCRDs(root, crdMap); err == nil {
+		live.LocalProcs = procs
+	} else {
+		log.Printf("[service] warning: list local processes: %v", err)
 	}
 
 	if err := s.runtime.Ping(ctx); err != nil {
-		// Runtime not available — return empty live state
+		// Runtime not available — return with locals populated but no containers.
 		live.Available = false
 		return live, nil
 	}
@@ -96,9 +122,33 @@ func (s *ServiceProvider) FetchLive(ctx context.Context, config any) (any, error
 	return live, nil
 }
 
+// ─── Execution-mode selection ───────────────────────────────────────────────────
+
+// serviceMode returns the effective execution mode for a CRD given current
+// runtime availability. Docker is preferred when both an image is declared
+// and the runtime is reachable; local is the fallback. "none" indicates the
+// CRD cannot be executed in the current environment.
+const (
+	modeDocker = "docker"
+	modeLocal  = "local"
+	modeNone   = "none"
+)
+
+func serviceMode(crd *ServiceCRD, runtimeAvailable bool) string {
+	if crd.Spec.Image != "" && runtimeAvailable {
+		return modeDocker
+	}
+	if crd.Spec.Local != nil {
+		return modeLocal
+	}
+	return modeNone
+}
+
 // ─── ComputePlan ────────────────────────────────────────────────────────────────
 
-// ComputePlan compares declared CRDs against live container state.
+// ComputePlan compares declared CRDs against live state (containers + local
+// processes) and produces per-service create/update/skip/delete actions.
+// Each CRD resolves to exactly one mode; orphans in either mode get cleaned up.
 func (s *ServiceProvider) ComputePlan(config any, live any, state *ReconcileState) (*ReconcilePlan, error) {
 	crds := config.([]ServiceCRD)
 	liveState := live.(*ServiceLiveState)
@@ -110,17 +160,7 @@ func (s *ServiceProvider) ComputePlan(config any, live any, state *ReconcileStat
 	}
 
 	if !liveState.Available {
-		plan.Warnings = append(plan.Warnings, "container runtime not available — skipping all services")
-		for _, crd := range crds {
-			plan.Actions = append(plan.Actions, ReconcileAction{
-				Action:       ActionSkip,
-				ResourceType: "service",
-				Name:         crd.Metadata.Name,
-				Details:      map[string]any{"reason": "runtime not available"},
-			})
-			plan.Summary.Skipped++
-		}
-		return plan, nil
+		plan.Warnings = append(plan.Warnings, "container runtime not available — docker-mode services will be skipped")
 	}
 
 	// Sort CRDs by name for deterministic output
@@ -128,67 +168,61 @@ func (s *ServiceProvider) ComputePlan(config any, live any, state *ReconcileStat
 		return crds[i].Metadata.Name < crds[j].Metadata.Name
 	})
 
-	seen := make(map[string]bool)
+	seenContainer := make(map[string]bool)
+	seenLocal := make(map[string]bool)
 
 	for _, crd := range crds {
 		name := crd.Metadata.Name
-		seen[name] = true
-		info, exists := liveState.Containers[name]
+		mode := serviceMode(&crd, liveState.Available)
 
-		if !exists {
-			// Declared but no container
-			plan.Actions = append(plan.Actions, ReconcileAction{
-				Action:       ActionCreate,
-				ResourceType: "service",
-				Name:         name,
-				Details: map[string]any{
-					"reason": "no container found",
-					"image":  crd.Spec.Image,
-				},
-			})
-			plan.Summary.Creates++
-			continue
-		}
-
-		// Container exists — check for drift
-		drifted, reasons := detectServiceDrift(&crd, info)
-		if drifted {
-			plan.Actions = append(plan.Actions, ReconcileAction{
-				Action:       ActionUpdate,
-				ResourceType: "service",
-				Name:         name,
-				Details: map[string]any{
-					"reason":       "drift detected: " + joinReasons(reasons),
-					"container_id": info.ID[:12],
-				},
-			})
-			plan.Summary.Updates++
-		} else {
+		switch mode {
+		case modeDocker:
+			seenContainer[name] = true
+			s.planDockerService(plan, &crd, liveState.Containers[name])
+		case modeLocal:
+			seenLocal[name] = true
+			s.planLocalService(plan, &crd, liveState.LocalProcs[name])
+		case modeNone:
 			plan.Actions = append(plan.Actions, ReconcileAction{
 				Action:       ActionSkip,
 				ResourceType: "service",
 				Name:         name,
-				Details: map[string]any{
-					"reason":       "in sync",
-					"container_id": info.ID[:12],
-					"status":       info.State.Status,
-				},
+				Details:      map[string]any{"reason": "no image and no local spec (or runtime unavailable)"},
 			})
 			plan.Summary.Skipped++
 		}
 	}
 
-	// Check for orphaned managed containers (not in any CRD)
-	for name := range liveState.Containers {
-		if !seen[name] {
-			info := liveState.Containers[name]
+	// Orphaned managed containers (not declared by any CRD as docker-mode).
+	for name, info := range liveState.Containers {
+		if !seenContainer[name] {
 			plan.Actions = append(plan.Actions, ReconcileAction{
 				Action:       ActionDelete,
 				ResourceType: "service",
 				Name:         name,
 				Details: map[string]any{
-					"reason":       "no matching service CRD",
+					"reason":       "no matching service CRD (docker)",
 					"container_id": info.ID[:12],
+					"mode":         modeDocker,
+				},
+			})
+			plan.Summary.Deletes++
+		}
+	}
+
+	// Orphaned local processes — includes "declared CRD is docker-mode but
+	// a local process is running under the same name" (stale from a prior
+	// mode), which we want to stop.
+	for name, proc := range liveState.LocalProcs {
+		if !seenLocal[name] {
+			plan.Actions = append(plan.Actions, ReconcileAction{
+				Action:       ActionDelete,
+				ResourceType: "service",
+				Name:         name,
+				Details: map[string]any{
+					"reason": "no matching service CRD (local)",
+					"pid":    proc.PID,
+					"mode":   modeLocal,
 				},
 			})
 			plan.Summary.Deletes++
@@ -196,6 +230,97 @@ func (s *ServiceProvider) ComputePlan(config any, live any, state *ReconcileStat
 	}
 
 	return plan, nil
+}
+
+// planDockerService produces the action for a docker-mode CRD.
+func (s *ServiceProvider) planDockerService(plan *ReconcilePlan, crd *ServiceCRD, info *ContainerInfo) {
+	name := crd.Metadata.Name
+	if info == nil {
+		plan.Actions = append(plan.Actions, ReconcileAction{
+			Action:       ActionCreate,
+			ResourceType: "service",
+			Name:         name,
+			Details: map[string]any{
+				"reason": "no container found",
+				"image":  crd.Spec.Image,
+				"mode":   modeDocker,
+			},
+		})
+		plan.Summary.Creates++
+		return
+	}
+	drifted, reasons := detectServiceDrift(crd, info)
+	if drifted {
+		plan.Actions = append(plan.Actions, ReconcileAction{
+			Action:       ActionUpdate,
+			ResourceType: "service",
+			Name:         name,
+			Details: map[string]any{
+				"reason":       "drift detected: " + joinReasons(reasons),
+				"container_id": info.ID[:12],
+				"mode":         modeDocker,
+			},
+		})
+		plan.Summary.Updates++
+		return
+	}
+	plan.Actions = append(plan.Actions, ReconcileAction{
+		Action:       ActionSkip,
+		ResourceType: "service",
+		Name:         name,
+		Details: map[string]any{
+			"reason":       "in sync",
+			"container_id": info.ID[:12],
+			"status":       info.State.Status,
+			"mode":         modeDocker,
+		},
+	})
+	plan.Summary.Skipped++
+}
+
+// planLocalService produces the action for a local-mode CRD.
+func (s *ServiceProvider) planLocalService(plan *ReconcilePlan, crd *ServiceCRD, proc *LocalProcess) {
+	name := crd.Metadata.Name
+	if proc == nil || !proc.Running {
+		plan.Actions = append(plan.Actions, ReconcileAction{
+			Action:       ActionCreate,
+			ResourceType: "service",
+			Name:         name,
+			Details: map[string]any{
+				"reason": "no local process running",
+				"mode":   modeLocal,
+			},
+		})
+		plan.Summary.Creates++
+		return
+	}
+	// Drift: compare cmdHash of declared spec vs recorded spec.
+	expected := localCmdHash(crd.Spec.Local, resolveWorkdir(s.root, crd.Spec.Local))
+	if expected != proc.CmdHash {
+		plan.Actions = append(plan.Actions, ReconcileAction{
+			Action:       ActionUpdate,
+			ResourceType: "service",
+			Name:         name,
+			Details: map[string]any{
+				"reason": "declared spec differs from running cmd_hash",
+				"pid":    proc.PID,
+				"mode":   modeLocal,
+			},
+		})
+		plan.Summary.Updates++
+		return
+	}
+	plan.Actions = append(plan.Actions, ReconcileAction{
+		Action:       ActionSkip,
+		ResourceType: "service",
+		Name:         name,
+		Details: map[string]any{
+			"reason": "in sync",
+			"pid":    proc.PID,
+			"mode":   modeLocal,
+		},
+	})
+	plan.Summary.Skipped++
 }
 
 // detectServiceDrift compares a CRD against a live container.
@@ -259,12 +384,15 @@ func detectServiceDrift(crd *ServiceCRD, info *ContainerInfo) (bool, []string) {
 
 // ─── ApplyPlan ──────────────────────────────────────────────────────────────────
 
-// ApplyPlan executes planned service changes.
+// ApplyPlan executes planned service changes, dispatching per action to the
+// docker or local handler based on the `mode` detail key attached by the
+// planner.
 func (s *ServiceProvider) ApplyPlan(ctx context.Context, plan *ReconcilePlan) ([]ReconcileResult, error) {
 	s.mu.Lock()
 	if s.runtime == nil {
 		s.runtime = NewDockerClient("")
 	}
+	root := s.root
 	s.mu.Unlock()
 
 	var results []ReconcileResult
@@ -272,20 +400,84 @@ func (s *ServiceProvider) ApplyPlan(ctx context.Context, plan *ReconcilePlan) ([
 		if action.Action == ActionSkip {
 			continue
 		}
+		mode, _ := action.Details["mode"].(string)
+		if mode == "" {
+			mode = modeDocker // backward-compat default
+		}
 
-		switch action.Action {
-		case ActionCreate:
-			result := s.applyCreate(ctx, action.Name)
-			results = append(results, result)
-		case ActionUpdate:
-			result := s.applyUpdate(ctx, action.Name)
-			results = append(results, result)
-		case ActionDelete:
-			result := s.applyDelete(ctx, action.Name)
-			results = append(results, result)
+		switch mode {
+		case modeLocal:
+			results = append(results, s.applyLocal(root, action))
+		default:
+			results = append(results, s.applyDocker(ctx, action))
 		}
 	}
 	return results, nil
+}
+
+// applyDocker dispatches create/update/delete for docker-mode services.
+func (s *ServiceProvider) applyDocker(ctx context.Context, action ReconcileAction) ReconcileResult {
+	switch action.Action {
+	case ActionCreate:
+		return s.applyCreate(ctx, action.Name)
+	case ActionUpdate:
+		return s.applyUpdate(ctx, action.Name)
+	case ActionDelete:
+		return s.applyDelete(ctx, action.Name)
+	}
+	return ReconcileResult{Phase: "service", Action: string(action.Action), Name: action.Name, Status: ApplySkipped}
+}
+
+// applyLocal dispatches create/update/delete for local-mode services.
+func (s *ServiceProvider) applyLocal(root string, action ReconcileAction) ReconcileResult {
+	switch action.Action {
+	case ActionCreate:
+		return s.applyLocalCreate(root, action.Name)
+	case ActionUpdate:
+		// Stop then recreate; cheapest way to pick up new argv/env.
+		if err := LocalStop(root, action.Name); err != nil {
+			return ReconcileResult{
+				Phase: "service", Action: "update", Name: action.Name,
+				Status: ApplyFailed, Error: fmt.Sprintf("stop before update: %v", err),
+			}
+		}
+		result := s.applyLocalCreate(root, action.Name)
+		result.Action = "update"
+		return result
+	case ActionDelete:
+		if err := LocalStop(root, action.Name); err != nil {
+			return ReconcileResult{
+				Phase: "service", Action: "delete", Name: action.Name,
+				Status: ApplyFailed, Error: err.Error(),
+			}
+		}
+		return ReconcileResult{
+			Phase: "service", Action: "delete", Name: action.Name,
+			Status: ApplySucceeded,
+		}
+	}
+	return ReconcileResult{Phase: "service", Action: string(action.Action), Name: action.Name, Status: ApplySkipped}
+}
+
+func (s *ServiceProvider) applyLocalCreate(root, name string) ReconcileResult {
+	crd, err := LoadServiceCRD(root, name)
+	if err != nil {
+		return ReconcileResult{
+			Phase: "service", Action: "create", Name: name,
+			Status: ApplyFailed, Error: err.Error(),
+		}
+	}
+	proc, err := LocalStart(root, crd)
+	if err != nil {
+		return ReconcileResult{
+			Phase: "service", Action: "create", Name: name,
+			Status: ApplyFailed, Error: err.Error(),
+		}
+	}
+	return ReconcileResult{
+		Phase: "service", Action: "create", Name: name,
+		Status: ApplySucceeded, CreatedID: fmt.Sprintf("pid:%d", proc.PID),
+	}
 }
 
 func (s *ServiceProvider) applyCreate(ctx context.Context, name string) ReconcileResult {
@@ -434,6 +626,28 @@ func (s *ServiceProvider) BuildState(config any, live any, existing *ReconcileSt
 				"status":  info.State.Status,
 				"running": info.State.Running,
 				"health":  health,
+				"mode":    modeDocker,
+			},
+		}
+		state.Resources = append(state.Resources, resource)
+	}
+
+	for name, proc := range liveState.LocalProcs {
+		resource := ReconcileResource{
+			Address:       "service." + name,
+			Type:          "local",
+			Mode:          ModeManaged,
+			ExternalID:    fmt.Sprintf("pid:%d", proc.PID),
+			Name:          name,
+			LastRefreshed: nowISO(),
+			Attributes: map[string]any{
+				"pid":        proc.PID,
+				"started_at": proc.StartedAt,
+				"workdir":    proc.Workdir,
+				"cmd_hash":   proc.CmdHash,
+				"running":    proc.Running,
+				"log_path":   proc.LogPath,
+				"mode":       modeLocal,
 			},
 		}
 		state.Resources = append(state.Resources, resource)
@@ -473,18 +687,22 @@ func (s *ServiceProvider) Health() ResourceStatus {
 	runtime := NewDockerClient("")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	if err := runtime.Ping(ctx); err != nil {
-		return ResourceStatus{
-			Sync: SyncStatusUnknown, Health: HealthMissing, Operation: OperationIdle,
-			Message: "container runtime not available",
-		}
-	}
+	runtimeUp := runtime.Ping(ctx) == nil
 
 	down := 0
 	for _, crd := range crds {
-		entry, _ := runtime.FindManagedContainer(ctx, crd.Metadata.Name)
-		if entry == nil || entry.State != "running" {
+		switch serviceMode(&crd, runtimeUp) {
+		case modeDocker:
+			entry, _ := runtime.FindManagedContainer(ctx, crd.Metadata.Name)
+			if entry == nil || entry.State != "running" {
+				down++
+			}
+		case modeLocal:
+			proc, _ := LocalStatus(root, crd.Metadata.Name)
+			if proc == nil || !proc.Running {
+				down++
+			}
+		case modeNone:
 			down++
 		}
 	}
@@ -575,25 +793,30 @@ func (m *ServiceHealthMonitor) checkAndEmit() {
 		return
 	}
 
-	// Use a short context just for the ping check
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer pingCancel()
-
-	if err := m.runtime.Ping(pingCtx); err != nil {
-		return
-	}
+	runtimeUp := m.runtime.Ping(pingCtx) == nil
 
 	for _, crd := range crds {
-		// Per-service timeout so one slow service doesn't starve the rest
 		svcCtx, svcCancel := context.WithTimeout(context.Background(), 10*time.Second)
 
-		entry, _ := m.runtime.FindManagedContainer(svcCtx, crd.Metadata.Name)
 		status := "not_running"
 		health := "unknown"
+		mode := serviceMode(&crd, runtimeUp)
 
-		if entry != nil {
-			status = entry.State
-			if entry.State == "running" {
+		switch mode {
+		case modeDocker:
+			entry, _ := m.runtime.FindManagedContainer(svcCtx, crd.Metadata.Name)
+			if entry != nil {
+				status = entry.State
+				if entry.State == "running" {
+					health = checkServiceHealth(svcCtx, &crd)
+				}
+			}
+		case modeLocal:
+			proc, _ := LocalStatus(m.root, crd.Metadata.Name)
+			if proc != nil && proc.Running {
+				status = "running"
 				health = checkServiceHealth(svcCtx, &crd)
 			}
 		}
@@ -605,6 +828,7 @@ func (m *ServiceHealthMonitor) checkAndEmit() {
 				"status":  status,
 				"health":  health,
 				"image":   crd.Spec.Image,
+				"mode":    mode,
 			}
 			if _, err := m.mgr.appendBusEvent(serviceHealthBusID, BlockServiceHealth, "kernel:cogos", payload); err != nil {
 				log.Printf("[svc-health] emit event for %s: %v", crd.Metadata.Name, err)
