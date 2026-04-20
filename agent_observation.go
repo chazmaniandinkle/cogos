@@ -312,3 +312,31 @@ func firstUserMessageSessionID(pending []pendingUserMsg) string {
 	}
 	return ""
 }
+
+// uniqueUserMessageSessionIDs returns the distinct session_ids observed across
+// the pending queue, in first-seen order. Messages with an empty session_id
+// collapse into a single "" entry that publishers interpret as a broadcast.
+//
+// Used by the cycle's reply paths (respond tool + auto-fallback) to fan out a
+// single agent response to every originating session when drainPendingUserMessages
+// returned messages from multiple tabs/clients. Without this fan-out, a cycle
+// that consumed N messages from N different sessions would only reply on one
+// session (whichever was first), leaving the others silently waiting.
+//
+// Returns nil when pending is empty so callers can distinguish "no reply owed"
+// from "broadcast reply owed".
+func uniqueUserMessageSessionIDs(pending []pendingUserMsg) []string {
+	if len(pending) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(pending))
+	out := make([]string, 0, len(pending))
+	for _, m := range pending {
+		if seen[m.SessionID] {
+			continue
+		}
+		seen[m.SessionID] = true
+		out = append(out, m.SessionID)
+	}
+	return out
+}

@@ -3,11 +3,14 @@
 //
 // These tests do NOT spawn real processes; they exercise the unit logic of
 // verifyOwnership via the psLookup seam and localCmdHash via direct calls.
+// The adoption test uses os.Getpid() so processAlive() returns true without
+// fork/exec gymnastics, and feeds the expected argv through the psLookup seam.
 
 package main
 
 import (
 	"errors"
+	"os"
 	"runtime"
 	"testing"
 )
@@ -134,6 +137,181 @@ func TestVerifyOwnership(t *testing.T) {
 			})
 		})
 	}
+}
+
+// legacyPIDFile is the on-disk shape older kernel builds wrote before we
+// started recording Cmd/Args on LocalProcess. Emulating it in tests lets us
+// exercise the adoption path without a migration dance.
+func writeLegacyPIDFile(t *testing.T, root, name string, pid int) {
+	t.Helper()
+	legacy := &LocalProcess{
+		Name:      name,
+		PID:       pid,
+		StartedAt: "2026-01-01T00:00:00Z",
+		CmdHash:   "legacy-hash",
+		Workdir:   root,
+		LogPath:   localLogPath(root, name),
+		// Cmd and Args intentionally empty — this is what older PID files
+		// on disk look like, and what LocalStatusWithCRD must handle.
+	}
+	if err := writeLocalProcess(root, legacy); err != nil {
+		t.Fatalf("write legacy PID file: %v", err)
+	}
+}
+
+// TestLocalStatusWithCRD_AdoptsLegacyPIDFile covers the in-place upgrade
+// recovery path: older kernel wrote a PID file without Cmd/Args, the service
+// is still running, and the current kernel must adopt it — not clear the PID
+// file and start a duplicate alongside the live service.
+//
+// The test uses os.Getpid() so processAlive() returns true without spawning,
+// and routes the ps argv lookup through the psLookup seam so the assertion is
+// hermetic (no dependency on what `ps -p $OS_PID -o args=` actually emits).
+func TestLocalStatusWithCRD_AdoptsLegacyPIDFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("adoption path uses ps, which isn't the production path on windows")
+	}
+
+	root := t.TempDir()
+	name := "myservice"
+	pid := os.Getpid() // always alive and owned by this process
+	writeLegacyPIDFile(t, root, name, pid)
+
+	crd := &ServiceCRD{
+		Metadata: ServiceCRDMeta{Name: name},
+		Spec: ServiceCRDSpec{
+			Local: &ServiceLocal{
+				Command: "/usr/bin/python3",
+				Args:    []string{"server.py", "--port", "9090"},
+			},
+		},
+	}
+	expectedArgv := "/usr/bin/python3 server.py --port 9090"
+
+	withPSLookup(func(lookupPID int) (string, error) {
+		if lookupPID != pid {
+			t.Fatalf("ps consulted for unexpected pid %d (want %d)", lookupPID, pid)
+		}
+		return expectedArgv, nil
+	}, func() {
+		p, err := LocalStatusWithCRD(root, name, crd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if p == nil {
+			t.Fatalf("expected non-nil LocalProcess after adoption")
+		}
+		if !p.Running {
+			t.Errorf("Running = false, want true after adoption")
+		}
+		if p.Cmd != "/usr/bin/python3" {
+			t.Errorf("returned Cmd = %q, want /usr/bin/python3 (post-adoption)", p.Cmd)
+		}
+		want := []string{"server.py", "--port", "9090"}
+		if len(p.Args) != len(want) {
+			t.Fatalf("Args len = %d, want %d (%v)", len(p.Args), len(want), p.Args)
+		}
+		for i := range want {
+			if p.Args[i] != want[i] {
+				t.Errorf("Args[%d] = %q, want %q", i, p.Args[i], want[i])
+			}
+		}
+	})
+
+	// Verify the PID file was rewritten with the recorded cmd+args so
+	// subsequent calls take the strict fast path and no longer need the CRD.
+	rewritten, err := readLocalProcess(root, name)
+	if err != nil {
+		t.Fatalf("read rewritten PID file: %v", err)
+	}
+	if rewritten == nil {
+		t.Fatalf("PID file was cleared instead of rewritten")
+	}
+	if rewritten.Cmd != "/usr/bin/python3" {
+		t.Errorf("rewritten Cmd = %q, want /usr/bin/python3", rewritten.Cmd)
+	}
+	if len(rewritten.Args) != 3 {
+		t.Errorf("rewritten Args = %v, want 3 elements", rewritten.Args)
+	}
+}
+
+// Negative case: legacy PID file + CRD whose expected argv does NOT match the
+// live process. Must clear the PID file (old safe-default) — adopting a
+// mismatched process would let a crashed-and-PID-reused scenario slip through.
+func TestLocalStatusWithCRD_ClearsLegacyPIDOnArgvMismatch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("adoption path uses ps, which isn't the production path on windows")
+	}
+
+	root := t.TempDir()
+	name := "mismatched"
+	pid := os.Getpid()
+	writeLegacyPIDFile(t, root, name, pid)
+
+	crd := &ServiceCRD{
+		Metadata: ServiceCRDMeta{Name: name},
+		Spec: ServiceCRDSpec{
+			Local: &ServiceLocal{
+				Command: "/usr/bin/python3",
+				Args:    []string{"server.py"},
+			},
+		},
+	}
+
+	withPSLookup(func(lookupPID int) (string, error) {
+		// Live process is some unrelated shell — definitely not our service.
+		return "-zsh", nil
+	}, func() {
+		p, err := LocalStatusWithCRD(root, name, crd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if p == nil {
+			t.Fatalf("readLocalProcess should have returned the pre-clear struct")
+		}
+		if p.Running {
+			t.Errorf("Running = true, want false (argv mismatch must not adopt)")
+		}
+	})
+
+	// PID file must be gone so the next reconcile creates a fresh process.
+	if _, statErr := os.Stat(localPIDPath(root, name)); !os.IsNotExist(statErr) {
+		t.Errorf("legacy PID file should have been cleared (argv mismatch); stat err=%v", statErr)
+	}
+}
+
+// Legacy PID file + no CRD → preserves original strict behavior (clear).
+func TestLocalStatusWithCRD_NilCRDClearsLegacyPID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("adoption path uses ps, which isn't the production path on windows")
+	}
+
+	root := t.TempDir()
+	name := "nocrd"
+	pid := os.Getpid()
+	writeLegacyPIDFile(t, root, name, pid)
+
+	// psLookup must NOT be consulted at all — without a CRD we can't form an
+	// expected argv, so there's nothing to compare. Fail loudly if called.
+	withPSLookup(func(lookupPID int) (string, error) {
+		t.Fatalf("ps should not be consulted when crd is nil")
+		return "", nil
+	}, func() {
+		p, err := LocalStatusWithCRD(root, name, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if p != nil && p.Running {
+			t.Errorf("Running = true, want false (no CRD must clear legacy)")
+		}
+	})
+
+	if _, statErr := os.Stat(localPIDPath(root, name)); !os.IsNotExist(statErr) {
+		t.Errorf("legacy PID file should have been cleared when CRD is nil; stat err=%v", statErr)
+	}
+
+	// Unused import guard: errors used implicitly via withPSLookup/psLookup stubs.
+	_ = errors.New("")
 }
 
 func TestLocalCmdHashIncludesVenv(t *testing.T) {

@@ -35,6 +35,12 @@ var errDashboardNotInstalled = errors.New("dashboard inlet not installed: call I
 // without plumbing state through the harness registry.
 var respondInvokeCount uint64
 
+// respondPublish is the seam used by the respond tool to emit a reply. Tests
+// swap this to capture fan-out without standing up a live bus manager;
+// production points it at the bus-publishing implementation. Must be called
+// per-session during fan-out so multi-session cycles reach every recipient.
+var respondPublish = publishDashboardResponse
+
 // respondInvokeSnapshot returns the current respond-call counter. Pair with a
 // later check `respondInvokedSince(snapshot)` around the Execute call.
 func respondInvokeSnapshot() uint64 {
@@ -107,25 +113,55 @@ func newRespondFunc() ToolFunc {
 			})
 		}
 
-		// sessionIDFromContext returns "" when the cycle isn't replying to a
-		// dashboard turn — publishDashboardResponse omits the field in that
-		// case, preserving the legacy broadcast behavior.
-		n, err := publishDashboardResponse(p.Text, p.Reasoning, sessionIDFromContext(ctx))
-		if err != nil {
+		// Fan out across every session_id observed on the cycle's pending
+		// queue. A cycle that drained N messages from N different tabs owes
+		// each of them a reply — without this loop, only the first session
+		// would ever hear back and the rest would wait forever.
+		//
+		// sessionIDsFromContext returns nil when the cycle wasn't wired for
+		// fan-out (single-message cycles, non-dashboard calls, tests); we
+		// fall back to the legacy single-id path and let publishDashboardResponse
+		// omit the field when the id is empty (broadcast).
+		sessionIDs := sessionIDsFromContext(ctx)
+		if len(sessionIDs) == 0 {
+			sessionIDs = []string{sessionIDFromContext(ctx)}
+		}
+
+		var (
+			totalBytes int
+			firstErr   error
+			anySuccess bool
+		)
+		for _, sid := range sessionIDs {
+			n, err := respondPublish(p.Text, p.Reasoning, sid)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			anySuccess = true
+			totalBytes += n
+		}
+
+		if !anySuccess {
+			// All publishes failed — surface the first error and do NOT bump
+			// the invocation counter so the auto-fallback still fires.
 			return json.Marshal(map[string]interface{}{
 				"ok":    false,
-				"error": err.Error(),
+				"error": firstErr.Error(),
 			})
 		}
 
-		// Increment the invocation counter so the agent cycle can dedup its
-		// auto-fallback publisher. Only on success — a failed publish should
-		// not suppress the fallback.
+		// At least one publish landed. Bump the counter exactly once per
+		// respond-tool invocation so the auto-fallback dedups correctly —
+		// N fan-out publishes still count as one tool call.
 		atomic.AddUint64(&respondInvokeCount, 1)
 
 		return json.Marshal(map[string]interface{}{
-			"ok":    true,
-			"bytes": n,
+			"ok":         true,
+			"bytes":      totalBytes,
+			"recipients": len(sessionIDs),
 		})
 	}
 }

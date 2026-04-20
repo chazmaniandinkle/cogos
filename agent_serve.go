@@ -648,15 +648,27 @@ func ensureUserTurnReply(
 	if pubText == "" {
 		return
 	}
-	sessionID := firstUserMessageSessionID(pendingMsgs)
+	// Fan out across every unique session_id observed on the pending queue.
+	// One reply per distinct session so each tab/client that sent a message
+	// sees the response — not just whichever happened to be first. See the
+	// Codex re-review comment on PR #3 for the full rationale.
+	sessionIDs := uniqueUserMessageSessionIDs(pendingMsgs)
+	if len(sessionIDs) == 0 {
+		// Shouldn't happen given the len(pendingMsgs)==0 early-return above,
+		// but belt-and-braces: fall back to a single broadcast so the user
+		// isn't silently dropped.
+		sessionIDs = []string{""}
+	}
 
-	go func(text, reason, sid string) {
-		if _, err := publishUserTurnReply(text, reason, sid); err != nil {
-			log.Printf("[dashboard-inlet] auto-fallback publish failed: %v", err)
-			return
-		}
-		log.Printf("[dashboard-inlet] auto-fallback published agent response (%d chars, session=%q) on bus_dashboard_response", len(text), sid)
-	}(pubText, reasoning, sessionID)
+	for _, sid := range sessionIDs {
+		go func(text, reason, sid string) {
+			if _, err := publishUserTurnReply(text, reason, sid); err != nil {
+				log.Printf("[dashboard-inlet] auto-fallback publish failed (session=%q): %v", sid, err)
+				return
+			}
+			log.Printf("[dashboard-inlet] auto-fallback published agent response (%d chars, session=%q) on bus_dashboard_response", len(text), sid)
+		}(pubText, reasoning, sid)
+	}
 }
 
 // runCycle executes a single observe-assess-execute pass.
@@ -686,15 +698,22 @@ func (sa *ServeAgent) runCycle(ctx context.Context) string {
 		log.Printf("[agent] cycle %s: observing %d pending user message(s)", cycleID, len(pendingMsgs))
 	}
 
-	// Stamp ctx with the originating session_id (first pending message) so
-	// the respond tool can tag its reply with the correct session and Mod³
-	// can route it back to the originating client instead of broadcasting.
-	// Multi-session interleaving in a single cycle is rare; if it happens,
-	// the first session wins for tool-tagging and the auto-fallback will
-	// publish per-session replies (see ensureUserTurnReply below).
-	turnSessionID := firstUserMessageSessionID(pendingMsgs)
-	if turnSessionID != "" {
-		ctx = WithSessionID(ctx, turnSessionID)
+	// Stamp ctx with the originating session_ids so downstream publishers can
+	// route replies back to every originating client/tab — not just the first.
+	// Two keys land on ctx:
+	//   - WithSessionIDs: the de-duped fan-out list (used by respond tool +
+	//     auto-fallback to publish one reply per unique session).
+	//   - WithSessionID: the first session_id, preserved for legacy readers
+	//     that only consult the single-id key.
+	// Multi-session interleaving happens when multiple tabs/clients post
+	// messages between reconcile ticks; without fan-out, only one tab sees
+	// the reply and the rest wait forever (the BLOCKER Codex flagged).
+	turnSessionIDs := uniqueUserMessageSessionIDs(pendingMsgs)
+	if len(turnSessionIDs) > 0 {
+		ctx = WithSessionIDs(ctx, turnSessionIDs)
+		if turnSessionIDs[0] != "" {
+			ctx = WithSessionID(ctx, turnSessionIDs[0])
+		}
 	}
 
 	// Cheap checks gate: skip model call if nothing changed. Pending user

@@ -78,7 +78,7 @@ func TestEnsureUserTurnReply_PublishesOnCycleError(t *testing.T) {
 	withSink(sink, func() {
 		ensureUserTurnReply(
 			userTurn("hello", "sess-A"),
-			0, // respondSnap — respond was never called
+			respondInvokeSnapshot(), // fresh snapshot — respond must not appear to have landed
 			errors.New("ollama: context deadline exceeded"),
 			nil, // assessment is nil when assess errored
 			"",
@@ -102,7 +102,7 @@ func TestEnsureUserTurnReply_PublishesExecuteResult(t *testing.T) {
 	withSink(sink, func() {
 		ensureUserTurnReply(
 			userTurn("hi", "sess-B"),
-			0,
+			respondInvokeSnapshot(),
 			nil,
 			&Assessment{Action: "execute", Reason: "process inbox"},
 			"   I processed 3 items.   ",
@@ -122,7 +122,7 @@ func TestEnsureUserTurnReply_PublishesEmptyExecuteWithSleep(t *testing.T) {
 	withSink(sink, func() {
 		ensureUserTurnReply(
 			userTurn("hey", "sess-C"),
-			0,
+			respondInvokeSnapshot(),
 			nil,
 			&Assessment{Action: "sleep", Reason: "nothing to do"},
 			"", // sleep skips Execute → empty result
@@ -140,7 +140,7 @@ func TestEnsureUserTurnReply_PublishesEmptyExecuteWithSleep(t *testing.T) {
 func TestEnsureUserTurnReply_NoUserTurn_NoPublish(t *testing.T) {
 	sink := newCaptureSink()
 	withSink(sink, func() {
-		ensureUserTurnReply(nil, 0, nil, &Assessment{Action: "sleep"}, "")
+		ensureUserTurnReply(nil, respondInvokeSnapshot(), nil, &Assessment{Action: "sleep"}, "")
 		// Tiny grace period in case a goroutine got scheduled.
 		select {
 		case <-sink.done:
@@ -173,5 +173,200 @@ func TestEnsureUserTurnReply_RespondAlreadyInvoked_NoPublish(t *testing.T) {
 		case <-time.After(50 * time.Millisecond):
 		}
 	})
+}
+
+// waitN blocks until n publish calls have landed or the timeout expires.
+// Returns the captured calls (stable order not guaranteed since they race).
+func (c *captureSink) waitN(t *testing.T, n int) []capturedReply {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for c.callCount() < n {
+		select {
+		case <-c.done:
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d publishes; captured %d", n, c.callCount())
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]capturedReply, len(c.calls))
+	copy(out, c.calls)
+	return out
+}
+
+// sessionIDsOf extracts the session_id field from a list of captured replies.
+// Used for set-comparison assertions that don't depend on goroutine order.
+func sessionIDsOf(calls []capturedReply) []string {
+	out := make([]string, len(calls))
+	for i, c := range calls {
+		out[i] = c.SessionID
+	}
+	return out
+}
+
+// sameStringSet returns true if got and want contain the same strings,
+// regardless of ordering. Used to assert fan-out recipients without being
+// sensitive to which goroutine happened to land first.
+func sameStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	gotMap := make(map[string]int, len(got))
+	for _, s := range got {
+		gotMap[s]++
+	}
+	for _, s := range want {
+		if gotMap[s] == 0 {
+			return false
+		}
+		gotMap[s]--
+	}
+	return true
+}
+
+// TestEnsureUserTurnReply_FanOutTwoSessions: cycle drained two messages from
+// two different sessions and the agent emitted ONE response (executeResult).
+// Contract: one publish per unique session_id, same payload.
+func TestEnsureUserTurnReply_FanOutTwoSessions(t *testing.T) {
+	sink := newCaptureSink()
+	withSink(sink, func() {
+		pending := []pendingUserMsg{
+			{Text: "from A", SessionID: "sess-A", Ts: time.Now()},
+			{Text: "from B", SessionID: "sess-B", Ts: time.Now()},
+		}
+		ensureUserTurnReply(
+			pending,
+			respondInvokeSnapshot(),
+			nil,
+			&Assessment{Action: "execute", Reason: "ok"},
+			"shared answer",
+		)
+		calls := sink.waitN(t, 2)
+		if !sameStringSet(sessionIDsOf(calls), []string{"sess-A", "sess-B"}) {
+			t.Errorf("recipients = %v, want {sess-A, sess-B}", sessionIDsOf(calls))
+		}
+		for _, c := range calls {
+			if c.Text != "shared answer" {
+				t.Errorf("text = %q, want %q (payload should be identical across sessions)", c.Text, "shared answer")
+			}
+		}
+	})
+}
+
+// TestEnsureUserTurnReply_FanOutSameSessionCollapses: two messages from the
+// same session collapse to one publish. Guards against N-messages-N-replies
+// regression when a single tab sends multiple messages in one cycle.
+func TestEnsureUserTurnReply_FanOutSameSessionCollapses(t *testing.T) {
+	sink := newCaptureSink()
+	withSink(sink, func() {
+		pending := []pendingUserMsg{
+			{Text: "msg 1", SessionID: "sess-X", Ts: time.Now()},
+			{Text: "msg 2", SessionID: "sess-X", Ts: time.Now()},
+		}
+		ensureUserTurnReply(
+			pending,
+			respondInvokeSnapshot(),
+			nil,
+			&Assessment{Action: "execute", Reason: "ok"},
+			"ack",
+		)
+		// Wait for the one expected call, then confirm no second arrives.
+		got := sink.waitOne(t)
+		if got.SessionID != "sess-X" {
+			t.Errorf("session_id = %q, want sess-X", got.SessionID)
+		}
+		select {
+		case <-sink.done:
+			t.Fatalf("unexpected second publish; calls=%d", sink.callCount())
+		case <-time.After(50 * time.Millisecond):
+		}
+	})
+}
+
+// TestEnsureUserTurnReply_FanOutErrorMultiSession: cycle errored after draining
+// messages from two sessions. Every session must still receive the failure
+// notice — silence on one tab would be the original BLOCKER regression.
+func TestEnsureUserTurnReply_FanOutErrorMultiSession(t *testing.T) {
+	sink := newCaptureSink()
+	withSink(sink, func() {
+		pending := []pendingUserMsg{
+			{Text: "A", SessionID: "sess-A", Ts: time.Now()},
+			{Text: "B", SessionID: "sess-B", Ts: time.Now()},
+		}
+		ensureUserTurnReply(
+			pending,
+			respondInvokeSnapshot(),
+			errors.New("ollama: deadline"),
+			nil,
+			"",
+		)
+		calls := sink.waitN(t, 2)
+		if !sameStringSet(sessionIDsOf(calls), []string{"sess-A", "sess-B"}) {
+			t.Errorf("recipients = %v, want {sess-A, sess-B}", sessionIDsOf(calls))
+		}
+		for _, c := range calls {
+			if !strings.Contains(c.Text, "cycle failed") {
+				t.Errorf("reply text should mention cycle failure; got %q", c.Text)
+			}
+		}
+	})
+}
+
+// TestUniqueUserMessageSessionIDs covers the ordering + dedup + empty-id
+// contract that the fan-out loop depends on.
+func TestUniqueUserMessageSessionIDs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []pendingUserMsg
+		want []string
+	}{
+		{
+			name: "nil input",
+			in:   nil,
+			want: nil,
+		},
+		{
+			name: "single session preserved",
+			in:   []pendingUserMsg{{SessionID: "a"}},
+			want: []string{"a"},
+		},
+		{
+			name: "duplicates collapse, first-seen order preserved",
+			in: []pendingUserMsg{
+				{SessionID: "a"},
+				{SessionID: "b"},
+				{SessionID: "a"},
+				{SessionID: "c"},
+			},
+			want: []string{"a", "b", "c"},
+		},
+		{
+			name: "empty id collapses to one broadcast entry",
+			in:   []pendingUserMsg{{SessionID: ""}, {SessionID: ""}},
+			want: []string{""},
+		},
+		{
+			name: "mixed empty + named",
+			in: []pendingUserMsg{
+				{SessionID: ""},
+				{SessionID: "a"},
+				{SessionID: ""},
+			},
+			want: []string{"", "a"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := uniqueUserMessageSessionIDs(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("len=%d, want %d (got=%v)", len(got), len(tc.want), got)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
 }
 

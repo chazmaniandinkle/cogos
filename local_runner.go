@@ -113,6 +113,21 @@ func resolveWorkdir(root string, local *ServiceLocal) string {
 	return filepath.Join(root, local.Workdir)
 }
 
+// resolveLocalCommand returns the executable path LocalStart would actually
+// invoke for the given CRD — post-venv lookup. Shared with LocalStatusWithCRD
+// so adoption of a legacy PID file compares the *same* argv the supervisor
+// would produce on a fresh start. Extracted to keep both call sites in sync.
+func resolveLocalCommand(root string, local *ServiceLocal) string {
+	command := local.Command
+	if venv := resolveVenv(root, local); venv != "" && !filepath.IsAbs(command) {
+		candidate := filepath.Join(venv, "bin", command)
+		if _, err := os.Stat(candidate); err == nil {
+			command = candidate
+		}
+	}
+	return command
+}
+
 // resolveVenv returns the absolute venv path (or empty string).
 func resolveVenv(root string, local *ServiceLocal) string {
 	if local.Venv == "" {
@@ -281,7 +296,28 @@ func verifyOwnership(pid int, expectedCmd string, expectedArgs []string) (bool, 
 //
 // Stale PID files (dead process or argv mismatch) are cleaned up
 // automatically so the next reconcile treats this as a create.
+//
+// This form has no CRD context, so legacy PID files (written before Cmd/Args
+// were recorded) cannot be adopted — they get cleared. Callers that *do* have
+// the CRD in hand should use LocalStatusWithCRD instead: it falls back to
+// re-deriving the expected argv from the CRD and adopting the live process
+// when it matches. Used by FetchLive during reconcile so in-place kernel
+// upgrades don't start a duplicate alongside an already-running service.
 func LocalStatus(root, name string) (*LocalProcess, error) {
+	return LocalStatusWithCRD(root, name, nil)
+}
+
+// LocalStatusWithCRD returns the tracked process for the named service, with
+// an optional CRD used to recover from legacy PID files. Preserves all the
+// strict-match guarantees of LocalStatus; only the "empty recorded cmd" case
+// is changed: when a CRD is supplied and the live process's argv matches what
+// the CRD would resolve to, the runner adopts the process (writes a fresh PID
+// file with the recorded cmd/args) so subsequent calls use the fast path.
+//
+// Callers without the CRD (e.g. raw `cog service status` dumps) should keep
+// using LocalStatus — adoption is reconciliation-time behavior, not a general
+// status-read concern.
+func LocalStatusWithCRD(root, name string, crd *ServiceCRD) (*LocalProcess, error) {
 	p, err := readLocalProcess(root, name)
 	if err != nil || p == nil {
 		return p, err
@@ -290,14 +326,55 @@ func LocalStatus(root, name string) (*LocalProcess, error) {
 		removeLocalPID(root, name)
 		return p, nil
 	}
-	owns, _ := verifyOwnership(p.PID, p.Cmd, p.Args)
-	if !owns {
-		log.Printf("[local-runner] warn: PID %d for service %s does not match recorded argv (cmd=%q); clearing stale PID file",
-			p.PID, name, p.Cmd)
+
+	// Fast path: PID file has a recorded argv → verify against live argv.
+	if p.Cmd != "" {
+		owns, _ := verifyOwnership(p.PID, p.Cmd, p.Args)
+		if !owns {
+			log.Printf("[local-runner] warn: PID %d for service %s does not match recorded argv (cmd=%q); clearing stale PID file",
+				p.PID, name, p.Cmd)
+			removeLocalPID(root, name)
+			return p, nil
+		}
+		p.Running = true
+		return p, nil
+	}
+
+	// Legacy PID file (empty Cmd) — written before LocalProcess tracked argv.
+	// Without a CRD we can't verify ownership, so fall back to the old strict
+	// refusal: clear it and let the reconciler recreate the service.
+	if crd == nil || crd.Spec.Local == nil {
+		log.Printf("[local-runner] warn: PID %d for service %s has no recorded argv and no CRD available for adoption; clearing stale PID file",
+			p.PID, name)
 		removeLocalPID(root, name)
 		return p, nil
 	}
+
+	// Adoption path: re-derive the expected argv from the CRD and compare
+	// against the live process. If it matches, the PID really is ours — we
+	// just didn't know it because the PID file predates argv tracking. Write
+	// a fresh PID file with the resolved cmd so future calls take the fast
+	// path above (no CRD needed).
+	expectedCmd := resolveLocalCommand(root, crd.Spec.Local)
+	expectedArgs := crd.Spec.Local.Args
+	owns, _ := verifyOwnership(p.PID, expectedCmd, expectedArgs)
+	if !owns {
+		log.Printf("[local-runner] warn: PID %d for service %s has legacy PID file and live argv does not match CRD (expected cmd=%q); clearing stale PID file",
+			p.PID, name, expectedCmd)
+		removeLocalPID(root, name)
+		return p, nil
+	}
+
+	log.Printf("[local-runner] adopting legacy PID %d for service %s (argv matches CRD cmd=%q)",
+		p.PID, name, expectedCmd)
+	p.Cmd = expectedCmd
+	p.Args = append([]string(nil), expectedArgs...)
 	p.Running = true
+	if err := writeLocalProcess(root, p); err != nil {
+		// Non-fatal — next reconcile will try again. Return Running=true
+		// regardless since the live process is genuinely ours.
+		log.Printf("[local-runner] warn: adoption succeeded but PID file rewrite failed for %s: %v", name, err)
+	}
 	return p, nil
 }
 
@@ -329,17 +406,10 @@ func LocalStart(root string, crd *ServiceCRD) (*LocalProcess, error) {
 
 	fmt.Fprintf(logFile, "\n=== %s started at %s ===\n", crd.Metadata.Name, nowISO())
 
-	// Resolve command against the venv's bin/ when non-absolute. Go's
-	// exec.Command uses the parent process PATH at lookup time, which
-	// doesn't include the venv we prepend in buildLocalEnv — so we resolve
-	// manually to keep `command: python3` working under a venv.
-	command := local.Command
-	if venv := resolveVenv(root, local); venv != "" && !filepath.IsAbs(command) {
-		candidate := filepath.Join(venv, "bin", command)
-		if _, err := os.Stat(candidate); err == nil {
-			command = candidate
-		}
-	}
+	// Resolve command against the venv's bin/ when non-absolute. Shared with
+	// LocalStatusWithCRD so adoption of legacy PID files compares argv the
+	// exact same way.
+	command := resolveLocalCommand(root, local)
 
 	cmd := exec.Command(command, local.Args...)
 	cmd.Dir = workdir
@@ -437,7 +507,22 @@ func LocalStop(root, name string) error {
 
 // ListLocalProcesses scans .cog/run/services/ for tracked services and
 // returns their live status. Useful for reconcile orphan detection.
+//
+// No CRD map is consulted, so legacy PID files without recorded argv are
+// cleared rather than adopted. Call sites that have CRDs in hand (reconcile's
+// FetchLive) should use ListLocalProcessesWithCRDs instead to preserve live
+// services across in-place kernel upgrades.
 func ListLocalProcesses(root string) (map[string]*LocalProcess, error) {
+	return ListLocalProcessesWithCRDs(root, nil)
+}
+
+// ListLocalProcessesWithCRDs scans the PID directory and reports live status
+// per service, consulting the provided CRD map for adoption of legacy PID
+// files. The map is keyed by service name; entries absent from the map use
+// the strict (non-adopting) code path.
+//
+// nil map is equivalent to ListLocalProcesses: no adoption attempts.
+func ListLocalProcessesWithCRDs(root string, crds map[string]*ServiceCRD) (map[string]*LocalProcess, error) {
 	entries, err := os.ReadDir(localServicesDir(root))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -452,7 +537,11 @@ func ListLocalProcesses(root string) (map[string]*LocalProcess, error) {
 			continue
 		}
 		name := strings.TrimSuffix(e.Name(), ".pid")
-		p, err := LocalStatus(root, name)
+		var crd *ServiceCRD
+		if crds != nil {
+			crd = crds[name]
+		}
+		p, err := LocalStatusWithCRD(root, name, crd)
 		if err != nil || p == nil {
 			continue
 		}
