@@ -30,7 +30,6 @@ make build && ./cogos serve --workspace ~/my-project
 - **Anthropic Messages API proxy** -- Transparent proxy at `POST /v1/messages` that forwards to the real Anthropic API with streaming SSE passthrough. Enables `cog claude` to route Claude Code through the kernel via `ANTHROPIC_BASE_URL`.
 
 - **Foveated decomposition pipeline** -- `cog decompose` processes any input through E4B into four tiers: Tier 0 (one-sentence, ~15 tokens), Tier 1 (paragraph, ~100 tokens), Tier 2 (full CogDoc with sections and embeddings), Tier 3 (raw, gated). Includes an interactive workbench TUI (`--workbench`), embedding co-generation via nomic-embed-text, content-addressed CogDoc storage, and bus event emission for observability. This is the DECOMPOSE stage of the CogOS Hypercycle.
-
 ---
 
 ## Architecture
