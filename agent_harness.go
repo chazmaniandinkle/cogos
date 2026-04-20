@@ -44,6 +44,73 @@ func WithCycleID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, cycleIDKey{}, id)
 }
 
+// sessionIDKey is the context key that carries the dashboard session_id of
+// the user turn currently being processed. The respond tool reads this so
+// its reply can be tagged with the originating session, letting Mod³ filter
+// broadcasts and avoid cross-talk between simultaneously-connected clients.
+type sessionIDKey struct{}
+
+// sessionIDFromContext extracts the dashboard session_id from ctx, or "" if
+// none. Empty string is the explicit "no session" signal — publishers treat
+// it as a broadcast to anyone listening (the legacy behavior).
+func sessionIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(sessionIDKey{}).(string)
+	return v
+}
+
+// WithSessionID returns ctx carrying the given dashboard session_id. Set by
+// ServeAgent.runCycle when a pending user message is being observed so the
+// downstream respond tool can stamp its reply with the correct session.
+func WithSessionID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, sessionIDKey{}, id)
+}
+
+// sessionIDsKey carries the de-duplicated list of dashboard session_ids for a
+// cycle that drained multiple user messages. The respond tool fans out its
+// reply across this list so every originating session/tab sees the response —
+// without it, a cycle consuming messages from N clients would only reply on
+// whichever session_id happened to be first in the pending queue.
+//
+// When absent (or empty), publishers fall back to sessionIDFromContext — the
+// single-session path preserved for the common case of one message per cycle.
+type sessionIDsKey struct{}
+
+// sessionIDsFromContext returns the fan-out list of session_ids for the
+// current cycle's reply, or nil if none was set. An empty slice is treated as
+// no-list (callers should use the single-id path).
+func sessionIDsFromContext(ctx context.Context) []string {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(sessionIDsKey{}).([]string)
+	if len(v) == 0 {
+		return nil
+	}
+	return v
+}
+
+// WithSessionIDs returns ctx carrying the given fan-out list of session_ids.
+// Set by ServeAgent.runCycle after draining the pending queue so downstream
+// publishers (respond tool, auto-fallback) can emit one reply per unique
+// session. Nil/empty ids are ignored — callers keep WithSessionID for the
+// single-session case.
+func WithSessionIDs(ctx context.Context, ids []string) context.Context {
+	if len(ids) == 0 {
+		return ctx
+	}
+	// Copy so later mutations on the caller's slice can't alter the stored
+	// list — ctx values are treated as immutable by convention.
+	cp := make([]string, len(ids))
+	copy(cp, ids)
+	return context.WithValue(ctx, sessionIDsKey{}, cp)
+}
+
 // --- Wire protocol types (Ollama native /api/chat) ---
 //
 // Uses Ollama's native API instead of the OpenAI-compatible shim because:

@@ -74,8 +74,21 @@ func (s *ServiceProvider) FetchLive(ctx context.Context, config any) (any, error
 		LocalProcs: make(map[string]*LocalProcess),
 	}
 
+	// Build a name→CRD lookup so ListLocalProcessesWithCRDs can adopt legacy
+	// PID files whose argv matches the current CRD's expected command. The
+	// reconcile harness passes the LoadConfig output through as `config`;
+	// when it's the expected shape we forward it, otherwise we fall back to
+	// the strict (non-adopting) scan.
+	var crdMap map[string]*ServiceCRD
+	if crds, ok := config.([]ServiceCRD); ok {
+		crdMap = make(map[string]*ServiceCRD, len(crds))
+		for i := range crds {
+			crdMap[crds[i].Metadata.Name] = &crds[i]
+		}
+	}
+
 	// Local processes are discoverable whether or not Docker is up.
-	if procs, err := ListLocalProcesses(root); err == nil {
+	if procs, err := ListLocalProcessesWithCRDs(root, crdMap); err == nil {
 		live.LocalProcs = procs
 	} else {
 		log.Printf("[service] warning: list local processes: %v", err)
