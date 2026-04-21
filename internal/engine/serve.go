@@ -69,6 +69,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	mux.HandleFunc("GET /v1/proprioceptive", s.handleProprioceptive)
 	mux.HandleFunc("GET /v1/lightcone", s.handleLightCone)
 	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext)
+	mux.HandleFunc("GET /v1/tool-calls", s.handleToolCalls)
 
 	// Constellation / attention endpoints (Phase 3)
 	s.registerAttentionRoutes(mux)
@@ -448,6 +449,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	clientMsgs := block.Messages
 
+	// Resolve any pending client-ownership tool calls whose results are
+	// arriving on this turn. Each role=tool message carries a tool_call_id
+	// that matches a previously-forwarded tool.call; emitting the paired
+	// tool.result closes the ledger pair.
+	for _, msg := range clientMsgs {
+		if msg.Role == "tool" && msg.ToolCallID != "" {
+			s.process.resolvePendingToolCall(msg.ToolCallID, msg.Content)
+		}
+	}
+
 	// Extract the user's latest message as the query for relevance scoring.
 	query := ""
 	for i := len(clientMsgs) - 1; i >= 0; i-- {
@@ -689,6 +700,19 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 					Arguments: tc.Arguments,
 				},
 			}
+			// Observability: emit tool.call for every client-ownership tool
+			// the server is about to forward, and register a pending entry
+			// so the next-turn role=tool message resolves to a tool.result.
+			s.process.emitToolCall(ToolCallEvent{
+				CallID:    tc.ID,
+				ToolName:  tc.Name,
+				Arguments: json.RawMessage(tc.Arguments),
+				Source:    ToolSourceOpenAI,
+				Ownership: ToolOwnershipClient,
+				Provider:  provider.Name(),
+				SessionID: s.process.SessionID(),
+			})
+			s.process.registerPendingToolCall(tc.ID, tc.Name, ToolSourceOpenAI, 0)
 		}
 		raw, _ := json.Marshal(calls)
 		msg.ToolCalls = json.RawMessage(raw)
@@ -801,6 +825,21 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 			if sc.ToolCallDelta.ID != "" {
 				tc.ID = sc.ToolCallDelta.ID
 				tc.Type = "function"
+				// Emit tool.call on the first delta that carries an ID.
+				// Arguments arrive incrementally in later deltas; for the
+				// ledger row we record what we have at announcement time
+				// (typically just the name — arguments accumulate client-
+				// side). The paired tool.result will still fire on the
+				// follow-up role=tool message.
+				s.process.emitToolCall(ToolCallEvent{
+					CallID:    sc.ToolCallDelta.ID,
+					ToolName:  sc.ToolCallDelta.Name,
+					Source:    ToolSourceOpenAI,
+					Ownership: ToolOwnershipClient,
+					Provider:  provider.Name(),
+					SessionID: s.process.SessionID(),
+				})
+				s.process.registerPendingToolCall(sc.ToolCallDelta.ID, sc.ToolCallDelta.Name, ToolSourceOpenAI, 0)
 			}
 			// Always create Function — OpenAI spec requires it on every tool call
 			// delta, even the initial chunk where only Name is set and Arguments
@@ -840,6 +879,89 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 	}
 	_, _ = fmt.Fprint(bw, "data: [DONE]\n\n")
 	flush()
+}
+
+// handleToolCalls is the HTTP companion to cog_read_tool_calls.
+//
+// GET /v1/tool-calls
+//
+//	?session_id=&tool_name=&status=&source=&ownership=&call_id=
+//	&since=&until=&limit=&order=
+//	&include_args=&include_output=
+//
+// Returns the same stitched call+result rows as the MCP tool. Missing or
+// malformed query params error with 400; empty filter set returns the
+// default-limit most-recent rows.
+func (s *Server) handleToolCalls(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	q := r.URL.Query()
+	query := ToolCallQuery{
+		SessionID:     q.Get("session_id"),
+		ToolName:      q.Get("tool_name"),
+		Status:        q.Get("status"),
+		Source:        q.Get("source"),
+		Ownership:     q.Get("ownership"),
+		CallID:        q.Get("call_id"),
+		Order:         q.Get("order"),
+		IncludeArgs:   boolQueryParam(q.Get("include_args")),
+		IncludeOutput: boolQueryParam(q.Get("include_output")),
+	}
+	if raw := q.Get("limit"); raw != "" {
+		n, err := parseIntQuery(raw)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid limit"})
+			return
+		}
+		query.Limit = n
+	}
+	if raw := q.Get("since"); raw != "" {
+		ts, err := parseTimeOrDuration(raw)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid since: " + err.Error()})
+			return
+		}
+		query.Since = ts
+	}
+	if raw := q.Get("until"); raw != "" {
+		ts, err := parseTimeOrDuration(raw)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid until: " + err.Error()})
+			return
+		}
+		query.Until = ts
+	}
+
+	result, err := QueryToolCalls(s.cfg.WorkspaceRoot, query)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// boolQueryParam accepts "true", "1", "yes" (case-insensitive) as true.
+func boolQueryParam(raw string) bool {
+	switch regexp.MustCompile(`^(true|1|yes|on)$`).MatchString(raw) {
+	case true:
+		return true
+	default:
+		return false
+	}
+}
+
+// parseIntQuery returns the int value of a query string param, or an error.
+func parseIntQuery(raw string) (int, error) {
+	var n int
+	_, err := fmt.Sscanf(raw, "%d", &n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // handleDebugLast returns the full pipeline snapshot from the most recent chat request.
