@@ -276,6 +276,9 @@ func runBenchCmd(args []string, workspaceRoot string, defaultPort int) {
 		fmt.Fprintf(os.Stderr, "error: load config: %v\n", err)
 		os.Exit(1)
 	}
+	// Upgrade stderr-only logger to also fan into the kernel slog JSONL sink
+	// (Agent U's kernel-slog-api). See log_capture.go.
+	upgradeLoggerWithFileSink(cfg)
 
 	nucleus, err := LoadNucleus(cfg)
 	if err != nil {

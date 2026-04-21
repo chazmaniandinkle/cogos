@@ -66,6 +66,10 @@ type Config struct {
 	// Empty map means external digestion is disabled.
 	DigestPaths map[string]string
 
+	// KernelLogPath overrides the default per-workspace kernel slog JSONL sink
+	// at .cog/run/kernel.log.jsonl. Leave empty for the default.
+	KernelLogPath string
+
 	LocalModel string
 
 	localModelConfigured bool
@@ -86,6 +90,7 @@ type kernelConfigSection struct {
 	ToolCallValidation    *bool             `yaml:"tool_call_validation_enabled"`
 	LocalModel            string            `yaml:"local_model"`
 	DigestPaths           map[string]string `yaml:"digest_paths"`
+	KernelLogPath         string            `yaml:"kernel_log_path"`
 }
 
 // kernelConfig is the on-disk YAML shape of .cog/config/kernel.yaml.
@@ -190,6 +195,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 		for name, path := range s.DigestPaths {
 			cfg.DigestPaths[name] = path
 		}
+	}
+	if s.KernelLogPath != "" {
+		cfg.KernelLogPath = s.KernelLogPath
 	}
 }
 

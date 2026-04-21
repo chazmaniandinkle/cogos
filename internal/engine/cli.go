@@ -141,6 +141,12 @@ func runServe(workspace string, port int) {
 		slog.Error("config load failed", "err", err)
 		os.Exit(1)
 	}
+	// Now that the workspace root is known, upgrade the stderr-only logger
+	// to also fan records to <workspace>/.cog/run/kernel.log.jsonl (Agent U's
+	// kernel-slog-api). Lines logged above go to stderr only; lines below
+	// this call also land in the JSONL sink exposed by /v1/kernel-log and
+	// the cog_tail_kernel_log MCP tool.
+	upgradeLoggerWithFileSink(cfg)
 	slog.Info("config loaded", "workspace", cfg.WorkspaceRoot, "port", cfg.Port)
 
 	if reuse, msg, err := planServeState(cfg, checkDaemonHealth); err != nil {
