@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+- `POST /v1/context/build` — context engine exposed without inference (#8)
+- Hash-chained ledger exposed via `cog_read_ledger` MCP + `GET /v1/ledger`, with hash-chain verification (#11)
+- Config mutation API — `cog_read_config` / `cog_write_config` / `cog_rollback_config` MCP + `GET`/`PATCH /v1/config` + `POST /v1/config/rollback` (RFC 7396 merge-patch) (#14)
+- Windows build targets in `Makefile` + install docs in `docs/RELEASING.md` (#15)
+- Event bus — broker hooked inside `AppendEvent`, real SSE stream at `/v1/bus/:id/events/stream`, `cog_tail_events` + `cog_query_events` MCP tools (#16)
+- Traces search API — `cog_search_traces` MCP + `GET /v1/traces` (`/v1/proprioceptive` preserved byte-compat via regression test) (#17)
+- `docker-compose.node.yml` bridge-{primary,secondary} + tailscale-{primary,secondary} siblings for multi-session MCP substrate (#19)
+- Engine-side `cogos emit` subcommand (Track 5 Phase 1); additive — root `cmdEmit` retained for compat (#23)
+- Conversation turns persisted via `turn.completed` ledger events + per-session `.cog/run/turns/<sessionID>.jsonl` sidecar; `cog_read_conversation` MCP + `GET /v1/conversation` (#24)
+- Tool-bridge observability — `cog_read_tool_calls` + `cog_tail_tool_calls` MCP; activates dormant `gate.go` `tool.call`/`tool.result` recognizer + `NormalizeMCPRequest` normalize-path + pending-call correlation cache (#25)
+- Agent state + loop control — `cog_list_agents` / `cog_get_agent_state` / `cog_trigger_agent_loop` MCP + `/v1/agents[/...]` plural HTTP routes (preserves singular `/v1/agent/{status,traces,trigger}` byte-compat) (#27)
+- Kernel slog capture — `teeHandler` fans slog to stderr + JSONL sink at `.cog/run/kernel.log.jsonl`; `cog_tail_kernel_log` MCP + `GET /v1/kernel-log` (#28)
+- `--bind` flag + `bind_addr` YAML — wires long-dormant `BindAddr` config field; default remains `127.0.0.1`; CORS relaxed on non-loopback bind (closes #12) (#33)
+- `cog bus send` subcommand — write symmetry for bus CLI; defaults to direct JSONL write, `--http` opt-in for kernel broadcast (closes #26) (#34)
+
 ### Changed
 - MCP server + ingestion pipeline + tool loop + cogdoc service + membrane policy
   are now always compiled into the kernel. The `mcpserver` build tag has been
@@ -10,11 +26,20 @@
   binaries silently shipped without MCP — breaking the kernel's primary use
   case (LLM collaboration via MCP). See
   [docs/archival/2026-04-21-mcp-always-on.md](docs/archival/2026-04-21-mcp-always-on.md)
-  for full rationale and call-graph evidence.
+  for full rationale and call-graph evidence. (#9)
+
+### Fixed
+- Ledger + sync-watcher tests now stable on `-count>=2` — `resetLedgerCacheForTest` helper + sync-watcher parse-retry (closes #18) (#30)
+- `syscall.Dup2` blocked linux/arm64 builds — switched to `golang.org/x/sys/unix.Dup2` (closes #13) (#31)
+- `EmitLedgerEvent` orphan-file bug — was writing to flat `.cog/ledger/events.jsonl` bypassing hash-chain (closes #10) (#16)
+- `RecordBlock` data-loss — chat prompt/response text was GC'd every turn (closes #20) (#24)
+- Root `cogos emit` silent-drop bug — hook invocations returned success but never wrote to ledger (#23)
 
 ### Removed
 - `internal/engine/serve_mcp_stub.go` — the noop `!mcpserver` fallback, no
-  longer needed now that MCP is always-on.
+  longer needed now that MCP is always-on. (#9)
+- `turn_metrics.jsonl` fossil source — no production writers, superseded by `turn.completed` ledger events (closes #21) (#32)
+- 5 unused TAA config fields (`ExtractionMethod`, `ConfidenceThreshold`, `FailureMode`, `TraceTiers`, `TraceFile` — all marked `// TODO: not yet wired`) (closes #22) (#29)
 
 ## [2.6.0] - 2026-04-15 — Decomposition pipeline workbench
 
