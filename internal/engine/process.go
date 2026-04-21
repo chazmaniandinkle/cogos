@@ -162,6 +162,12 @@ type Process struct {
 	// hookRegistry holds ADR-072 state-transition hooks loaded from
 	// .cog/hooks/transitions/*.yaml. May be nil if the directory is missing.
 	hookRegistry *stateHookRegistry
+
+	// pendingToolCalls correlates client-ownership tool.call emissions with
+	// the role=tool response that arrives on a later HTTP turn. Lazily
+	// initialized on first registerPendingToolCall; swept by
+	// RunPendingToolCallSweeper. See tool_observer.go.
+	pendingToolCalls *pendingToolCallRegistry
 }
 
 // NewProcess constructs and initialises the process.
