@@ -1,20 +1,31 @@
 # CogOS Multi-Node Local Testing
 #
 # This compose file runs two CogOS nodes locally to test:
-#   - Container deployment (kernel + gateway per node)
-#   - Secret resolution via envspec
-#   - Vaultwarden sidecar on the primary node
+#   - Container deployment (kernel + gateway + bridge per node)
+#   - Secret resolution via envspec → vaultwarden sidecar (primary only)
+#   - MCP HTTP bridge for session/handoff coordination (cog-sandbox-mcp)
+#   - Optional Tailscale sidecar for cross-machine federation (profile: federation)
 #   - Network separation between nodes
 #
+# Siblings per node, per the self-similar bootstrap principle:
+#   node-level services: kernel, gateway, bridge
+#   node-level sidecars: vaultwarden (primary), tailscale (opt-in)
+#
 # Usage:
-#   docker compose -f docker-compose.node.yml up -d
+#   docker compose -f docker-compose.node.yml up -d                          # default profile
+#   docker compose -f docker-compose.node.yml --profile federation up -d     # include tailscale
 #   docker compose -f docker-compose.node.yml ps
 #   docker compose -f docker-compose.node.yml logs -f
 #   docker compose -f docker-compose.node.yml down -v
 #
 # Prerequisites:
-#   - Build kernel image: docker build -t cogos/kernel:latest .
+#   - Build kernel image:  docker build -t cogos/kernel:latest .
 #   - Build gateway image: docker build -t cogos/gateway:latest ../moltbot-gateway/
+#   - Bridge image:        once ghcr.io/cogos-dev/cog-sandbox-mcp is published,
+#                          no build step needed. Until then, the bridge service
+#                          builds from ../cog-sandbox-mcp (expects sibling-dir
+#                          layout — i.e. cog-sandbox-mcp checked out alongside
+#                          cogos/).
 #   - Or use: ./scripts/build-node-images.sh
 
 # ── Primary Node ─────────────────────────────────────────────────────────────────
@@ -90,6 +101,77 @@ services:
       com.cogos.service: gateway
       com.cogos.node: primary-local
 
+  # ── Primary Bridge (cog-sandbox-mcp) ────────────────────────────────────────
+  # MCP HTTP bridge. Exposes the kernel's bus/memory/session/handoff primitives
+  # as MCP tools for any client (Claude Code, Claude Desktop, LM Studio, codex,
+  # gemini, etc.) that speaks the Streamable-HTTP MCP transport. Enables multi-
+  # session substrate coordination — each client is an independent MCP peer on
+  # this central server, emitting to and reading from the same bus.
+  #
+  # Image source: once ghcr.io/cogos-dev/cog-sandbox-mcp is published, swap the
+  # `build:` block for `image: ghcr.io/cogos-dev/cog-sandbox-mcp:latest`. Until
+  # then, builds from ../cog-sandbox-mcp (sibling-dir layout).
+  bridge-primary:
+    build:
+      context: ../cog-sandbox-mcp
+      dockerfile: Dockerfile
+    container_name: cogos-primary-bridge
+    ports:
+      - "7823:7823"
+    environment:
+      - MCP_TRANSPORT=http
+      - MCP_HTTP_HOST=0.0.0.0
+      - MCP_HTTP_PORT=7823
+      - COG_OS_BASE_URL=http://kernel-primary:6931
+      - COG_SANDBOX_ROOT=/workspaces
+      - COG_SANDBOX_INITIAL_AUTH=${COG_SANDBOX_INITIAL_AUTH:-cog}
+      - COGOS_HOME_WORKSPACE=${COGOS_HOME_WORKSPACE:-cog}
+    volumes:
+      # Read-only view of host workspaces so the sandbox tools can operate.
+      # Override WORKSPACES_HOST_PATH via .env to point elsewhere.
+      - type: bind
+        source: ${WORKSPACES_HOST_PATH:-../..}
+        target: /workspaces
+        read_only: true
+    depends_on:
+      - kernel-primary
+    restart: unless-stopped
+    labels:
+      com.cogos.managed: "true"
+      com.cogos.service: bridge
+      com.cogos.node: primary-local
+
+  # ── Primary Tailscale (opt-in, --profile federation) ────────────────────────
+  # Enrolls this node in a Tailnet for cross-machine federation. Expects
+  # TS_AUTHKEY from a Headscale server (or tailscale admin console). When
+  # active, other nodes in the same Tailnet can reach this kernel directly
+  # as `cogos-primary:6931` without any manual IP/firewall work.
+  #
+  # Start with: docker compose --profile federation up
+  # Without --profile federation, this service is NOT created.
+  tailscale-primary:
+    image: tailscale/tailscale:latest
+    container_name: cogos-primary-tailscale
+    hostname: cogos-primary
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_EXTRA_ARGS=--advertise-tags=tag:cogos-node
+      - TS_USERSPACE=${TS_USERSPACE:-false}
+    volumes:
+      - tailscale-primary-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - net_admin
+      - sys_module
+    restart: unless-stopped
+    profiles:
+      - federation
+    labels:
+      com.cogos.managed: "true"
+      com.cogos.service: tailscale
+      com.cogos.node: primary-local
+
   # ── Secondary Node ─────────────────────────────────────────────────────────────
   # Standard tier: kernel + gateway (no vaultwarden)
 
@@ -138,7 +220,62 @@ services:
       com.cogos.service: gateway
       com.cogos.node: secondary-local
 
+  # ── Secondary Bridge (cog-sandbox-mcp) ──────────────────────────────────────
+  bridge-secondary:
+    build:
+      context: ../cog-sandbox-mcp
+      dockerfile: Dockerfile
+    container_name: cogos-secondary-bridge
+    ports:
+      - "7824:7823"
+    environment:
+      - MCP_TRANSPORT=http
+      - MCP_HTTP_HOST=0.0.0.0
+      - MCP_HTTP_PORT=7823
+      - COG_OS_BASE_URL=http://kernel-secondary:6931
+      - COG_SANDBOX_ROOT=/workspaces
+      - COG_SANDBOX_INITIAL_AUTH=${COG_SANDBOX_INITIAL_AUTH:-cog}
+      - COGOS_HOME_WORKSPACE=${COGOS_HOME_WORKSPACE:-cog}
+    volumes:
+      - type: bind
+        source: ${WORKSPACES_HOST_PATH:-../..}
+        target: /workspaces
+        read_only: true
+    depends_on:
+      - kernel-secondary
+    restart: unless-stopped
+    labels:
+      com.cogos.managed: "true"
+      com.cogos.service: bridge
+      com.cogos.node: secondary-local
+
+  # ── Secondary Tailscale (opt-in, --profile federation) ──────────────────────
+  tailscale-secondary:
+    image: tailscale/tailscale:latest
+    container_name: cogos-secondary-tailscale
+    hostname: cogos-secondary
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_EXTRA_ARGS=--advertise-tags=tag:cogos-node
+      - TS_USERSPACE=${TS_USERSPACE:-false}
+    volumes:
+      - tailscale-secondary-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - net_admin
+      - sys_module
+    restart: unless-stopped
+    profiles:
+      - federation
+    labels:
+      com.cogos.managed: "true"
+      com.cogos.service: tailscale
+      com.cogos.node: secondary-local
+
 volumes:
   vw-data:
   primary-cog:
   secondary-cog:
+  tailscale-primary-state:
+  tailscale-secondary-state:

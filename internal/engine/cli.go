@@ -90,6 +90,8 @@ func Main() {
 		case "node":
 			runNodeCmd(args[1:], *workspace)
 			return
+		case "emit":
+			os.Exit(runEmitCmd(args[1:], *workspace))
 		}
 	}
 
