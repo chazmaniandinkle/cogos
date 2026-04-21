@@ -76,6 +76,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	mux.HandleFunc("GET /v1/lightcone", s.handleLightCone)
 	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext)
 	mux.HandleFunc("GET /v1/tool-calls", s.handleToolCalls)
+	mux.HandleFunc("GET /v1/conversation", s.handleConversation)
 
 	// Constellation / attention endpoints (Phase 3)
 	s.registerAttentionRoutes(mux)
@@ -641,17 +642,37 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		instruments.ChatRequests.Add(ctx, 1)
 	}
 
+	// Prepare the turn record. Fully populated by the provider path (complete/stream)
+	// below, then persisted via RecordTurn once the response is on its way to the client.
+	turn := &TurnRecord{
+		TurnID:    uuid.New().String(),
+		TurnIndex: NextTurnIndex(s.cfg.WorkspaceRoot, block.SessionID),
+		SessionID: block.SessionID,
+		Timestamp: time.Now().UTC(),
+		Prompt:    query,
+		Provider:  provider.Name(),
+		Model:     model,
+		BlockID:   block.ID,
+	}
+
 	inferStart := time.Now()
 	if req.Stream {
-		s.streamChat(w, r.Context(), creq, provider, respID, model, req.StreamOptions)
+		s.streamChat(w, r.Context(), creq, provider, respID, model, req.StreamOptions, turn)
 	} else {
-		s.completeChat(w, r.Context(), creq, provider, respID, model)
+		s.completeChat(w, r.Context(), creq, provider, respID, model, turn)
 	}
 
 	inferMs := float64(time.Since(inferStart).Milliseconds())
 	span.SetAttributes(attribute.Float64("cogos.inference.latency_ms", inferMs))
 	if instruments.InferenceLatency != nil {
 		instruments.InferenceLatency.Record(ctx, inferMs)
+	}
+
+	// Persist the turn (ledger event + sidecar). Closes cogos#20 by
+	// capturing the full prompt/response pair, which RecordBlock drops.
+	turn.DurationMs = time.Since(inferStart).Milliseconds()
+	if err := s.process.RecordTurn(turn); err != nil {
+		slog.Warn("chat: RecordTurn failed", "err", err, "session", turn.SessionID)
 	}
 
 	// Capture debug snapshot (best-effort, non-blocking).
@@ -665,12 +686,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 // completeChat handles non-streaming chat completions.
+// The optional turn record is populated with the response text, usage, and
+// any tool-call traces so the caller can persist the full turn via RecordTurn.
 func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *CompletionRequest,
-	provider Provider, respID, model string) {
+	provider Provider, respID, model string, turn *TurnRecord) {
 
 	resp, err := provider.Complete(ctx, req)
 	if err != nil {
 		slog.Warn("chat: complete error", "err", err)
+		if turn != nil {
+			turn.Status = "error"
+			turn.Error = err.Error()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -682,6 +709,25 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 			},
 		})
 		return
+	}
+	if turn != nil {
+		turn.Response = resp.Content
+		turn.Usage = TurnUsage{
+			InputTokens:  resp.Usage.InputTokens,
+			OutputTokens: resp.Usage.OutputTokens,
+			TotalTokens:  resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		}
+		// Non-kernel tool calls returned to the client become transcript
+		// entries with empty result (the client will execute them).
+		if len(resp.ToolCalls) > 0 {
+			for _, tc := range resp.ToolCalls {
+				turn.ToolCalls = append(turn.ToolCalls, ToolCallRecord{
+					ID:        tc.ID,
+					Name:      tc.Name,
+					Arguments: tc.Arguments,
+				})
+			}
+		}
 	}
 
 	msg := &oaiMessage{Role: "assistant", Content: mustMarshalString(resp.Content)}
@@ -746,12 +792,18 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 }
 
 // streamChat handles streaming chat completions via SSE.
+// The optional turn record accumulates the response text (and usage from
+// the final chunk) so the caller can persist the full turn via RecordTurn.
 func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *CompletionRequest,
-	provider Provider, respID, model string, streamOpts *oaiStreamOpts) {
+	provider Provider, respID, model string, streamOpts *oaiStreamOpts, turn *TurnRecord) {
 
 	chunks, err := provider.Stream(ctx, req)
 	if err != nil {
 		slog.Warn("chat: stream error", "err", err)
+		if turn != nil {
+			turn.Status = "error"
+			turn.Error = err.Error()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -764,6 +816,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 		})
 		return
 	}
+	var respBuf strings.Builder
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -790,6 +843,10 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 	for sc := range chunks {
 		if sc.Error != nil {
 			slog.Warn("chat: stream chunk error", "err", sc.Error)
+			if turn != nil {
+				turn.Status = "error"
+				turn.Error = sc.Error.Error()
+			}
 			break
 		}
 
@@ -801,6 +858,17 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 				finishReason = "stop"
 				if sawToolCall {
 					finishReason = "tool_calls"
+				}
+			}
+			// Populate the turn record with accumulated response + final usage.
+			if turn != nil {
+				turn.Response = respBuf.String()
+				if sc.Usage != nil {
+					turn.Usage = TurnUsage{
+						InputTokens:  sc.Usage.InputTokens,
+						OutputTokens: sc.Usage.OutputTokens,
+						TotalTokens:  sc.Usage.InputTokens + sc.Usage.OutputTokens,
+					}
 				}
 			}
 			data := oaiChatResponse{
@@ -872,6 +940,9 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 
 		// Text delta.
 		if sc.Delta != "" {
+			if turn != nil {
+				respBuf.WriteString(sc.Delta)
+			}
 			delta := &oaiMessage{Role: "assistant", Content: mustMarshalString(sc.Delta)}
 			data := oaiChatResponse{
 				ID:      respID,
@@ -883,6 +954,11 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 			b, _ := json.Marshal(data)
 			writeSSE(b)
 		}
+	}
+	// Ensure the turn record picks up the response text even when the
+	// stream never sent a Done chunk (error mid-stream, client disconnect).
+	if turn != nil && turn.Response == "" {
+		turn.Response = respBuf.String()
 	}
 	_, _ = fmt.Fprint(bw, "data: [DONE]\n\n")
 	flush()
@@ -1228,6 +1304,94 @@ func (s *Server) handleLightCone(w http.ResponseWriter, r *http.Request) {
 		"count":  len(cones),
 		"cones":  cones,
 	})
+}
+
+// handleConversation returns the conversation turns for a session.
+//
+//	GET /v1/conversation
+//	  ?session_id=…            default: current process session
+//	  &after_turn=N            pagination: turn_index > N
+//	  &before_turn=N           reverse pagination: turn_index < N
+//	  &since=RFC3339           time filter
+//	  &limit=20                default 20, max 200
+//	  &include_full=true       default true — hydrate from sidecar
+//	  &include_tools=true      default true — include tool-call transcript
+//	  &order=asc               asc (default) | desc
+//
+//	200 → ConversationQueryResult
+//	400 → parse error
+//
+// Backed by the turn.completed ledger event stream + the per-session
+// sidecar JSONL. Closes Agent F gap #4.
+func (s *Server) handleConversation(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	sessionID := q.Get("session_id")
+	if sessionID == "" && s.process != nil {
+		sessionID = s.process.SessionID()
+	}
+	cq := ConversationQuery{
+		SessionID:    sessionID,
+		IncludeFull:  parseBoolDefault(q.Get("include_full"), true),
+		IncludeTools: parseBoolDefault(q.Get("include_tools"), true),
+		Order:        q.Get("order"),
+	}
+	if v := q.Get("after_turn"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			writeConversationError(w, http.StatusBadRequest, "invalid after_turn: "+err.Error())
+			return
+		}
+		cq.AfterTurn = n
+	}
+	if v := q.Get("before_turn"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			writeConversationError(w, http.StatusBadRequest, "invalid before_turn: "+err.Error())
+			return
+		}
+		cq.BeforeTurn = n
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			writeConversationError(w, http.StatusBadRequest, "invalid limit: "+err.Error())
+			return
+		}
+		cq.Limit = n
+	}
+	if v := q.Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeConversationError(w, http.StatusBadRequest, "invalid since (want RFC3339): "+err.Error())
+			return
+		}
+		cq.Since = t
+	}
+
+	res, err := QueryConversation(s.cfg.WorkspaceRoot, cq)
+	if err != nil {
+		writeConversationError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+func writeConversationError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func parseBoolDefault(s string, def bool) bool {
+	if s == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(s)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 // readLastJSONLEntries reads the last n lines from a JSONL file and returns

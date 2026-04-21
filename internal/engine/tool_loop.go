@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -302,15 +303,10 @@ func ValidateToolCall(tc ToolCall, toolDefs []ToolDefinition) ToolCallValidation
 	return result
 }
 
-// RunToolLoop executes the kernel tool loop.
-// Given a CompletionResponse with tool_calls, it:
-// 1. Separates kernel tools from client tools
-// 2. Executes kernel tools
-// 3. Appends results to messages
-// 4. Re-calls the provider
-// 5. Repeats until no more kernel tool calls or max iterations
-//
-// Returns the final response and any client tool calls that need forwarding.
+// RunToolLoop executes the kernel tool loop. See RunToolLoopWithTranscript
+// for the full detail — this wrapper drops the per-turn tool-call transcript
+// for callers that don't need it. Preserved for backwards compatibility
+// with existing tests / call sites.
 func RunToolLoop(
 	ctx context.Context,
 	provider Provider,
@@ -318,13 +314,43 @@ func RunToolLoop(
 	initialResp *CompletionResponse,
 	registry *KernelToolRegistry,
 ) (*CompletionResponse, []ToolCall, error) {
+	resp, clientCalls, _, err := RunToolLoopWithTranscript(ctx, provider, req, initialResp, registry)
+	return resp, clientCalls, err
+}
+
+// RunToolLoopWithTranscript executes the kernel tool loop and returns a
+// transcript of kernel-owned tool calls executed (and any rejected ones).
+// The transcript is threaded back to chat handlers so it can be stored
+// alongside the prompt/response in the turn.completed record (Agent R
+// §5.4).
+//
+// Given a CompletionResponse with tool_calls, it:
+// 1. Separates kernel tools from client tools
+// 2. Executes kernel tools (capturing a ToolCallRecord for each)
+// 3. Appends results to messages
+// 4. Re-calls the provider
+// 5. Repeats until no more kernel tool calls or max iterations
+//
+// Returns:
+//   - final response
+//   - any client tool calls that need forwarding
+//   - per-turn tool-call transcript (kernel calls + rejections)
+//   - error
+func RunToolLoopWithTranscript(
+	ctx context.Context,
+	provider Provider,
+	req *CompletionRequest,
+	initialResp *CompletionResponse,
+	registry *KernelToolRegistry,
+) (*CompletionResponse, []ToolCall, []ToolCallRecord, error) {
 
 	resp := initialResp
 	var clientToolCalls []ToolCall
+	var transcript []ToolCallRecord
 
 	for i := 0; i < maxToolLoopIterations; i++ {
 		if len(resp.ToolCalls) == 0 {
-			return resp, clientToolCalls, nil
+			return resp, clientToolCalls, transcript, nil
 		}
 
 		// Add the assistant message with tool calls to the conversation.
@@ -356,6 +382,13 @@ func RunToolLoop(
 				}
 
 				rejected = append(rejected, validation)
+				transcript = append(transcript, ToolCallRecord{
+					ID:           tc.ID,
+					Name:         tc.Name,
+					Arguments:    tc.Arguments,
+					Rejected:     true,
+					RejectReason: validation.Reason,
+				})
 				recordToolCallRejection(provider.Name())
 				if registry != nil {
 					registry.logRejectedToolCall(provider.Name(), tc, validation)
@@ -377,7 +410,7 @@ func RunToolLoop(
 				var err error
 				resp, err = provider.Complete(ctx, req)
 				if err != nil {
-					return nil, clientToolCalls, fmt.Errorf("tool_loop re-call after rejection: %w", err)
+					return nil, clientToolCalls, transcript, fmt.Errorf("tool_loop re-call after rejection: %w", err)
 				}
 
 				slog.Info("tool_loop: provider re-called after tool rejection",
@@ -402,7 +435,7 @@ func RunToolLoop(
 
 		// If no kernel calls, return — client needs to handle the rest.
 		if len(kernelCalls) == 0 {
-			return resp, clientToolCalls, nil
+			return resp, clientToolCalls, transcript, nil
 		}
 
 		// Execute kernel tools and add results.
@@ -412,14 +445,27 @@ func RunToolLoop(
 				"iteration", i+1,
 			)
 
+			start := time.Now()
 			result, err := registry.Execute(ctx, tc.Name, tc.Arguments)
+			dur := time.Since(start).Milliseconds()
+			rec := ToolCallRecord{
+				ID:         tc.ID,
+				Name:       tc.Name,
+				Arguments:  tc.Arguments,
+				Result:     result,
+				DurationMs: dur,
+			}
 			if err != nil {
-				result = fmt.Sprintf(`{"error": %q}`, err.Error())
+				rec.Rejected = false
+				rec.RejectReason = ""
+				rec.Result = fmt.Sprintf(`{"error": %q}`, err.Error())
+				result = rec.Result
 				slog.Warn("tool_loop: tool execution failed",
 					"tool", tc.Name,
 					"err", err,
 				)
 			}
+			transcript = append(transcript, rec)
 
 			req.Messages = append(req.Messages, ProviderMessage{
 				Role:       "tool",
@@ -431,14 +477,14 @@ func RunToolLoop(
 		// If there are also client tool calls, we need to stop and let the client handle them.
 		if len(clientToolCalls) > 0 {
 			// Return a synthetic response that includes both the text and pending client calls.
-			return resp, clientToolCalls, nil
+			return resp, clientToolCalls, transcript, nil
 		}
 
 		// Re-call the provider with the updated messages.
 		var err error
 		resp, err = provider.Complete(ctx, req)
 		if err != nil {
-			return nil, clientToolCalls, fmt.Errorf("tool_loop re-call: %w", err)
+			return nil, clientToolCalls, transcript, fmt.Errorf("tool_loop re-call: %w", err)
 		}
 
 		slog.Info("tool_loop: provider re-called",
@@ -449,7 +495,7 @@ func RunToolLoop(
 	}
 
 	slog.Warn("tool_loop: max iterations reached", "max", maxToolLoopIterations)
-	return resp, clientToolCalls, nil
+	return resp, clientToolCalls, transcript, nil
 }
 
 // ── Schema helpers ───────────────────────────────────────────────────────────

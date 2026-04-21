@@ -285,7 +285,7 @@ func TestQueryCrossSession(t *testing.T) {
 	}
 }
 
-func TestQuerySinceFilter(t *testing.T) {
+func TestQueryToolCallsSinceFilter(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
 	old := time.Now().UTC().Add(-2 * time.Hour)
