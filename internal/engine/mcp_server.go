@@ -94,51 +94,56 @@ func (m *MCPServer) Handler() http.Handler {
 // registerTools registers MCP tools.
 // Design: tools are actions with side effects or non-trivial computation.
 // Read-only state queries will migrate to MCP Resources in Phase 2.
+//
+// Every handler is wrapped with withToolObserver so an invocation emits a
+// paired tool.call + tool.result event to the hash-chained ledger. This
+// closes Agent F gap #6 and activates the gate.go:94 recognizer that has
+// been waiting for a producer.
 func (m *MCPServer) registerTools() {
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_search_memory",
 		Description: "Full-text and semantic search over the CogDoc memory corpus. Returns ranked results with salience scores. Fallback: ./scripts/cog memory search \"query\"",
-	}, m.toolSearchMemory)
+	}, withToolObserver(m, "cog_search_memory", m.toolSearchMemory))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_read_cogdoc",
 		Description: "Read a CogDoc by URI or path. Resolves cog: URIs automatically. Returns full content with parsed frontmatter and optional section extraction via #fragment. Fallback: ./scripts/cog memory read <path>",
-	}, m.toolReadCogdoc)
+	}, withToolObserver(m, "cog_read_cogdoc", m.toolReadCogdoc))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_write_cogdoc",
 		Description: "Write or update a CogDoc at the specified memory path. Creates the file with proper frontmatter if it doesn't exist. Fallback: ./scripts/cog memory write <path> \"Title\"",
-	}, m.toolWriteCogdoc)
+	}, withToolObserver(m, "cog_write_cogdoc", m.toolWriteCogdoc))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_patch_frontmatter",
 		Description: "Merge description, tags, or type patches into a CogDoc frontmatter block.",
-	}, m.toolPatchFrontmatter)
+	}, withToolObserver(m, "cog_patch_frontmatter", m.toolPatchFrontmatter))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_check_coherence",
 		Description: "Run coherence validation against the workspace. Checks URI resolution, frontmatter validity, and reference integrity. Fallback: ./scripts/cog coherence check",
-	}, m.toolCheckCoherence)
+	}, withToolObserver(m, "cog_check_coherence", m.toolCheckCoherence))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_get_state",
 		Description: "Get kernel state: process status, uptime, trust, node health (sibling services), field size, and heartbeat info. Includes identity and coherence metadata. Fallback: curl http://localhost:6931/health",
-	}, m.toolGetState)
+	}, withToolObserver(m, "cog_get_state", m.toolGetState))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_query_field",
 		Description: "Query the attentional field — the salience-scored map of all tracked CogDocs. Returns top-N items, optionally filtered by sector. Shows what the kernel considers most relevant right now.",
-	}, m.toolQueryField)
+	}, withToolObserver(m, "cog_query_field", m.toolQueryField))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_assemble_context",
 		Description: "Build a context package for a given token budget with an explicit focus topic. Use this for intentional context assembly (subtasks, specific investigations). The automatic foveated-context hook handles ambient context on every prompt.",
-	}, m.toolAssembleContext)
+	}, withToolObserver(m, "cog_assemble_context", m.toolAssembleContext))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_emit_event",
 		Description: "Emit a typed event to the workspace ledger. Events: attention.boost (uri + weight), session.marker (label), insight.captured (summary), decision.made (decision + rationale). Fallback: events are JSONL in .cog/ledger/",
-	}, m.toolEmitEvent)
+	}, withToolObserver(m, "cog_emit_event", m.toolEmitEvent))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_read_ledger",
@@ -148,7 +153,20 @@ func (m *MCPServer) registerTools() {
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_ingest",
 		Description: "Ingest external material into CogOS knowledge. Deterministic decomposition — no LLM calls. Supports URLs, conversations, documents. Applies membrane policy (accept/quarantine/defer/discard).",
-	}, m.toolIngest)
+	}, withToolObserver(m, "cog_ingest", m.toolIngest))
+
+	// Tool-call observability — reads the paired tool.call/tool.result events
+	// the wrapper above emits. Self-reflective: these two tools also go
+	// through withToolObserver and end up in their own query results.
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_read_tool_calls",
+		Description: "Query recent tool invocations and their outcomes. Returns call+result pairs from the ledger, filterable by tool_name, status (pending/success/error/rejected/timeout), source, ownership, call_id, or time window. Default limit 100, max 500. Arguments and output are opt-in via include_args/include_output. Fallback: grep '\"type\":\"tool\\.' .cog/ledger/<sid>/events.jsonl",
+	}, withToolObserver(m, "cog_read_tool_calls", m.toolReadToolCalls))
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_tail_tool_calls",
+		Description: "Tail tool-call events live. Replays recent tool.call / tool.result events (up to max_events, default 50), applying the same filters as cog_read_tool_calls. When Agent N's event bus lands, this will stream new events live; until then it returns a snapshot of the latest matching rows. Fallback: tail -f .cog/ledger/<sid>/events.jsonl | grep '\"type\":\"tool\\.'",
+	}, withToolObserver(m, "cog_tail_tool_calls", m.toolTailToolCalls))
 
 	// Agent state / loop control — closes Agent F gap #8 per Agent T's design.
 	mcp.AddTool(m.server, &mcp.Tool{
@@ -473,6 +491,39 @@ type triggerAgentLoopInput struct {
 	AgentID string `json:"agent_id,omitempty" jsonschema:"Which agent to trigger. Default \"primary\"."`
 	Reason  string `json:"reason,omitempty" jsonschema:"Free-text tag stored on a synthetic agent.wake event for audit (optional)."`
 	Wait    bool   `json:"wait,omitempty" jsonschema:"If true, block until the cycle completes (up to 90s) and return the outcome. Default false (fire-and-forget)."`
+}
+
+// readToolCallsInput mirrors ToolCallQuery for the MCP surface. Time bounds
+// accept RFC3339 strings; relative shorthand ("5m", "1h", "24h") is supported.
+type readToolCallsInput struct {
+	SessionID     string `json:"session_id,omitempty" jsonschema:"Filter to a session; empty = all sessions"`
+	ToolName      string `json:"tool_name,omitempty" jsonschema:"Exact match or wildcard (e.g. cog_read_*)"`
+	Status        string `json:"status,omitempty" jsonschema:"pending | success | error | rejected | timeout"`
+	Source        string `json:"source,omitempty" jsonschema:"mcp | openai-chat | anthropic-messages | kernel-loop"`
+	Ownership     string `json:"ownership,omitempty" jsonschema:"kernel | client"`
+	CallID        string `json:"call_id,omitempty" jsonschema:"Exact single-call lookup"`
+	Since         string `json:"since,omitempty" jsonschema:"Lower bound — RFC3339 timestamp or relative duration (e.g. 5m, 1h)"`
+	Until         string `json:"until,omitempty" jsonschema:"Upper bound — RFC3339 timestamp"`
+	Limit         int    `json:"limit,omitempty" jsonschema:"Default 100, max 500"`
+	Order         string `json:"order,omitempty" jsonschema:"desc (default) | asc"`
+	IncludeArgs   bool   `json:"include_args,omitempty" jsonschema:"Include arguments payload (default false — PII control)"`
+	IncludeOutput bool   `json:"include_output,omitempty" jsonschema:"Include output summary (default false — PII control)"`
+}
+
+// tailToolCallsInput is a snapshot-mode version of the live tail. Inherits
+// all of readToolCallsInput's filters; defaults include_args/include_output
+// to true (callers tailing are actively observing) and caps the returned set
+// with max_events + max_duration.
+type tailToolCallsInput struct {
+	SessionID   string `json:"session_id,omitempty" jsonschema:"Filter to a session; empty = all sessions"`
+	ToolName    string `json:"tool_name,omitempty" jsonschema:"Exact match or wildcard"`
+	Status      string `json:"status,omitempty" jsonschema:"pending | success | error | rejected | timeout"`
+	Source      string `json:"source,omitempty" jsonschema:"Source taxonomy filter"`
+	Ownership   string `json:"ownership,omitempty" jsonschema:"kernel | client"`
+	CallID      string `json:"call_id,omitempty" jsonschema:"Exact single-call lookup"`
+	Since       string `json:"since,omitempty" jsonschema:"Lower bound — RFC3339 or relative"`
+	MaxEvents   int    `json:"max_events,omitempty" jsonschema:"Stop after N matching events (default 50, max 500)"`
+	MaxDuration string `json:"max_duration,omitempty" jsonschema:"Hard cap on wall-clock (default 60s, max 10m)"`
 }
 
 // readConversationInput drives cog_read_conversation — see Agent R §5.2.
@@ -1150,6 +1201,110 @@ func agentErrorResult(err error, fallback string) (*mcp.CallToolResult, any, err
 		msg = ace.Message
 	}
 	return fallbackResult(msg, fallback)
+}
+
+// toolReadToolCalls is the MCP handler for cog_read_tool_calls. It parses the
+// input filters, invokes QueryToolCalls, and returns the stitched result.
+func (m *MCPServer) toolReadToolCalls(ctx context.Context, req *mcp.CallToolRequest, input readToolCallsInput) (*mcp.CallToolResult, any, error) {
+	q := ToolCallQuery{
+		SessionID:     input.SessionID,
+		ToolName:      input.ToolName,
+		Status:        input.Status,
+		Source:        input.Source,
+		Ownership:     input.Ownership,
+		CallID:        input.CallID,
+		Limit:         input.Limit,
+		Order:         input.Order,
+		IncludeArgs:   input.IncludeArgs,
+		IncludeOutput: input.IncludeOutput,
+	}
+	if input.Since != "" {
+		ts, err := parseTimeOrDuration(input.Since)
+		if err != nil {
+			return textResult(fmt.Sprintf("parse since: %v", err))
+		}
+		q.Since = ts
+	}
+	if input.Until != "" {
+		ts, err := parseTimeOrDuration(input.Until)
+		if err != nil {
+			return textResult(fmt.Sprintf("parse until: %v", err))
+		}
+		q.Until = ts
+	}
+	result, err := QueryToolCalls(m.cfg.WorkspaceRoot, q)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("query failed: %v", err),
+			"grep '\"type\":\"tool\\.' .cog/ledger/*/events.jsonl")
+	}
+	return marshalResult(result)
+}
+
+// toolTailToolCalls returns a snapshot of the most recent tool-call rows for
+// the filter set. When Agent N's event bus lands this will become a proper
+// SSE-style stream; the snapshot behavior is a safe stand-in (same data, same
+// shape) that does not rely on a broker.
+func (m *MCPServer) toolTailToolCalls(ctx context.Context, req *mcp.CallToolRequest, input tailToolCallsInput) (*mcp.CallToolResult, any, error) {
+	limit := input.MaxEvents
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	q := ToolCallQuery{
+		SessionID: input.SessionID,
+		ToolName:  input.ToolName,
+		Status:    input.Status,
+		Source:    input.Source,
+		Ownership: input.Ownership,
+		CallID:    input.CallID,
+		Limit:     limit,
+		Order:     "desc",
+		// Tails default to showing full rows — callers here are actively
+		// observing so the PII opt-out is moot.
+		IncludeArgs:   true,
+		IncludeOutput: true,
+	}
+	if input.Since != "" {
+		ts, err := parseTimeOrDuration(input.Since)
+		if err != nil {
+			return textResult(fmt.Sprintf("parse since: %v", err))
+		}
+		q.Since = ts
+	}
+	// MaxDuration is accepted for forward compatibility with a real stream.
+	// The snapshot path is instantaneous; no wait is needed.
+	_ = input.MaxDuration
+
+	result, err := QueryToolCalls(m.cfg.WorkspaceRoot, q)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("tail failed: %v", err),
+			"tail -f .cog/ledger/*/events.jsonl | grep '\"type\":\"tool\\.'")
+	}
+	stopped := "snapshot"
+	return marshalResult(map[string]any{
+		"count":          result.Count,
+		"events":         result.Calls,
+		"stopped_reason": stopped,
+		"truncated":      result.Truncated,
+	})
+}
+
+// parseTimeOrDuration accepts either an RFC3339 timestamp ("2026-04-21T…") or
+// a relative duration ("5m", "1h", "24h"). Durations subtract from "now".
+func parseTimeOrDuration(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if ts, err := time.Parse(time.RFC3339, s); err == nil {
+		return ts, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return time.Now().UTC().Add(-d), nil
+	}
+	return time.Time{}, fmt.Errorf("not RFC3339 and not a Go duration: %q", s)
 }
 
 // toolReadConversation is the MCP handler for cog_read_conversation.
