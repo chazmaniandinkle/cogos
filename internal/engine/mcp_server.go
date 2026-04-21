@@ -166,6 +166,15 @@ func (m *MCPServer) registerTools() {
 		Description: "Manually invoke one homeostatic cycle of the specified agent, outside the regular ticker. Equivalent to POST /v1/agents/{id}/tick. Returns immediately with a trigger receipt; cycle runs async unless wait=true. Refuses if a cycle is already in flight (overlap guard). Fallback: curl -X POST http://localhost:6931/v1/agents/primary/tick",
 	}, m.toolTriggerAgentLoop)
 
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name: "cog_read_conversation",
+		Description: "Read conversation turns (prompt + response pairs) from a session's chat history. " +
+			"Each turn is a complete user-to-assistant exchange; kernel tool calls are inlined when include_tools=true. " +
+			"Backed by the turn.completed ledger event + per-session sidecar (.cog/run/turns/<sid>.jsonl). " +
+			"Use after_turn / before_turn for pagination. Default: current process session, 20 turns, ascending. " +
+			"Fallback (kernel unavailable): jq -c . .cog/run/turns/<sid>.jsonl",
+	}, m.toolReadConversation)
+
 	// Config mutation API (Agent O design — closes Agent F gaps #5 + #19).
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_read_config",
@@ -464,6 +473,18 @@ type triggerAgentLoopInput struct {
 	AgentID string `json:"agent_id,omitempty" jsonschema:"Which agent to trigger. Default \"primary\"."`
 	Reason  string `json:"reason,omitempty" jsonschema:"Free-text tag stored on a synthetic agent.wake event for audit (optional)."`
 	Wait    bool   `json:"wait,omitempty" jsonschema:"If true, block until the cycle completes (up to 90s) and return the outcome. Default false (fire-and-forget)."`
+}
+
+// readConversationInput drives cog_read_conversation — see Agent R §5.2.
+type readConversationInput struct {
+	SessionID    string `json:"session_id,omitempty" jsonschema:"Session to read. Empty = current process session."`
+	AfterTurn    int    `json:"after_turn,omitempty" jsonschema:"Pagination: return turns with turn_index > this."`
+	BeforeTurn   int    `json:"before_turn,omitempty" jsonschema:"Reverse pagination: turn_index < this."`
+	Since        string `json:"since,omitempty" jsonschema:"RFC3339 lower bound on turn timestamp."`
+	Limit        int    `json:"limit,omitempty" jsonschema:"Max turns (default 20, max 200)."`
+	IncludeFull  *bool  `json:"include_full,omitempty" jsonschema:"Hydrate prompt/response from the sidecar (default true)."`
+	IncludeTools *bool  `json:"include_tools,omitempty" jsonschema:"Include kernel tool-call transcript (default true)."`
+	Order        string `json:"order,omitempty" jsonschema:"asc (default, natural reading order) or desc."`
 }
 
 type searchTracesInput struct {
@@ -1129,6 +1150,45 @@ func agentErrorResult(err error, fallback string) (*mcp.CallToolResult, any, err
 		msg = ace.Message
 	}
 	return fallbackResult(msg, fallback)
+}
+
+// toolReadConversation is the MCP handler for cog_read_conversation.
+// Thin wrapper over QueryConversation — same shape the HTTP surface returns.
+func (m *MCPServer) toolReadConversation(ctx context.Context, req *mcp.CallToolRequest, input readConversationInput) (*mcp.CallToolResult, any, error) {
+	sessionID := input.SessionID
+	if sessionID == "" && m.process != nil {
+		sessionID = m.process.SessionID()
+	}
+	includeFull := true
+	if input.IncludeFull != nil {
+		includeFull = *input.IncludeFull
+	}
+	includeTools := true
+	if input.IncludeTools != nil {
+		includeTools = *input.IncludeTools
+	}
+	q := ConversationQuery{
+		SessionID:    sessionID,
+		AfterTurn:    input.AfterTurn,
+		BeforeTurn:   input.BeforeTurn,
+		Limit:        input.Limit,
+		IncludeFull:  includeFull,
+		IncludeTools: includeTools,
+		Order:        input.Order,
+	}
+	if input.Since != "" {
+		t, err := time.Parse(time.RFC3339, input.Since)
+		if err != nil {
+			return textResult(fmt.Sprintf("invalid since (want RFC3339): %v", err))
+		}
+		q.Since = t
+	}
+	res, err := QueryConversation(m.cfg.WorkspaceRoot, q)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("query failed: %v", err),
+			fmt.Sprintf("jq -c . .cog/run/turns/%s.jsonl", sessionID))
+	}
+	return marshalResult(res)
 }
 
 // ── Config Mutation API ──────────────────────────────────────────────────────
