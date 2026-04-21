@@ -1,5 +1,3 @@
-//go:build mcpserver
-
 // tool_loop.go — Internal tool execution loop for the v3 kernel
 //
 // When the inference provider returns tool_calls, the kernel:

@@ -1,5 +1,3 @@
-//go:build mcpserver
-
 // cogdoc_service.go — Unified CogDoc write path
 //
 // CogDocService is the ONLY write path for CogDoc mutations. It ensures that

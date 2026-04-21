@@ -1,5 +1,3 @@
-//go:build mcpserver
-
 // ingest.go — Core types and interfaces for the deterministic ingestion pipeline.
 //
 // The ingestion pipeline decomposes heterogeneous input (URLs, conversations,

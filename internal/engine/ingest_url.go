@@ -1,5 +1,3 @@
-//go:build mcpserver
-
 // ingest_url.go — URL decomposer for the ingestion pipeline.
 //
 // Fetches a URL, extracts structured metadata from HTML (title, meta tags,
