@@ -294,8 +294,12 @@ func TestEmitIngestEvent(t *testing.T) {
 		t.Fatalf("EmitIngestEvent: %v", err)
 	}
 
-	// Read the ledger file and verify the event.
-	ledgerPath := filepath.Join(tmp, ".cog", "ledger", "events.jsonl")
+	// Post-cogos#10 refactor: EmitLedgerEvent routes through AppendEvent so
+	// ingestion events land in .cog/ledger/<session>/events.jsonl (not the
+	// flat orphan file). When called without a live Process the session
+	// bucket is "mcp-client" — the same path other MCP-client-originated
+	// events use.
+	ledgerPath := filepath.Join(tmp, ".cog", "ledger", "mcp-client", "events.jsonl")
 	data, err := os.ReadFile(ledgerPath)
 	if err != nil {
 		t.Fatalf("ReadFile ledger: %v", err)
@@ -306,25 +310,34 @@ func TestEmitIngestEvent(t *testing.T) {
 		t.Fatalf("expected 1 ledger line, got %d", len(lines))
 	}
 
-	var event map[string]any
-	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
-		t.Fatalf("unmarshal ledger event: %v", err)
+	// Envelope shape: {hashed_payload:{type,timestamp,session_id,data:{...}}, metadata:{hash,seq,source}}
+	var env EventEnvelope
+	if err := json.Unmarshal([]byte(lines[0]), &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
 	}
 
-	if event["type"] != IngestEventType {
-		t.Errorf("event type = %v; want %q", event["type"], IngestEventType)
+	if env.HashedPayload.Type != IngestEventType {
+		t.Errorf("event type = %v; want %q", env.HashedPayload.Type, IngestEventType)
 	}
-	if event["title"] != "Test Article" {
-		t.Errorf("event title = %v; want %q", event["title"], "Test Article")
-	}
-	if event["cogdoc_path"] != cogdocPath {
-		t.Errorf("event cogdoc_path = %v; want %q", event["cogdoc_path"], cogdocPath)
-	}
-	if event["cogdoc_uri"] != "cog:mem/"+cogdocPath {
-		t.Errorf("event cogdoc_uri = %v; want %q", event["cogdoc_uri"], "cog:mem/"+cogdocPath)
-	}
-	if _, ok := event["timestamp"]; !ok {
+	if env.HashedPayload.Timestamp == "" {
 		t.Error("event missing timestamp")
+	}
+	if env.HashedPayload.SessionID != "mcp-client" {
+		t.Errorf("event session_id = %q; want mcp-client", env.HashedPayload.SessionID)
+	}
+	if env.Metadata.Hash == "" {
+		t.Error("event missing hash — AppendEvent should set it")
+	}
+
+	data2 := env.HashedPayload.Data
+	if data2["title"] != "Test Article" {
+		t.Errorf("event data.title = %v; want %q", data2["title"], "Test Article")
+	}
+	if data2["cogdoc_path"] != cogdocPath {
+		t.Errorf("event data.cogdoc_path = %v; want %q", data2["cogdoc_path"], cogdocPath)
+	}
+	if data2["cogdoc_uri"] != "cog:mem/"+cogdocPath {
+		t.Errorf("event data.cogdoc_uri = %v; want %q", data2["cogdoc_uri"], "cog:mem/"+cogdocPath)
 	}
 }
 

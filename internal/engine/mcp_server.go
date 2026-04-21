@@ -127,6 +127,16 @@ func (m *MCPServer) registerTools() {
 	}, m.toolReadLedger)
 
 	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_read_events",
+		Description: "Query recent kernel events for observability. Returns historical events from the ledger without chain verification (use cog_read_ledger for audit). Filters: session_id, event_type (exact or 'attention.*' wildcard), source ('kernel-v3' / 'mcp-client'), since/until (RFC3339 or duration shorthand like '5m'), limit (default 100, max 1000), order ('desc' newest-first default, 'asc' oldest-first). Fallback: ls .cog/ledger/ && cat .cog/ledger/*/events.jsonl",
+	}, m.toolReadEvents)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_tail_events",
+		Description: "Tail kernel events as they are appended to the ledger, like 'tail -f'. Blocks until max_events or max_duration reached. Same filters as cog_read_events plus since= for replay before going live. Bounded by max_events (default 100, max 1000) and max_duration (default 60s, max 10m). Fallback: curl -N http://localhost:6931/v1/events/stream",
+	}, m.toolTailEvents)
+
+	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_ingest",
 		Description: "Ingest external material into CogOS knowledge. Deterministic decomposition — no LLM calls. Supports URLs, conversations, documents. Applies membrane policy (accept/quarantine/defer/discard).",
 	}, m.toolIngest)
@@ -373,6 +383,25 @@ type readLedgerInput struct {
 	SinceTimestamp string `json:"since_timestamp,omitempty" jsonschema:"RFC3339 timestamp; return events with timestamp >= this"`
 	Limit          int    `json:"limit,omitempty" jsonschema:"Maximum events to return. Default 100, capped at 1000."`
 	VerifyChain    bool   `json:"verify_chain,omitempty" jsonschema:"Recompute hashes and validate prior_hash links on returned events. Off by default (chain walk is O(N))."`
+}
+
+type readEventsInput struct {
+	SessionID string `json:"session_id,omitempty" jsonschema:"Filter to a single session; empty reads across all"`
+	EventType string `json:"event_type,omitempty" jsonschema:"Exact event type, or a prefix wildcard like 'attention.*'"`
+	Source    string `json:"source,omitempty" jsonschema:"Filter by source (e.g. 'kernel-v3', 'mcp-client')"`
+	Since     string `json:"since,omitempty" jsonschema:"RFC3339 timestamp or duration shorthand ('5m', '1h')"`
+	Until     string `json:"until,omitempty" jsonschema:"RFC3339 timestamp or duration shorthand (upper bound)"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum events to return. Default 100, capped at 1000."`
+	Order     string `json:"order,omitempty" jsonschema:"'desc' (default, newest first) or 'asc'"`
+}
+
+type tailEventsInput struct {
+	SessionID   string `json:"session_id,omitempty" jsonschema:"Filter to a single session; empty reads across all"`
+	EventType   string `json:"event_type,omitempty" jsonschema:"Exact event type, or a prefix wildcard like 'attention.*'"`
+	Source      string `json:"source,omitempty" jsonschema:"Filter by source (e.g. 'kernel-v3', 'mcp-client')"`
+	Since       string `json:"since,omitempty" jsonschema:"RFC3339 timestamp or duration shorthand; replay before going live"`
+	MaxEvents   int    `json:"max_events,omitempty" jsonschema:"Stop after receiving this many events. Default 100, capped at 1000."`
+	MaxDuration string `json:"max_duration,omitempty" jsonschema:"Stop after this duration ('30s', '5m'). Default 60s, capped at 10m."`
 }
 
 // getIndexInput — no longer an MCP tool; used by the internal tool loop (tool_loop.go).
@@ -809,16 +838,23 @@ func (m *MCPServer) toolEmitEvent(ctx context.Context, req *mcp.CallToolRequest,
 	if input.Type == "" {
 		return textResult("event type is required. Valid types: attention.boost, session.marker, insight.captured, decision.made")
 	}
-
-	event := map[string]any{
-		"type": input.Type,
+	if m.process == nil {
+		return fallbackResult("process not initialized", "echo '{\"type\":\"...\"}' >> .cog/ledger/<session_id>/events.jsonl")
 	}
+
+	// Build the event data. Legacy shape exposed payload under a separate
+	// "payload" key; the on-disk envelope shape uses "data". We flatten so
+	// subscribers see a uniform envelope and the historical payload is still
+	// reachable under data.payload.
+	data := map[string]any{}
 	if input.Payload != nil {
-		event["payload"] = input.Payload
+		data["payload"] = input.Payload
 	}
 
-	// Handle attention.boost: resolve URI to field key, then boost.
-	if input.Type == "attention.boost" && m.process != nil {
+	// Handle attention.boost: resolve URI to field key, then boost. Side
+	// effects are recorded in the event data so downstream consumers know
+	// the field mutated.
+	if input.Type == "attention.boost" {
 		if uri, ok := input.Payload["uri"].(string); ok && uri != "" {
 			fieldKey := ResolveToFieldKey(m.cfg.WorkspaceRoot, uri)
 			weight := 1.0
@@ -826,18 +862,23 @@ func (m *MCPServer) toolEmitEvent(ctx context.Context, req *mcp.CallToolRequest,
 				weight = w
 			}
 			m.process.Field().Boost(fieldKey, weight)
-			event["field_boosted"] = true
-			event["resolved_key"] = fieldKey
+			data["field_boosted"] = true
+			data["resolved_key"] = fieldKey
 		}
 	}
 
-	if err := EmitLedgerEvent(m.cfg, event); err != nil {
-		return fallbackResult(fmt.Sprintf("emit failed: %v", err), "echo '{\"type\":\"...\"}' >> .cog/ledger/events.jsonl")
+	// Route every emission through AppendEvent (hash chain + broker fan-out).
+	// Fixes the cogos#10 orphan-file bug: pre-refactor writes landed in a
+	// flat .cog/ledger/events.jsonl bypassing both the chain and the bus.
+	if err := m.process.EmitEvent(input.Type, data, "mcp-client"); err != nil {
+		return fallbackResult(fmt.Sprintf("emit failed: %v", err),
+			"echo '{\"type\":\"...\"}' >> .cog/ledger/<session_id>/events.jsonl")
 	}
 
 	return marshalResult(map[string]any{
-		"emitted": true,
-		"type":    input.Type,
+		"emitted":    true,
+		"type":       input.Type,
+		"session_id": m.process.SessionID(),
 	})
 }
 
@@ -856,6 +897,151 @@ func (m *MCPServer) toolReadLedger(ctx context.Context, req *mcp.CallToolRequest
 			"ls .cog/ledger/ && cat .cog/ledger/<session_id>/events.jsonl")
 	}
 	return marshalResult(result)
+}
+
+func (m *MCPServer) toolReadEvents(ctx context.Context, req *mcp.CallToolRequest, input readEventsInput) (*mcp.CallToolResult, any, error) {
+	now := time.Now().UTC()
+
+	sinceTime, err := ParseSinceDuration(input.Since, now)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("bad since: %v", err),
+			"check duration format (RFC3339 or '5m'/'1h')")
+	}
+	untilTime, err := ParseSinceDuration(input.Until, now)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("bad until: %v", err),
+			"check duration format (RFC3339 or '5m'/'1h')")
+	}
+
+	q := EventQuery{
+		SessionID:        input.SessionID,
+		EventTypePattern: input.EventType,
+		Source:           input.Source,
+		Since:            sinceTime,
+		Until:            untilTime,
+		Limit:            input.Limit,
+		Order:            input.Order,
+	}
+	result, err := QueryEvents(m.cfg.WorkspaceRoot, q)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("read events failed: %v", err),
+			"ls .cog/ledger/ && cat .cog/ledger/*/events.jsonl")
+	}
+	return marshalResult(result)
+}
+
+func (m *MCPServer) toolTailEvents(ctx context.Context, req *mcp.CallToolRequest, input tailEventsInput) (*mcp.CallToolResult, any, error) {
+	if m.process == nil {
+		return fallbackResult("process not initialised",
+			"curl -N http://localhost:6931/v1/events/stream")
+	}
+	broker := m.process.Broker()
+	if broker == nil {
+		return fallbackResult("event broker not available",
+			"curl -N http://localhost:6931/v1/events/stream")
+	}
+
+	// Parse bounds.
+	const (
+		defaultTailMaxEvents = 100
+		maxTailMaxEvents     = 1000
+		defaultTailDuration  = 60 * time.Second
+		maxTailDuration      = 10 * time.Minute
+	)
+	maxEvents := input.MaxEvents
+	if maxEvents <= 0 {
+		maxEvents = defaultTailMaxEvents
+	}
+	if maxEvents > maxTailMaxEvents {
+		maxEvents = maxTailMaxEvents
+	}
+	maxDur := defaultTailDuration
+	if input.MaxDuration != "" {
+		d, err := time.ParseDuration(input.MaxDuration)
+		if err != nil || d <= 0 {
+			return fallbackResult(fmt.Sprintf("bad max_duration: %q", input.MaxDuration),
+				"use a Go duration string like '30s' or '5m'")
+		}
+		maxDur = d
+	}
+	if maxDur > maxTailDuration {
+		maxDur = maxTailDuration
+	}
+
+	// Parse `since` for replay.
+	now := time.Now().UTC()
+	sinceTime, err := ParseSinceDuration(input.Since, now)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("bad since: %v", err),
+			"check duration format (RFC3339 or '5m'/'1h')")
+	}
+
+	filter := EventFilter{
+		SessionID:        input.SessionID,
+		EventTypePattern: input.EventType,
+		Source:           input.Source,
+	}
+
+	// Apply request context if available, plus our own max-duration cap.
+	tailCtx, cancel := context.WithTimeout(ctx, maxDur)
+	defer cancel()
+
+	sub, err := broker.Subscribe(tailCtx, filter)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("subscribe failed: %v", err),
+			"curl -N http://localhost:6931/v1/events/stream")
+	}
+	defer sub.Cancel()
+
+	// Replay matching ring entries first so reconnecting clients catch up.
+	replay := broker.RingReplay(filter, sinceTime)
+	events := make([]LedgerEvent, 0, maxEvents)
+	for _, env := range replay {
+		events = append(events, envelopeToLedgerEvent(env))
+		if len(events) >= maxEvents {
+			return marshalResult(map[string]any{
+				"count":          len(events),
+				"events":         events,
+				"stopped_reason": "max_events",
+			})
+		}
+	}
+
+	// Live loop.
+	stopped := "max_duration"
+tailLoop:
+	for len(events) < maxEvents {
+		select {
+		case env, ok := <-sub.Events:
+			if !ok {
+				stopped = "session_end"
+				break tailLoop
+			}
+			events = append(events, envelopeToLedgerEvent(env))
+			if len(events) >= maxEvents {
+				stopped = "max_events"
+				break tailLoop
+			}
+		case <-tailCtx.Done():
+			// Either ctx cancelled by caller or maxDur expired. ctx.Err
+			// distinguishes: deadline → max_duration, canceled → client_cancel.
+			if tailCtx.Err() == context.DeadlineExceeded {
+				stopped = "max_duration"
+			} else {
+				stopped = "client_cancel"
+			}
+			break tailLoop
+		}
+	}
+	if len(events) >= maxEvents {
+		stopped = "max_events"
+	}
+
+	return marshalResult(map[string]any{
+		"count":          len(events),
+		"events":         events,
+		"stopped_reason": stopped,
+	})
 }
 
 // toolGetIndex — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).

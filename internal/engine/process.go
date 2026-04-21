@@ -162,6 +162,12 @@ type Process struct {
 	// hookRegistry holds ADR-072 state-transition hooks loaded from
 	// .cog/hooks/transitions/*.yaml. May be nil if the directory is missing.
 	hookRegistry *stateHookRegistry
+
+	// broker fans out ledger events to live subscribers (SSE /
+	// cog_tail_events). Nil if the process was constructed without one.
+	// AppendEvent publishes through the package-level CurrentBroker() set
+	// by NewProcess, so call sites don't need to thread this pointer.
+	broker *EventBroker
 }
 
 // NewProcess constructs and initialises the process.
@@ -169,6 +175,12 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 	field := NewAttentionalField(cfg)
 	gate := NewGate(field, cfg)
 	now := time.Now().UTC()
+	broker := NewEventBroker(EventBrokerOptions{})
+	// Additive registration — every process's broker receives every
+	// ledger append. In production there's only one process so this is
+	// functionally identical to SetCurrentBroker; in tests it lets
+	// multiple parallel processes coexist without racing a single slot.
+	RegisterBroker(broker)
 	return &Process{
 		state:     StateReceptive,
 		nucleus:   nucleus,
@@ -191,7 +203,16 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 		nodeHealth:          NewNodeHealth(),
 		nodeManifest:        loadManifestQuiet(cfg),
 		hookRegistry:        loadStateHookRegistry(workspaceRootFromCfg(cfg)),
+		broker:              broker,
 	}
+}
+
+// Broker returns the process event broker (nil if not initialised).
+func (p *Process) Broker() *EventBroker {
+	if p == nil {
+		return nil
+	}
+	return p.broker
 }
 
 // workspaceRootFromCfg returns the workspace root from the config, or "" if nil.
@@ -774,6 +795,28 @@ func (p *Process) CurrentCycleID() string {
 
 // emitEvent records a ledger event for the process session.
 func (p *Process) emitEvent(eventType string, data map[string]interface{}) {
+	_ = p.EmitEvent(eventType, data, "kernel-v3")
+}
+
+// EmitEvent appends a single event to the session ledger via AppendEvent,
+// which means it flows through the hash chain AND the in-process broker.
+// Callers: MCP cog_emit_event tool, internal emitEvent helper.
+//
+// The `source` field lands on envelope.Metadata.Source — subscribers use it
+// to distinguish kernel-generated events (kernel-v3) from MCP-client events
+// (mcp-client) and future external sources.
+//
+// This replaces the pre-PR EmitLedgerEvent in mcp_stubs.go which wrote to a
+// flat .cog/ledger/events.jsonl orphan file bypassing hash chaining
+// (cogos#10). Post-refactor: every event — kernel or MCP — goes through
+// AppendEvent, so the live broker sees everything.
+func (p *Process) EmitEvent(eventType string, data map[string]interface{}, source string) error {
+	if p == nil {
+		return fmt.Errorf("process: nil receiver")
+	}
+	if source == "" {
+		source = "kernel-v3"
+	}
 	env := &EventEnvelope{
 		HashedPayload: EventPayload{
 			Type:      eventType,
@@ -782,12 +825,14 @@ func (p *Process) emitEvent(eventType string, data map[string]interface{}) {
 			Data:      data,
 		},
 		Metadata: EventMetadata{
-			Source: "kernel-v3",
+			Source: source,
 		},
 	}
 	if err := AppendEvent(p.cfg.WorkspaceRoot, p.sessionID, env); err != nil {
 		slog.Debug("process: ledger append failed", "err", fmt.Sprintf("%v", err))
+		return err
 	}
+	return nil
 }
 
 func loadOrCreateNodeID(cfg *Config) string {
