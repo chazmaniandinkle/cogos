@@ -130,6 +130,22 @@ func (m *MCPServer) registerTools() {
 		Name:        "cog_ingest",
 		Description: "Ingest external material into CogOS knowledge. Deterministic decomposition — no LLM calls. Supports URLs, conversations, documents. Applies membrane policy (accept/quarantine/defer/discard).",
 	}, m.toolIngest)
+
+	// Config mutation API (Agent O design — closes Agent F gaps #5 + #19).
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_read_config",
+		Description: "Read the kernel config (.cog/config/kernel.yaml). Returns the effective resolved config (defaults + file overrides). Optional include_raw_yaml returns the raw file bytes; include_defaults also returns the hardcoded defaults for diffing. kernel.yaml only — sibling configs (providers.yaml, secrets.yaml) are out of scope.",
+	}, m.toolReadConfig)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_write_config",
+		Description: "Merge a patch into the kernel config (.cog/config/kernel.yaml) using RFC 7396 JSON merge-patch semantics: fields omitted from the patch are left unchanged; explicit null removes a field and restores the default on next boot. Validated before persisting — returns violations without writing on failure. Atomic write + rotating .bak-<timestamp> backups (keeps 10). Takes effect on next daemon restart (requires_restart: true in response). Fallback: edit .cog/config/kernel.yaml and run `./scripts/cog restart`. No authentication — the kernel assumes a trusted local caller.",
+	}, m.toolWriteConfig)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_rollback_config",
+		Description: "Restore kernel.yaml from a prior .bak-<timestamp> backup. Pass list_only=true to enumerate available backups without restoring. If backup is empty, the most recent backup is used. Atomic restore; response carries updated backup list.",
+	}, m.toolRollbackConfig)
 }
 
 // registerResources registers MCP Resources — read-only addressable data.
@@ -156,6 +172,13 @@ func (m *MCPServer) registerResources() {
 		Description: "Top-20 salience-scored CogDocs with cog:// URIs",
 		MIMEType:    "application/json",
 	}, m.resourceField)
+
+	m.server.AddResource(&mcp.Resource{
+		URI:         "cogos://config",
+		Name:        "Kernel Config",
+		Description: "Effective kernel configuration (kernel.yaml resolved against defaults)",
+		MIMEType:    "application/json",
+	}, m.resourceConfig)
 }
 
 // ── Resource Handlers ───────────────────────────────────────────────────────
@@ -987,6 +1010,77 @@ func (m *MCPServer) toolIngest(ctx context.Context, req *mcp.CallToolRequest, in
 		"title":        result.Title,
 		"content_type": string(result.ContentType),
 	})
+}
+
+// ── Config Mutation API ──────────────────────────────────────────────────────
+
+type readConfigInput struct {
+	IncludeRawYAML  bool `json:"include_raw_yaml,omitempty" jsonschema:"Also return the raw kernel.yaml bytes"`
+	IncludeDefaults bool `json:"include_defaults,omitempty" jsonschema:"Also return the hardcoded defaults for comparison"`
+}
+
+type writeConfigInput struct {
+	Patch  map[string]any `json:"patch" jsonschema:"RFC 7396 merge-patch object. Fields: port, consolidation_interval, heartbeat_interval, salience_days_window, output_reserve, trm_weights_path, trm_embeddings_path, trm_chunks_path, ollama_embed_endpoint, ollama_embed_model, tool_call_validation_enabled, local_model, digest_paths. Explicit null deletes a key; missing keys preserved."`
+	Scope  string         `json:"scope,omitempty" jsonschema:"Target section: 'top' (default) or 'v3'"`
+	DryRun bool           `json:"dry_run,omitempty" jsonschema:"If true, validate + return diff without writing"`
+}
+
+type rollbackConfigInput struct {
+	Backup   string `json:"backup,omitempty" jsonschema:"Backup filename (e.g. kernel.yaml.bak-2026-04-21T16-30-00Z). Empty = most recent."`
+	ListOnly bool   `json:"list_only,omitempty" jsonschema:"If true, return the list of backups without restoring"`
+}
+
+func (m *MCPServer) toolReadConfig(ctx context.Context, req *mcp.CallToolRequest, input readConfigInput) (*mcp.CallToolResult, any, error) {
+	snapshot, err := ReadConfigSnapshot(m.cfg.WorkspaceRoot, input.IncludeRawYAML, input.IncludeDefaults)
+	if err != nil {
+		// Parse error — still surface whatever we could read but tag the error.
+		return marshalResult(map[string]any{
+			"effective_config": snapshot.EffectiveConfig,
+			"path":             snapshot.Path,
+			"exists":           snapshot.Exists,
+			"raw_yaml":         snapshot.RawYAML,
+			"defaults":         snapshot.Defaults,
+			"parse_error":      err.Error(),
+		})
+	}
+	return marshalResult(snapshot)
+}
+
+func (m *MCPServer) toolWriteConfig(ctx context.Context, req *mcp.CallToolRequest, input writeConfigInput) (*mcp.CallToolResult, any, error) {
+	result, err := WriteConfigPatch(m.cfg.WorkspaceRoot, input.Patch, WriteConfigOptions{
+		Scope:  input.Scope,
+		DryRun: input.DryRun,
+	})
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("write config failed: %v", err), "edit .cog/config/kernel.yaml and run './scripts/cog restart'")
+	}
+	return marshalResult(result)
+}
+
+func (m *MCPServer) toolRollbackConfig(ctx context.Context, req *mcp.CallToolRequest, input rollbackConfigInput) (*mcp.CallToolResult, any, error) {
+	result, err := RollbackConfig(m.cfg.WorkspaceRoot, RollbackOptions{
+		Backup:   input.Backup,
+		ListOnly: input.ListOnly,
+	})
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("rollback failed: %v", err), "mv .cog/config/kernel.yaml.bak-<timestamp> .cog/config/kernel.yaml")
+	}
+	return marshalResult(result)
+}
+
+func (m *MCPServer) resourceConfig(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	snapshot, _ := ReadConfigSnapshot(m.cfg.WorkspaceRoot, false, true)
+	b, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	return &mcp.ReadResourceResult{
+		Contents: []*mcp.ResourceContents{{
+			URI:      req.Params.URI,
+			MIMEType: "application/json",
+			Text:     string(b),
+		}},
+	}, nil
 }
 
 // slugify converts a string to a URL-friendly slug.
