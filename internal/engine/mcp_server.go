@@ -1,7 +1,7 @@
 // mcp_server.go — MCP Streamable HTTP server for CogOS v3
 //
 // Embeds the MCP server into the existing HTTP server at /mcp.
-// Registers 10 MCP tools and 3 MCP resources. Four former tools
+// Registers 11 MCP tools and 3 MCP resources. Four former tools
 // (resolve_uri, get_trust, get_nucleus, get_index) are no longer
 // registered as MCP tools but their implementations remain — used
 // by the internal tool loop (tool_loop.go).
@@ -122,6 +122,11 @@ func (m *MCPServer) registerTools() {
 	}, m.toolEmitEvent)
 
 	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_read_ledger",
+		Description: "Read the hash-chained event ledger. Filter by session_id, event_type (exact or 'prefix.*' wildcard), after_seq (requires session_id), since_timestamp (RFC3339), or limit (default 100, max 1000). Set verify_chain=true to recompute hashes and validate prior_hash links. Fallback: cat .cog/ledger/<session_id>/events.jsonl",
+	}, m.toolReadLedger)
+
+	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_ingest",
 		Description: "Ingest external material into CogOS knowledge. Deterministic decomposition — no LLM calls. Supports URLs, conversations, documents. Applies membrane policy (accept/quarantine/defer/discard).",
 	}, m.toolIngest)
@@ -134,6 +139,22 @@ func (m *MCPServer) registerTools() {
 			"Use after_turn / before_turn for pagination. Default: current process session, 20 turns, ascending. " +
 			"Fallback (kernel unavailable): jq -c . .cog/run/turns/<sid>.jsonl",
 	}, m.toolReadConversation)
+
+	// Config mutation API (Agent O design — closes Agent F gaps #5 + #19).
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_read_config",
+		Description: "Read the kernel config (.cog/config/kernel.yaml). Returns the effective resolved config (defaults + file overrides). Optional include_raw_yaml returns the raw file bytes; include_defaults also returns the hardcoded defaults for diffing. kernel.yaml only — sibling configs (providers.yaml, secrets.yaml) are out of scope.",
+	}, m.toolReadConfig)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_write_config",
+		Description: "Merge a patch into the kernel config (.cog/config/kernel.yaml) using RFC 7396 JSON merge-patch semantics: fields omitted from the patch are left unchanged; explicit null removes a field and restores the default on next boot. Validated before persisting — returns violations without writing on failure. Atomic write + rotating .bak-<timestamp> backups (keeps 10). Takes effect on next daemon restart (requires_restart: true in response). Fallback: edit .cog/config/kernel.yaml and run `./scripts/cog restart`. No authentication — the kernel assumes a trusted local caller.",
+	}, m.toolWriteConfig)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_rollback_config",
+		Description: "Restore kernel.yaml from a prior .bak-<timestamp> backup. Pass list_only=true to enumerate available backups without restoring. If backup is empty, the most recent backup is used. Atomic restore; response carries updated backup list.",
+	}, m.toolRollbackConfig)
 }
 
 // registerResources registers MCP Resources — read-only addressable data.
@@ -160,6 +181,13 @@ func (m *MCPServer) registerResources() {
 		Description: "Top-20 salience-scored CogDocs with cog:// URIs",
 		MIMEType:    "application/json",
 	}, m.resourceField)
+
+	m.server.AddResource(&mcp.Resource{
+		URI:         "cogos://config",
+		Name:        "Kernel Config",
+		Description: "Effective kernel configuration (kernel.yaml resolved against defaults)",
+		MIMEType:    "application/json",
+	}, m.resourceConfig)
 }
 
 // ── Resource Handlers ───────────────────────────────────────────────────────
@@ -368,6 +396,15 @@ type readCogdocResult struct {
 type emitEventInput struct {
 	Type    string         `json:"type" jsonschema:"Event type: attention.boost, session.marker, insight.captured, decision.made"`
 	Payload map[string]any `json:"payload,omitempty" jsonschema:"Event payload. attention.boost: {uri, weight}. session.marker: {label}. insight.captured: {summary, tags}. decision.made: {decision, rationale}."`
+}
+
+type readLedgerInput struct {
+	SessionID      string `json:"session_id,omitempty" jsonschema:"Filter to a single session; empty reads across all non-genesis sessions"`
+	EventType      string `json:"event_type,omitempty" jsonschema:"Exact event type, or a prefix wildcard like 'attention.*'"`
+	AfterSeq       int64  `json:"after_seq,omitempty" jsonschema:"Return events with seq greater than this. Requires session_id (seq is not monotonic across sessions)."`
+	SinceTimestamp string `json:"since_timestamp,omitempty" jsonschema:"RFC3339 timestamp; return events with timestamp >= this"`
+	Limit          int    `json:"limit,omitempty" jsonschema:"Maximum events to return. Default 100, capped at 1000."`
+	VerifyChain    bool   `json:"verify_chain,omitempty" jsonschema:"Recompute hashes and validate prior_hash links on returned events. Off by default (chain walk is O(N))."`
 }
 
 // getIndexInput — no longer an MCP tool; used by the internal tool loop (tool_loop.go).
@@ -848,6 +885,23 @@ func (m *MCPServer) toolEmitEvent(ctx context.Context, req *mcp.CallToolRequest,
 	})
 }
 
+func (m *MCPServer) toolReadLedger(ctx context.Context, req *mcp.CallToolRequest, input readLedgerInput) (*mcp.CallToolResult, any, error) {
+	q := LedgerQuery{
+		SessionID:      input.SessionID,
+		EventType:      input.EventType,
+		AfterSeq:       input.AfterSeq,
+		SinceTimestamp: input.SinceTimestamp,
+		Limit:          input.Limit,
+		VerifyChain:    input.VerifyChain,
+	}
+	result, err := QueryLedger(m.cfg.WorkspaceRoot, q)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("read ledger failed: %v", err),
+			"ls .cog/ledger/ && cat .cog/ledger/<session_id>/events.jsonl")
+	}
+	return marshalResult(result)
+}
+
 // toolGetIndex — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
 func (m *MCPServer) toolGetIndex(ctx context.Context, req *mcp.CallToolRequest, input getIndexInput) (*mcp.CallToolResult, any, error) {
 	index, err := BuildMemoryIndex(m.cfg.WorkspaceRoot, input.Sector)
@@ -1016,6 +1070,77 @@ func (m *MCPServer) toolReadConversation(ctx context.Context, req *mcp.CallToolR
 			fmt.Sprintf("jq -c . .cog/run/turns/%s.jsonl", sessionID))
 	}
 	return marshalResult(res)
+}
+
+// ── Config Mutation API ──────────────────────────────────────────────────────
+
+type readConfigInput struct {
+	IncludeRawYAML  bool `json:"include_raw_yaml,omitempty" jsonschema:"Also return the raw kernel.yaml bytes"`
+	IncludeDefaults bool `json:"include_defaults,omitempty" jsonschema:"Also return the hardcoded defaults for comparison"`
+}
+
+type writeConfigInput struct {
+	Patch  map[string]any `json:"patch" jsonschema:"RFC 7396 merge-patch object. Fields: port, consolidation_interval, heartbeat_interval, salience_days_window, output_reserve, trm_weights_path, trm_embeddings_path, trm_chunks_path, ollama_embed_endpoint, ollama_embed_model, tool_call_validation_enabled, local_model, digest_paths. Explicit null deletes a key; missing keys preserved."`
+	Scope  string         `json:"scope,omitempty" jsonschema:"Target section: 'top' (default) or 'v3'"`
+	DryRun bool           `json:"dry_run,omitempty" jsonschema:"If true, validate + return diff without writing"`
+}
+
+type rollbackConfigInput struct {
+	Backup   string `json:"backup,omitempty" jsonschema:"Backup filename (e.g. kernel.yaml.bak-2026-04-21T16-30-00Z). Empty = most recent."`
+	ListOnly bool   `json:"list_only,omitempty" jsonschema:"If true, return the list of backups without restoring"`
+}
+
+func (m *MCPServer) toolReadConfig(ctx context.Context, req *mcp.CallToolRequest, input readConfigInput) (*mcp.CallToolResult, any, error) {
+	snapshot, err := ReadConfigSnapshot(m.cfg.WorkspaceRoot, input.IncludeRawYAML, input.IncludeDefaults)
+	if err != nil {
+		// Parse error — still surface whatever we could read but tag the error.
+		return marshalResult(map[string]any{
+			"effective_config": snapshot.EffectiveConfig,
+			"path":             snapshot.Path,
+			"exists":           snapshot.Exists,
+			"raw_yaml":         snapshot.RawYAML,
+			"defaults":         snapshot.Defaults,
+			"parse_error":      err.Error(),
+		})
+	}
+	return marshalResult(snapshot)
+}
+
+func (m *MCPServer) toolWriteConfig(ctx context.Context, req *mcp.CallToolRequest, input writeConfigInput) (*mcp.CallToolResult, any, error) {
+	result, err := WriteConfigPatch(m.cfg.WorkspaceRoot, input.Patch, WriteConfigOptions{
+		Scope:  input.Scope,
+		DryRun: input.DryRun,
+	})
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("write config failed: %v", err), "edit .cog/config/kernel.yaml and run './scripts/cog restart'")
+	}
+	return marshalResult(result)
+}
+
+func (m *MCPServer) toolRollbackConfig(ctx context.Context, req *mcp.CallToolRequest, input rollbackConfigInput) (*mcp.CallToolResult, any, error) {
+	result, err := RollbackConfig(m.cfg.WorkspaceRoot, RollbackOptions{
+		Backup:   input.Backup,
+		ListOnly: input.ListOnly,
+	})
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("rollback failed: %v", err), "mv .cog/config/kernel.yaml.bak-<timestamp> .cog/config/kernel.yaml")
+	}
+	return marshalResult(result)
+}
+
+func (m *MCPServer) resourceConfig(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	snapshot, _ := ReadConfigSnapshot(m.cfg.WorkspaceRoot, false, true)
+	b, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	return &mcp.ReadResourceResult{
+		Contents: []*mcp.ResourceContents{{
+			URI:      req.Params.URI,
+			MIMEType: "application/json",
+			Text:     string(b),
+		}},
+	}, nil
 }
 
 // slugify converts a string to a URL-friendly slug.
