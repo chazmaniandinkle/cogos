@@ -185,6 +185,11 @@ func (m *MCPServer) registerTools() {
 	}, m.toolTriggerAgentLoop)
 
 	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_tail_kernel_log",
+		Description: "Read recent entries from the kernel's own diagnostic log (slog JSON at .cog/run/kernel.log.jsonl). Returns newest-first, optionally filtered by level, substring, and time range. This is the OPERATOR/DEBUG surface — for hash-chained event history use cog_read_ledger (when available); for client metabolites (turn metrics, attention, proprioceptive) use cog_search_traces. Fallback: tail -n 100 .cog/run/kernel.log.jsonl | jq -c .",
+	}, m.toolTailKernelLog)
+
+	mcp.AddTool(m.server, &mcp.Tool{
 		Name: "cog_read_conversation",
 		Description: "Read conversation turns (prompt + response pairs) from a session's chat history. " +
 			"Each turn is a complete user-to-assistant exchange; kernel tool calls are inlined when include_tools=true. " +
@@ -475,6 +480,14 @@ type ingestInput struct {
 	Format   string            `json:"format" jsonschema:"Input format: url, conversation, message, document"`
 	Data     string            `json:"data" jsonschema:"Raw material to ingest (URL, text, JSON)"`
 	Metadata map[string]string `json:"metadata,omitempty" jsonschema:"Optional context (discord_message_id, channel, etc.)"`
+}
+
+type tailKernelLogInput struct {
+	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum entries to return (default 100, max 1000)"`
+	Level     string `json:"level,omitempty" jsonschema:"Filter by exact level (case-insensitive): debug|info|warn|error"`
+	Substring string `json:"substring,omitempty" jsonschema:"Case-insensitive substring filter applied to the raw JSON line. Max 1024 chars."`
+	Since     string `json:"since,omitempty" jsonschema:"Lower time bound. RFC3339 OR duration like '5m', '2h', '24h'."`
+	Until     string `json:"until,omitempty" jsonschema:"Upper time bound. RFC3339 OR duration."`
 }
 
 type listAgentsInput struct {
@@ -1149,6 +1162,44 @@ func (m *MCPServer) toolIngest(ctx context.Context, req *mcp.CallToolRequest, in
 		"title":        result.Title,
 		"content_type": string(result.ContentType),
 	})
+}
+
+// toolTailKernelLog reads the kernel slog JSONL sink at
+// <workspace>/.cog/run/kernel.log.jsonl and returns the most recent entries
+// that match the filters in input. Mirror of GET /v1/kernel-log; shares the
+// same QueryKernelLog backend. See Agent U's kernel-slog-api design for
+// rationale (this is the surface half; log_capture.go is the capture half).
+func (m *MCPServer) toolTailKernelLog(ctx context.Context, req *mcp.CallToolRequest, input tailKernelLogInput) (*mcp.CallToolResult, any, error) {
+	q, err := BuildKernelLogQueryFromValues(
+		intToStr(input.Limit),
+		input.Level,
+		input.Substring,
+		input.Since,
+		input.Until,
+		time.Now(),
+	)
+	if err != nil {
+		return textResult(fmt.Sprintf("invalid kernel-log query: %v", err))
+	}
+
+	path := kernelLogPathFor(m.cfg)
+	result, err := QueryKernelLog(path, q)
+	if err != nil {
+		return fallbackResult(
+			fmt.Sprintf("kernel log query failed: %v", err),
+			fmt.Sprintf("tail -n 100 %s | jq -c .", path),
+		)
+	}
+	return marshalResult(result)
+}
+
+// intToStr renders an int as a string for BuildKernelLogQueryFromValues.
+// Zero is returned as "" so callers get the default limit rather than 0.
+func intToStr(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d", n)
 }
 
 // --- Agent state / loop control tools -------------------------------------

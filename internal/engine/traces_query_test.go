@@ -192,7 +192,7 @@ func TestQueryFilterBySessionID(t *testing.T) {
 }
 
 // 5. since= as duration AND RFC3339.
-func TestQueryFilterBySinceDuration(t *testing.T) {
+func TestQueryTracesFilterBySinceDuration(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	now := time.Now().UTC().Truncate(time.Second)

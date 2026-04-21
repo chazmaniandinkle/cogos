@@ -11,6 +11,7 @@
 //	GET  /v1/proprioceptive                — last 50 proprioceptive log entries + light cone status
 //	GET  /v1/ledger                        — query the hash-chained event ledger
 //	GET  /v1/lightcone                     — light cone metadata (placeholder)
+//	GET  /v1/kernel-log                    — tail kernel slog (diagnostic text) JSONL sink; filter by level/substring/time
 //
 // Constellation / attention endpoints (Phase 3, see serve_attention.go):
 //
@@ -77,6 +78,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	mux.HandleFunc("GET /v1/traces", s.handleTraces)
 	mux.HandleFunc("GET /v1/lightcone", s.handleLightCone)
 	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext)
+	mux.HandleFunc("GET /v1/kernel-log", s.handleKernelLog)
 	mux.HandleFunc("GET /v1/tool-calls", s.handleToolCalls)
 	mux.HandleFunc("GET /v1/conversation", s.handleConversation)
 

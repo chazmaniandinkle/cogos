@@ -225,7 +225,7 @@ func TestToolCallsQueryTruncation(t *testing.T) {
 	root := makeWorkspace(t)
 	now := time.Now().UTC()
 	for i := 0; i < 150; i++ {
-		seedToolCall(t, root, "s1", "call-"+intToStr(i), "cog_x", now.Add(time.Duration(i)*time.Millisecond), nil)
+		seedToolCall(t, root, "s1", "call-"+intToStrTest(i), "cog_x", now.Add(time.Duration(i)*time.Millisecond), nil)
 	}
 	result, err := QueryToolCalls(root, ToolCallQuery{SessionID: "s1", Limit: 100})
 	if err != nil {
@@ -350,8 +350,10 @@ func TestQuerySourceCounts(t *testing.T) {
 	}
 }
 
-// intToStr is a tiny local helper so the test file doesn't pull strconv.
-func intToStr(n int) string {
+// intToStrTest is a tiny local helper so the test file doesn't pull strconv.
+// Renamed to avoid collision with the production intToStr in mcp_server.go
+// introduced by the kernel-slog-api branch.
+func intToStrTest(n int) string {
 	if n == 0 {
 		return "0"
 	}
