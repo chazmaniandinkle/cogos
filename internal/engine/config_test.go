@@ -18,6 +18,11 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.Port != 6931 {
 		t.Errorf("Port = %d; want 6931", cfg.Port)
 	}
+	// Default bind MUST be loopback — security posture for issue #12.
+	// Operators opt into 0.0.0.0 explicitly; never by accident.
+	if cfg.BindAddr != "127.0.0.1" {
+		t.Errorf("BindAddr = %q; want default 127.0.0.1 (loopback-only)", cfg.BindAddr)
+	}
 	if cfg.ConsolidationInterval != 3600 {
 		t.Errorf("ConsolidationInterval = %d; want 3600", cfg.ConsolidationInterval)
 	}
@@ -88,6 +93,69 @@ digest_paths:
 	}
 	if cfg.DigestPaths["openclaw"] != "/tmp/openclaw" {
 		t.Errorf("DigestPaths[openclaw] = %q; want /tmp/openclaw", cfg.DigestPaths["openclaw"])
+	}
+}
+
+// TestLoadConfigBindAddrFromYAML verifies that a `bind_addr: 0.0.0.0`
+// entry in kernel.yaml parses and applies to Config. Regression test for
+// cogos#12 (BindAddr declared but never wired).
+func TestLoadConfigBindAddrFromYAML(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	kernelYAML := "bind_addr: 0.0.0.0\n"
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "kernel.yaml"), kernelYAML)
+
+	cfg, err := LoadConfig(root, 0)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	if cfg.BindAddr != "0.0.0.0" {
+		t.Errorf("BindAddr = %q; want 0.0.0.0 (from YAML)", cfg.BindAddr)
+	}
+	// Port should still default — bind_addr shouldn't affect anything else.
+	if cfg.Port != 6931 {
+		t.Errorf("Port = %d; want default 6931", cfg.Port)
+	}
+}
+
+// TestLoadConfigBindAddrV3SectionOverridesTopLevel mirrors the existing
+// v3-override pattern for the bind_addr field.
+func TestLoadConfigBindAddrV3SectionOverridesTopLevel(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	kernelYAML := `bind_addr: 127.0.0.1
+v3:
+  bind_addr: 0.0.0.0
+`
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "kernel.yaml"), kernelYAML)
+
+	cfg, err := LoadConfig(root, 0)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	if cfg.BindAddr != "0.0.0.0" {
+		t.Errorf("BindAddr = %q; want 0.0.0.0 (v3 section)", cfg.BindAddr)
+	}
+}
+
+// TestLoadConfigBindAddrMissingKeepsLoopback verifies that YAML without a
+// bind_addr key does NOT reset the default to empty — the zero-skip pattern
+// must preserve the loopback default.
+func TestLoadConfigBindAddrMissingKeepsLoopback(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	kernelYAML := "port: 7000\n" // bind_addr absent
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "kernel.yaml"), kernelYAML)
+
+	cfg, err := LoadConfig(root, 0)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	if cfg.BindAddr != "127.0.0.1" {
+		t.Errorf("BindAddr = %q; want default 127.0.0.1 (YAML omitted bind_addr)", cfg.BindAddr)
 	}
 }
 

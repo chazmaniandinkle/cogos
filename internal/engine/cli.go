@@ -46,7 +46,7 @@ func Main() {
 			runInitCmd(args[1:], *workspace)
 			return
 		case "serve":
-			runServeCmd(args[1:], *workspace, *port)
+			runServeCmd(args[1:], *workspace, *port, "")
 			return
 		case "start":
 			runStartCmd(args[1:], *workspace, *port)
@@ -96,7 +96,7 @@ func Main() {
 	}
 
 	// Compatibility path: plain `cogos-v3` still serves in the foreground.
-	runServe(*workspace, *port)
+	runServe(*workspace, *port, "")
 }
 
 func runInitCmd(args []string, defaultWorkspace string) {
@@ -125,15 +125,16 @@ func setupLogger() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 }
 
-func runServeCmd(args []string, defaultWorkspace string, defaultPort int) {
+func runServeCmd(args []string, defaultWorkspace string, defaultPort int, defaultBind string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	workspace := fs.String("workspace", defaultWorkspace, "Workspace root path (auto-detected if empty)")
 	port := fs.Int("port", defaultPort, "HTTP API port (default 6931)")
+	bind := fs.String("bind", defaultBind, "HTTP server bind address (default 127.0.0.1; use 0.0.0.0 for LAN, requires trusted network)")
 	_ = fs.Parse(args)
-	runServe(*workspace, *port)
+	runServe(*workspace, *port, *bind)
 }
 
-func runServe(workspace string, port int) {
+func runServe(workspace string, port int, bindAddr string) {
 	setupLogger()
 	slog.Info("cogos-v3: starting", "build", BuildTime)
 
@@ -143,13 +144,25 @@ func runServe(workspace string, port int) {
 		slog.Error("config load failed", "err", err)
 		os.Exit(1)
 	}
+	// Flag override for bind address (takes precedence over YAML).
+	// LoadConfig cannot accept it as a parameter without breaking many
+	// unrelated call-sites, so we apply it here symmetrically with the
+	// port flag.
+	if bindAddr != "" {
+		cfg.BindAddr = bindAddr
+	}
+	// Defensive fallback: if BindAddr is somehow still empty after load
+	// (older YAML + empty-string flag + missing default), pin to loopback.
+	if cfg.BindAddr == "" {
+		cfg.BindAddr = "127.0.0.1"
+	}
 	// Now that the workspace root is known, upgrade the stderr-only logger
 	// to also fan records to <workspace>/.cog/run/kernel.log.jsonl (Agent U's
 	// kernel-slog-api). Lines logged above go to stderr only; lines below
 	// this call also land in the JSONL sink exposed by /v1/kernel-log and
 	// the cog_tail_kernel_log MCP tool.
 	upgradeLoggerWithFileSink(cfg)
-	slog.Info("config loaded", "workspace", cfg.WorkspaceRoot, "port", cfg.Port)
+	slog.Info("config loaded", "workspace", cfg.WorkspaceRoot, "port", cfg.Port, "bind", cfg.BindAddr)
 
 	if reuse, msg, err := planServeState(cfg, checkDaemonHealth); err != nil {
 		slog.Error("daemon lifecycle failed", "err", err)

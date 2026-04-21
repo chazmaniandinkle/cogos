@@ -133,9 +133,11 @@ func (s *serveServer) handleWatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upgrade to WebSocket
+	// Upgrade to WebSocket. Origin patterns follow the server's bind address:
+	// loopback stays tight, non-loopback relaxes to "*" (security is enforced
+	// at the network boundary when opting into 0.0.0.0).
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: []string{"localhost:*", "127.0.0.1:*"},
+		OriginPatterns: originPatternsForBind(s.bindAddr),
 	})
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "failed to upgrade: "+err.Error(), "server_error")

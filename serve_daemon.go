@@ -300,6 +300,7 @@ func getStartTimeFromPID(pid int) (time.Time, error) {
 
 func cmdServe(args []string) int {
 	port := defaultServePort
+	bindAddr := ""
 	subCmd := ""
 
 	// Parse arguments to find subcommand and flags
@@ -309,6 +310,11 @@ func cmdServe(args []string) int {
 		case "--port", "-p":
 			if i+1 < len(args) {
 				fmt.Sscanf(args[i+1], "%d", &port)
+				i++
+			}
+		case "--bind":
+			if i+1 < len(args) {
+				bindAddr = args[i+1]
 				i++
 			}
 		case "--debug":
@@ -339,12 +345,15 @@ func cmdServe(args []string) int {
 		return cmdServeDisable()
 	default:
 		// No subcommand = run in foreground (existing behavior)
-		return cmdServeForeground(port)
+		return cmdServeForeground(port, bindAddr)
 	}
 }
 
-// cmdServeForeground runs the server in the foreground
-func cmdServeForeground(port int) int {
+// cmdServeForeground runs the server in the foreground. An empty bindAddr
+// falls back to loopback ("127.0.0.1"); "0.0.0.0" opens all interfaces
+// (opt-in for pod/LAN/Tailnet deployments that handle the network boundary
+// at a lower layer).
+func cmdServeForeground(port int, bindAddr string) int {
 	// When running under launchd (stdout is not a terminal), redirect all output
 	// through a rotating log writer so StandardOutPath doesn't grow unbounded.
 	if !isStdoutTerminal() {
@@ -408,7 +417,7 @@ func cmdServeForeground(port int) int {
 		}
 	}
 
-	server := newServeServer(port, kernel)
+	server := newServeServerWithBind(port, bindAddr, kernel)
 
 	// Initialize OCI auto-reload
 	if root != "" {
@@ -1193,6 +1202,8 @@ Commands:
 
 Options:
   --port, -p <port>   Port to listen on (default: %d)
+  --bind <addr>       HTTP server bind address (default 127.0.0.1; use 0.0.0.0
+                      for LAN, requires trusted network)
   --help, -h          Show this help
 
 Inference Endpoints (OpenAI-compatible):
