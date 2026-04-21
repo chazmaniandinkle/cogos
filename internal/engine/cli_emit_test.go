@@ -49,6 +49,7 @@ func readLedger(t *testing.T, root, sessionID string) []*EventEnvelope {
 // via AppendEvent, with hash chaining intact.
 func TestRunEmitCmd_EmitsToLedger(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(resetLedgerCacheForTest)
 	root := newTestWorkspace(t)
 	sessionID := "test-session-emit-ledger"
 

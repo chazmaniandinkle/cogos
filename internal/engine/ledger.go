@@ -216,6 +216,18 @@ func getCachedLastEvent(sessionID string) *EventEnvelope {
 	return lastEventCache.bySession[sessionID]
 }
 
+// resetLedgerCacheForTest clears the package-level lastEventCache. Only intended
+// for tests: when -count>=2 reuses the same sessionID across fresh workspace
+// roots, the cache from the prior iteration's root leaks into the new one and
+// computes a wrong prior_hash (breaking chain-integrity assertions). Callers
+// should invoke this via t.Cleanup at the start of any test that pins a
+// sessionID literal.
+func resetLedgerCacheForTest() {
+	lastEventCache.mu.Lock()
+	defer lastEventCache.mu.Unlock()
+	lastEventCache.bySession = make(map[string]*EventEnvelope)
+}
+
 func setCachedLastEvent(sessionID string, env *EventEnvelope) {
 	lastEventCache.mu.Lock()
 	defer lastEventCache.mu.Unlock()
