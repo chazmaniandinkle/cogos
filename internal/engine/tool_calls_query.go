@@ -333,32 +333,6 @@ func toolNameMatches(name, pattern string) bool {
 	return true
 }
 
-// listLedgerSessions returns the session IDs to scan. If sessionID is non-
-// empty, only that one is returned (even if the directory does not exist yet
-// — the caller will get an empty result). Otherwise every directory under
-// .cog/ledger/ is returned.
-func listLedgerSessions(workspaceRoot, sessionID string) ([]string, error) {
-	if sessionID != "" {
-		return []string{sessionID}, nil
-	}
-	ledgerBase := filepath.Join(workspaceRoot, ".cog", "ledger")
-	entries, err := os.ReadDir(ledgerBase)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read ledger dir: %w", err)
-	}
-	var out []string
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		out = append(out, e.Name())
-	}
-	return out, nil
-}
-
 // incSourceCount bumps the matching bucket in ToolCallSourceCounts.
 func incSourceCount(c *ToolCallSourceCounts, source string) {
 	switch source {
