@@ -18,6 +18,7 @@ import (
 	"time"
 
 	sdk "github.com/cogos-dev/cogos/sdk"
+	"golang.org/x/sys/unix"
 )
 
 // === LOG ROTATION ===
@@ -126,11 +127,11 @@ func redirectOutputToRotatingLog(logPath string, maxSize int64, maxFiles int) (*
 	}
 
 	// Replace fd 1 (stdout) and fd 2 (stderr) with the pipe's write end
-	if err := syscall.Dup2(int(pw.Fd()), 1); err != nil {
+	if err := unix.Dup2(int(pw.Fd()), 1); err != nil {
 		w.Close()
 		return nil, fmt.Errorf("dup2 stdout: %w", err)
 	}
-	if err := syscall.Dup2(int(pw.Fd()), 2); err != nil {
+	if err := unix.Dup2(int(pw.Fd()), 2); err != nil {
 		w.Close()
 		return nil, fmt.Errorf("dup2 stderr: %w", err)
 	}
