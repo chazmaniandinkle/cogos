@@ -74,10 +74,26 @@ func (s *serveServer) handleContextBuild(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Parse UCP headers (same semantics as /v1/chat/completions).
-	ucpContext, err := parseUCPHeaders(r, workspaceRoot)
-	if err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid UCP headers: "+err.Error(), "invalid_request")
-		return
+	// When workspaceRoot is empty (kernel nil but contextEngine present),
+	// UCP packet validation cannot load workspace-backed schemas. Skip parsing
+	// in that case rather than return a spurious 400 — the request is still
+	// serviceable via the flat-message path below.
+	var ucpContext *UCPContext
+	if workspaceRoot != "" {
+		var err error
+		ucpContext, err = parseUCPHeaders(r, workspaceRoot)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "Invalid UCP headers: "+err.Error(), "invalid_request")
+			return
+		}
+	} else {
+		// Log once if any UCP headers were supplied but cannot be validated.
+		for _, h := range []string{"X-UCP-Identity", "X-UCP-TAA", "X-UCP-Memory", "X-UCP-History", "X-UCP-Workspace", "X-UCP-User"} {
+			if r.Header.Get(h) != "" {
+				log.Printf("[context-build] UCP headers present but workspaceRoot unavailable (kernel nil); skipping UCP parsing")
+				break
+			}
+		}
 	}
 
 	// Flatten system + user messages the same way the chat handler does.
@@ -194,26 +210,34 @@ func (s *serveServer) handleContextBuild(w http.ResponseWriter, r *http.Request)
 	// chat handler does, so callers see the tier breakdown + coherence score.
 	if taaEnabled {
 		taa := &ContextBuildTAA{Profile: taaProfile, Enabled: true}
-		contextState, cerr := ConstructContextStateWithProfile(req.Messages, sessionID, workspaceRoot, taaProfile)
-		if cerr == nil && contextState != nil {
-			taa.TotalTokens = contextState.TotalTokens
-			taa.CoherenceScore = contextState.CoherenceScore
-			tiers := make(map[string]int)
-			if contextState.Tier1Identity != nil {
-				tiers["tier1"] = contextState.Tier1Identity.Tokens
+		// Skip construction when workspaceRoot is empty: ConstructContextStateWithProfile
+		// needs a valid root to load profile YAML and tier sources. Returning
+		// taa.Enabled=true with empty tiers signals "TAA requested; diagnostics
+		// unavailable in this topology".
+		if workspaceRoot != "" {
+			contextState, cerr := ConstructContextStateWithProfile(req.Messages, sessionID, workspaceRoot, taaProfile)
+			if cerr == nil && contextState != nil {
+				taa.TotalTokens = contextState.TotalTokens
+				taa.CoherenceScore = contextState.CoherenceScore
+				tiers := make(map[string]int)
+				if contextState.Tier1Identity != nil {
+					tiers["tier1"] = contextState.Tier1Identity.Tokens
+				}
+				if contextState.Tier2Temporal != nil {
+					tiers["tier2"] = contextState.Tier2Temporal.Tokens
+				}
+				if contextState.Tier3Present != nil {
+					tiers["tier3"] = contextState.Tier3Present.Tokens
+				}
+				if contextState.Tier4Semantic != nil {
+					tiers["tier4"] = contextState.Tier4Semantic.Tokens
+				}
+				if len(tiers) > 0 {
+					taa.Tiers = tiers
+				}
 			}
-			if contextState.Tier2Temporal != nil {
-				tiers["tier2"] = contextState.Tier2Temporal.Tokens
-			}
-			if contextState.Tier3Present != nil {
-				tiers["tier3"] = contextState.Tier3Present.Tokens
-			}
-			if contextState.Tier4Semantic != nil {
-				tiers["tier4"] = contextState.Tier4Semantic.Tokens
-			}
-			if len(tiers) > 0 {
-				taa.Tiers = tiers
-			}
+		} else {
+			log.Printf("[context-build] TAA profile %q requested but workspaceRoot unavailable (kernel nil); skipping diagnostics", taaProfile)
 		}
 		resp.TAA = taa
 	}

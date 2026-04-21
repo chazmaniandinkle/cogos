@@ -139,6 +139,37 @@ func TestHandleContextBuild_BasicRequest(t *testing.T) {
 	}
 }
 
+// TestHandleContextBuild_NilKernelWithUCPHeaders guards the A1 regression:
+// when kernel is nil but contextEngine is populated, UCP headers must NOT
+// produce a spurious 400. The handler skips UCP schema validation (which
+// requires a workspace root) and serves the request via the flat-message
+// path. TAA diagnostics downgrade to Enabled=true with empty tiers rather
+// than crashing on a missing workspace root.
+func TestHandleContextBuild_NilKernelWithUCPHeaders(t *testing.T) {
+	s := newServeServerWithContextEngine(t) // fixture leaves s.kernel == nil
+	body := `{"messages":[{"role":"user","content":"hello there"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/context/build", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-UCP-TAA", `{"version":"1.0","profile":"test","total_tokens":0,"tiers":{"tier1_identity":{"enabled":true,"budget":0},"tier2_temporal":{"enabled":true,"budget":0},"tier3_present":{"enabled":true,"budget":0},"tier4_semantic":{"enabled":true,"budget":0}}}`)
+	req.Header.Set("X-TAA-Profile", "openclaw")
+	w := httptest.NewRecorder()
+	s.handleContextBuild(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 (nil-kernel + UCP headers must not 400)", w.Code, w.Body.String())
+	}
+	var resp ContextBuildResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if resp.TAA == nil {
+		t.Fatalf("resp.TAA is nil; want non-nil (TAA was requested via X-TAA-Profile)")
+	}
+	if !resp.TAA.Enabled {
+		t.Errorf("resp.TAA.Enabled=false, want true")
+	}
+}
+
 func TestHandleContextBuild_ExplicitSessionID(t *testing.T) {
 	s := newServeServerWithContextEngine(t)
 	body := `{"messages":[{"role":"user","content":"question one"}]}`
