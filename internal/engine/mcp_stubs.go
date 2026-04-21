@@ -1,5 +1,3 @@
-//go:build mcpserver
-
 // mcp_stubs.go — Internal API stubs for MCP tools
 //
 // These functions bridge MCP tool calls to the v3 kernel internals.

@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Changed
+- MCP server + ingestion pipeline + tool loop + cogdoc service + membrane policy
+  are now always compiled into the kernel. The `mcpserver` build tag has been
+  removed from all 14 gated files in `internal/engine/`. Rationale: no release
+  path (Makefile, goreleaser, CI) ever set `-tags mcpserver`, so default
+  binaries silently shipped without MCP — breaking the kernel's primary use
+  case (LLM collaboration via MCP). See
+  [docs/archival/2026-04-21-mcp-always-on.md](docs/archival/2026-04-21-mcp-always-on.md)
+  for full rationale and call-graph evidence.
+
+### Removed
+- `internal/engine/serve_mcp_stub.go` — the noop `!mcpserver` fallback, no
+  longer needed now that MCP is always-on.
+
 ## [2.6.0] - 2026-04-15 — Decomposition pipeline workbench
 
 ### Added

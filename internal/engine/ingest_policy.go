@@ -1,5 +1,3 @@
-//go:build mcpserver
-
 package engine
 
 type AssimilationDecision string

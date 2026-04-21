@@ -1,5 +1,3 @@
-//go:build mcpserver
-
 // mcp_server.go — MCP Streamable HTTP server for CogOS v3
 //
 // Embeds the MCP server into the existing HTTP server at /mcp.
