@@ -226,7 +226,7 @@ func (m *MCPServer) registerTools() {
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_search_traces",
-		Description: "Search kernel trace JSONL streams in .cog/run/ (turn_metrics, attention, proprioceptive, internal_requests). Filter by source, session_id, level, case-insensitive substring, and time range (since/until accept RFC3339 or duration like 5m/1h). Returns unified chronological results with per-source scan diagnostics. Fallback: ls .cog/run/*.jsonl && jq -c . .cog/run/<name>.jsonl | head",
+		Description: "Search kernel trace JSONL streams in .cog/run/ (attention, proprioceptive, internal_requests). Filter by source, session_id, level, case-insensitive substring, and time range (since/until accept RFC3339 or duration like 5m/1h). Returns unified chronological results with per-source scan diagnostics. Fallback: ls .cog/run/*.jsonl && jq -c . .cog/run/<name>.jsonl | head",
 	}, m.toolSearchTraces)
 }
 
@@ -581,9 +581,9 @@ type readConversationInput struct {
 }
 
 type searchTracesInput struct {
-	Source    string `json:"source,omitempty" jsonschema:"Trace source filter. One of: turn_metrics, attention, proprioceptive, internal_requests, all (default)."`
+	Source    string `json:"source,omitempty" jsonschema:"Trace source filter. One of: attention, proprioceptive, internal_requests, all (default)."`
 	Level     string `json:"level,omitempty" jsonschema:"Level-like filter (exact match, case-insensitive). For proprioceptive source this matches the event field."`
-	SessionID string `json:"session_id,omitempty" jsonschema:"Filter to rows whose session_id matches. Only meaningful for sources that carry a session_id (turn_metrics, internal_requests)."`
+	SessionID string `json:"session_id,omitempty" jsonschema:"Filter to rows whose session_id matches. Only meaningful for sources that carry a session_id (internal_requests)."`
 	Substring string `json:"substring,omitempty" jsonschema:"Case-insensitive substring match against the raw JSONL line. Capped at 1024 characters."`
 	Since     string `json:"since,omitempty" jsonschema:"Lower time bound. RFC3339 timestamp or Go duration (e.g. 5m, 1h, 24h for 'since N ago')."`
 	Until     string `json:"until,omitempty" jsonschema:"Upper time bound. RFC3339 timestamp or Go duration."`

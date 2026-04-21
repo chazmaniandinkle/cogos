@@ -2,9 +2,9 @@
 //
 // Per Agent Q's Survey Q design (2026-04-21), this file implements the read
 // side of `.cog/run/*.jsonl` observability: a single entry point that scans
-// the populated trace sources (turn_metrics, attention, proprioceptive,
-// internal-requests), normalizes their heterogeneous per-source schemas into
-// one `{source, timestamp, session_id?, level?, line}` shape, and applies
+// the populated trace sources (attention, proprioceptive, internal-requests),
+// normalizes their heterogeneous per-source schemas into one
+// `{source, timestamp, session_id?, level?, line}` shape, and applies
 // caller-provided filters (time range, session, level, substring).
 //
 // These are TRACES — semantic metabolites under the kernel-ingestion-and-
@@ -37,7 +37,6 @@ import (
 type TraceSource string
 
 const (
-	SourceTurnMetrics      TraceSource = "turn_metrics"
 	SourceAttention        TraceSource = "attention"
 	SourceProprioceptive   TraceSource = "proprioceptive"
 	SourceInternalRequests TraceSource = "internal_requests"
@@ -48,7 +47,7 @@ const (
 const (
 	defaultTracesLimit = 100
 	maxTracesLimit     = 1000
-	tracesScanBufSize  = 1 << 20 // 1 MiB; handles turn_metrics rows with embedded prompts.
+	tracesScanBufSize  = 1 << 20 // 1 MiB; handles rows with large embedded payloads.
 	maxSubstringLen    = 1024    // v1 cap on substring filter length.
 )
 
@@ -107,18 +106,11 @@ type sourceSpec struct {
 // sourceSpecs is the §3.4 normalization table materialized.
 //
 // Empirical verification (2026-04-21) against /Users/slowbro/cog-workspace/.cog/run:
-//   - turn_metrics.jsonl:      timestamp (RFC3339 w/ zone), session_id, no level
 //   - attention.jsonl:         occurred_at (RFC3339 Z), no session_id, no level
 //   - proprioceptive.jsonl:    timestamp (RFC3339 Z), no session_id, event as pseudo-level
 //   - internal-requests.jsonl: timestamp is FLOAT UNIX SECONDS (drift from spec's
 //     "observed RFC3339"); parseTimestamp handles both string and numeric forms.
 var sourceSpecs = map[TraceSource]sourceSpec{
-	SourceTurnMetrics: {
-		name:         "turn_metrics",
-		relPath:      filepath.Join(".cog", "run", "turn_metrics.jsonl"),
-		timestampKey: "timestamp",
-		sessionKey:   "session_id",
-	},
 	SourceAttention: {
 		name:         "attention",
 		relPath:      filepath.Join(".cog", "run", "attention.jsonl"),
@@ -142,7 +134,6 @@ var sourceSpecs = map[TraceSource]sourceSpec{
 // Map iteration is unstable; tests and diagnostic output benefit from
 // a predictable order.
 var canonicalSourceOrder = []TraceSource{
-	SourceTurnMetrics,
 	SourceAttention,
 	SourceProprioceptive,
 	SourceInternalRequests,
@@ -161,7 +152,7 @@ func resolveSources(src TraceSource) ([]sourceSpec, error) {
 	}
 	spec, ok := sourceSpecs[src]
 	if !ok {
-		return nil, fmt.Errorf("unknown source %q (valid: turn_metrics, attention, proprioceptive, internal_requests, all)", src)
+		return nil, fmt.Errorf("unknown source %q (valid: attention, proprioceptive, internal_requests, all)", src)
 	}
 	return []sourceSpec{spec}, nil
 }
@@ -250,7 +241,6 @@ func scanSource(root string, spec sourceSpec, q TraceQuery, perSourceLimit int) 
 		status.Scanned++
 
 		// Cheap byte-level substring check first — no JSON parse needed if it misses.
-		// Critical on turn_metrics.jsonl which is the heaviest source.
 		if q.Substring != "" && !bytes.Contains(bytes.ToLower(raw), []byte(substringLower)) {
 			continue
 		}
@@ -315,7 +305,7 @@ func extractFields(line []byte, spec sourceSpec) (TraceResult, bool) {
 }
 
 // parseTimestamp accepts:
-//   - an RFC3339 / RFC3339Nano string (turn_metrics, attention, proprioceptive)
+//   - an RFC3339 / RFC3339Nano string (attention, proprioceptive)
 //   - a numeric unix-seconds value, integer or float
 //     (internal-requests.jsonl uses this — drift from Agent Q §3.4
 //     which specified "observed RFC3339"; handled here without bubbling up

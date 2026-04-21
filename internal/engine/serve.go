@@ -1211,7 +1211,7 @@ func writeLedgerError(w http.ResponseWriter, code int, msg string) {
 // canvas.html:1706 consume its exact {entries, light_cone} shape.
 //
 //	GET /v1/traces
-//	    ?source=turn_metrics   (or "all", default)
+//	    ?source=attention      (or "all", default)
 //	    &level=…               (applies to sources with a level-like field)
 //	    &session_id=…
 //	    &substring=…           (case-insensitive, full-line match)

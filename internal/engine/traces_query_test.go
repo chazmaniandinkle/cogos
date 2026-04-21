@@ -80,17 +80,17 @@ func TestQueryEmptyWorkspace(t *testing.T) {
 	}
 }
 
-// 2. Single-source read of turn_metrics — all 3 rows returned with ts + session.
-func TestQuerySingleSourceTurnMetrics(t *testing.T) {
+// 2. Single-source read of internal_requests — all 3 rows returned with ts + session.
+func TestQuerySingleSourceInternalRequests(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeTraceFixture(t, root, "turn_metrics.jsonl", []map[string]any{
-		{"session_id": "s1", "turn_index": 1, "timestamp": "2026-04-20T10:00:00Z", "query": "hello"},
-		{"session_id": "s1", "turn_index": 2, "timestamp": "2026-04-20T10:01:00Z", "query": "world"},
-		{"session_id": "s2", "turn_index": 1, "timestamp": "2026-04-20T10:02:00Z", "query": "second"},
+	writeTraceFixture(t, root, "internal-requests.jsonl", []map[string]any{
+		{"session_id": "s1", "type": "request", "timestamp": "2026-04-20T10:00:00Z", "request_id": "hello"},
+		{"session_id": "s1", "type": "request", "timestamp": "2026-04-20T10:01:00Z", "request_id": "world"},
+		{"session_id": "s2", "type": "request", "timestamp": "2026-04-20T10:02:00Z", "request_id": "second"},
 	})
 
-	res, err := QueryTraces(root, TraceQuery{Source: SourceTurnMetrics})
+	res, err := QueryTraces(root, TraceQuery{Source: SourceInternalRequests})
 	if err != nil {
 		t.Fatalf("QueryTraces: %v", err)
 	}
@@ -109,8 +109,8 @@ func TestQuerySingleSourceTurnMetrics(t *testing.T) {
 	if err := json.Unmarshal(res.Results[0].Line, &decoded); err != nil {
 		t.Fatalf("decode Line: %v", err)
 	}
-	if decoded["query"].(string) != "second" {
-		t.Errorf("Line.query = %v; want second", decoded["query"])
+	if decoded["request_id"].(string) != "second" {
+		t.Errorf("Line.request_id = %v; want second", decoded["request_id"])
 	}
 }
 
@@ -118,9 +118,9 @@ func TestQuerySingleSourceTurnMetrics(t *testing.T) {
 func TestQueryAllSourcesMerged(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeTraceFixture(t, root, "turn_metrics.jsonl", []map[string]any{
-		{"session_id": "s1", "timestamp": "2026-04-20T10:00:00Z", "query": "first"},
-		{"session_id": "s1", "timestamp": "2026-04-20T10:05:00Z", "query": "third"},
+	writeTraceFixture(t, root, "internal-requests.jsonl", []map[string]any{
+		{"session_id": "s1", "type": "request", "timestamp": "2026-04-20T10:00:00Z", "request_id": "first"},
+		{"session_id": "s1", "type": "request", "timestamp": "2026-04-20T10:05:00Z", "request_id": "third"},
 	})
 	writeTraceFixture(t, root, "attention.jsonl", []map[string]any{
 		{"participant_id": "p1", "target_uri": "cog://x", "signal_type": "visit", "occurred_at": "2026-04-20T10:02:00Z"},
@@ -146,8 +146,8 @@ func TestQueryAllSourcesMerged(t *testing.T) {
 	for _, r := range res.Results {
 		seen[r.Source] = true
 	}
-	if !seen["turn_metrics"] || !seen["attention"] {
-		t.Errorf("merged sources = %v; want both turn_metrics and attention", seen)
+	if !seen["internal_requests"] || !seen["attention"] {
+		t.Errorf("merged sources = %v; want both internal_requests and attention", seen)
 	}
 }
 
@@ -155,10 +155,10 @@ func TestQueryAllSourcesMerged(t *testing.T) {
 func TestQueryFilterBySessionID(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeTraceFixture(t, root, "turn_metrics.jsonl", []map[string]any{
-		{"session_id": "s1", "timestamp": "2026-04-20T10:00:00Z"},
-		{"session_id": "s2", "timestamp": "2026-04-20T10:01:00Z"},
-		{"session_id": "s1", "timestamp": "2026-04-20T10:02:00Z"},
+	writeTraceFixture(t, root, "internal-requests.jsonl", []map[string]any{
+		{"session_id": "s1", "type": "request", "timestamp": "2026-04-20T10:00:00Z"},
+		{"session_id": "s2", "type": "request", "timestamp": "2026-04-20T10:01:00Z"},
+		{"session_id": "s1", "type": "request", "timestamp": "2026-04-20T10:02:00Z"},
 	})
 	writeTraceFixture(t, root, "attention.jsonl", []map[string]any{
 		{"participant_id": "p", "target_uri": "cog://x", "signal_type": "visit", "occurred_at": "2026-04-20T10:03:00Z"},
@@ -198,13 +198,13 @@ func TestQueryTracesFilterBySinceDuration(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	old := now.Add(-2 * time.Hour).Format(time.RFC3339)
 	recent := now.Add(-10 * time.Minute).Format(time.RFC3339)
-	writeTraceFixture(t, root, "turn_metrics.jsonl", []map[string]any{
-		{"session_id": "s1", "timestamp": old},
-		{"session_id": "s1", "timestamp": recent},
+	writeTraceFixture(t, root, "attention.jsonl", []map[string]any{
+		{"participant_id": "p1", "target_uri": "cog://a", "signal_type": "visit", "occurred_at": old},
+		{"participant_id": "p1", "target_uri": "cog://b", "signal_type": "visit", "occurred_at": recent},
 	})
 
 	res, err := QueryTraces(root, TraceQuery{
-		Source: SourceTurnMetrics,
+		Source: SourceAttention,
 		Since:  now.Add(-30 * time.Minute),
 	})
 	if err != nil {
@@ -219,7 +219,7 @@ func TestQueryTracesFilterBySinceDuration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseTraceDurationOrTime: %v", err)
 	}
-	res2, err := QueryTraces(root, TraceQuery{Source: SourceTurnMetrics, Since: since})
+	res2, err := QueryTraces(root, TraceQuery{Source: SourceAttention, Since: since})
 	if err != nil {
 		t.Fatalf("QueryTraces: %v", err)
 	}
@@ -232,13 +232,13 @@ func TestQueryTracesFilterBySinceDuration(t *testing.T) {
 func TestQueryFilterByUntilBound(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeTraceFixture(t, root, "turn_metrics.jsonl", []map[string]any{
-		{"session_id": "s1", "timestamp": "2026-04-20T10:00:00Z"},
-		{"session_id": "s2", "timestamp": "2026-04-20T12:00:00Z"},
+	writeTraceFixture(t, root, "internal-requests.jsonl", []map[string]any{
+		{"session_id": "s1", "type": "request", "timestamp": "2026-04-20T10:00:00Z"},
+		{"session_id": "s2", "type": "request", "timestamp": "2026-04-20T12:00:00Z"},
 	})
 
 	until, _ := time.Parse(time.RFC3339, "2026-04-20T11:00:00Z")
-	res, err := QueryTraces(root, TraceQuery{Source: SourceTurnMetrics, Until: until})
+	res, err := QueryTraces(root, TraceQuery{Source: SourceInternalRequests, Until: until})
 	if err != nil {
 		t.Fatalf("QueryTraces: %v", err)
 	}
@@ -254,13 +254,13 @@ func TestQueryFilterByUntilBound(t *testing.T) {
 func TestQueryFilterBySubstring(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeTraceFixture(t, root, "turn_metrics.jsonl", []map[string]any{
-		{"session_id": "s1", "timestamp": "2026-04-20T10:00:00Z", "query": "QUOTA exceeded"},
-		{"session_id": "s2", "timestamp": "2026-04-20T10:01:00Z", "query": "plain request"},
+	writeTraceFixture(t, root, "internal-requests.jsonl", []map[string]any{
+		{"session_id": "s1", "type": "request", "timestamp": "2026-04-20T10:00:00Z", "detail": "QUOTA exceeded"},
+		{"session_id": "s2", "type": "request", "timestamp": "2026-04-20T10:01:00Z", "detail": "plain request"},
 	})
 
 	res, err := QueryTraces(root, TraceQuery{
-		Source:    SourceTurnMetrics,
+		Source:    SourceInternalRequests,
 		Substring: "quota",
 	})
 	if err != nil {
@@ -318,12 +318,13 @@ func TestQueryTruncation(t *testing.T) {
 	for i := 0; i < 150; i++ {
 		rows = append(rows, map[string]any{
 			"session_id": "s1",
+			"type":       "request",
 			"timestamp":  time.Date(2026, 4, 20, 10, 0, i, 0, time.UTC).Format(time.RFC3339),
 		})
 	}
-	writeTraceFixture(t, root, "turn_metrics.jsonl", rows)
+	writeTraceFixture(t, root, "internal-requests.jsonl", rows)
 
-	res, err := QueryTraces(root, TraceQuery{Source: SourceTurnMetrics, Limit: 100})
+	res, err := QueryTraces(root, TraceQuery{Source: SourceInternalRequests, Limit: 100})
 	if err != nil {
 		t.Fatalf("QueryTraces: %v", err)
 	}
@@ -339,12 +340,12 @@ func TestQueryTruncation(t *testing.T) {
 func TestQueryMalformedLineSkipped(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeTraceRaw(t, root, "turn_metrics.jsonl",
-		`{"session_id":"s1","timestamp":"2026-04-20T10:00:00Z"}`+"\n"+
+	writeTraceRaw(t, root, "internal-requests.jsonl",
+		`{"session_id":"s1","type":"request","timestamp":"2026-04-20T10:00:00Z"}`+"\n"+
 			`not-json-garbage`+"\n"+
-			`{"session_id":"s2","timestamp":"2026-04-20T10:01:00Z"}`+"\n")
+			`{"session_id":"s2","type":"request","timestamp":"2026-04-20T10:01:00Z"}`+"\n")
 
-	res, err := QueryTraces(root, TraceQuery{Source: SourceTurnMetrics})
+	res, err := QueryTraces(root, TraceQuery{Source: SourceInternalRequests})
 	if err != nil {
 		t.Fatalf("QueryTraces: %v", err)
 	}
@@ -353,7 +354,7 @@ func TestQueryMalformedLineSkipped(t *testing.T) {
 	}
 	var status SourceStatus
 	for _, st := range res.SourcesChecked {
-		if st.Name == "turn_metrics" {
+		if st.Name == "internal_requests" {
 			status = st
 		}
 	}
@@ -366,13 +367,13 @@ func TestQueryMalformedLineSkipped(t *testing.T) {
 func TestQueryOrderAsc(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeTraceFixture(t, root, "turn_metrics.jsonl", []map[string]any{
-		{"session_id": "s1", "timestamp": "2026-04-20T12:00:00Z"},
-		{"session_id": "s2", "timestamp": "2026-04-20T10:00:00Z"},
-		{"session_id": "s3", "timestamp": "2026-04-20T11:00:00Z"},
+	writeTraceFixture(t, root, "internal-requests.jsonl", []map[string]any{
+		{"session_id": "s1", "type": "request", "timestamp": "2026-04-20T12:00:00Z"},
+		{"session_id": "s2", "type": "request", "timestamp": "2026-04-20T10:00:00Z"},
+		{"session_id": "s3", "type": "request", "timestamp": "2026-04-20T11:00:00Z"},
 	})
 
-	res, err := QueryTraces(root, TraceQuery{Source: SourceTurnMetrics, Order: "asc"})
+	res, err := QueryTraces(root, TraceQuery{Source: SourceInternalRequests, Order: "asc"})
 	if err != nil {
 		t.Fatalf("QueryTraces: %v", err)
 	}
@@ -402,21 +403,21 @@ func TestQueryBadSourceRejected(t *testing.T) {
 	}
 }
 
-// 13. Normalization correctness — attention (occurred_at) and turn_metrics (timestamp)
-// surface with populated Timestamp fields from different JSON keys, and
-// internal_requests (float unix) parses too (drift from spec §3.4).
-func TestQueryNormalizationAttentionVsTurnMetrics(t *testing.T) {
+// 13. Normalization correctness — attention (occurred_at), proprioceptive (timestamp,
+// event-as-level), and internal_requests (float unix timestamp + session_id) surface
+// with populated Timestamp fields from different JSON keys (drift from spec §3.4).
+func TestQueryNormalizationAcrossSources(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	writeTraceFixture(t, root, "attention.jsonl", []map[string]any{
 		{"participant_id": "p1", "target_uri": "cog://x", "signal_type": "visit", "occurred_at": "2026-04-20T10:00:00Z"},
 	})
-	writeTraceFixture(t, root, "turn_metrics.jsonl", []map[string]any{
-		{"session_id": "s1", "timestamp": "2026-04-20T10:01:00-04:00"},
+	writeTraceFixture(t, root, "proprioceptive.jsonl", []map[string]any{
+		{"timestamp": "2026-04-20T10:01:00Z", "event": "prediction_logged"},
 	})
 	writeTraceFixture(t, root, "internal-requests.jsonl", []map[string]any{
 		// Unix float timestamp — matches live workspace drift from spec.
-		{"type": "request", "timestamp": 1769281958.2577438, "request_id": "r1"},
+		{"session_id": "s1", "type": "request", "timestamp": 1769281958.2577438, "request_id": "r1"},
 	})
 
 	res, err := QueryTraces(root, TraceQuery{Source: SourceAll})
@@ -437,8 +438,8 @@ func TestQueryNormalizationAttentionVsTurnMetrics(t *testing.T) {
 		if r.Source == "attention" && r.SessionID != "" {
 			t.Errorf("attention SessionID = %q; want empty", r.SessionID)
 		}
-		if r.Source == "turn_metrics" && r.SessionID != "s1" {
-			t.Errorf("turn_metrics SessionID = %q; want s1", r.SessionID)
+		if r.Source == "internal_requests" && r.SessionID != "s1" {
+			t.Errorf("internal_requests SessionID = %q; want s1", r.SessionID)
 		}
 	}
 }
@@ -461,15 +462,15 @@ func TestHandleTracesHTTP(t *testing.T) {
 	t.Parallel()
 	srv := newTestServer(t)
 	root := srv.cfg.WorkspaceRoot
-	writeTraceFixture(t, root, "turn_metrics.jsonl", []map[string]any{
-		{"session_id": "sA", "timestamp": "2026-04-20T10:00:00Z", "query": "alpha"},
-		{"session_id": "sA", "timestamp": "2026-04-20T10:01:00Z", "query": "beta"},
+	writeTraceFixture(t, root, "attention.jsonl", []map[string]any{
+		{"participant_id": "pA", "target_uri": "cog://x", "signal_type": "visit", "occurred_at": "2026-04-20T10:00:00Z"},
+		{"participant_id": "pA", "target_uri": "cog://y", "signal_type": "read", "occurred_at": "2026-04-20T10:01:00Z"},
 	})
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/v1/traces?source=turn_metrics&limit=5")
+	resp, err := http.Get(ts.URL + "/v1/traces?source=attention&limit=5")
 	if err != nil {
 		t.Fatalf("GET /v1/traces: %v", err)
 	}
@@ -488,8 +489,8 @@ func TestHandleTracesHTTP(t *testing.T) {
 	if len(decoded.SourcesChecked) != 1 {
 		t.Fatalf("SourcesChecked len = %d; want 1", len(decoded.SourcesChecked))
 	}
-	if decoded.SourcesChecked[0].Name != "turn_metrics" {
-		t.Errorf("SourcesChecked[0].Name = %q; want turn_metrics", decoded.SourcesChecked[0].Name)
+	if decoded.SourcesChecked[0].Name != "attention" {
+		t.Errorf("SourcesChecked[0].Name = %q; want attention", decoded.SourcesChecked[0].Name)
 	}
 
 	// 400 on unknown source.
@@ -511,13 +512,13 @@ func TestToolSearchTracesMCP(t *testing.T) {
 	process := NewProcess(cfg, makeNucleus("Cog", "tester"))
 	server := NewMCPServer(cfg, makeNucleus("Cog", "tester"), process)
 
-	writeTraceFixture(t, root, "turn_metrics.jsonl", []map[string]any{
-		{"session_id": "mcp-s1", "timestamp": "2026-04-20T09:00:00Z", "query": "first"},
-		{"session_id": "mcp-s2", "timestamp": "2026-04-20T09:01:00Z", "query": "second"},
+	writeTraceFixture(t, root, "internal-requests.jsonl", []map[string]any{
+		{"session_id": "mcp-s1", "type": "request", "timestamp": "2026-04-20T09:00:00Z", "request_id": "first"},
+		{"session_id": "mcp-s2", "type": "request", "timestamp": "2026-04-20T09:01:00Z", "request_id": "second"},
 	})
 
 	result, _, err := server.toolSearchTraces(context.Background(), nil, searchTracesInput{
-		Source: "turn_metrics",
+		Source: "internal_requests",
 		Limit:  10,
 	})
 	if err != nil {
@@ -530,7 +531,7 @@ func TestToolSearchTracesMCP(t *testing.T) {
 	}
 	// Filter path — session_id.
 	result2, _, err := server.toolSearchTraces(context.Background(), nil, searchTracesInput{
-		Source:    "turn_metrics",
+		Source:    "internal_requests",
 		SessionID: "mcp-s1",
 	})
 	if err != nil {
