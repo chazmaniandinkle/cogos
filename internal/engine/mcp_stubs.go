@@ -7,7 +7,6 @@ package engine
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -227,28 +226,64 @@ func CheckCoherenceMCP(cfg *Config, nucleus *Nucleus) (any, error) {
 }
 
 // EmitLedgerEvent appends an event to the workspace ledger.
+//
+// Historical shape: pre-PR this helper wrote to a flat
+// .cog/ledger/events.jsonl outside the hash chain and outside any session
+// subdirectory (cogos#10). Post-refactor it builds a proper EventEnvelope
+// and routes through AppendEvent, which:
+//
+//   - chains the event by prior_hash / seq,
+//   - files it under .cog/ledger/<session_id>/events.jsonl,
+//   - fans out to live subscribers via the in-process EventBroker.
+//
+// Callers that have a live *Process should prefer (*Process).EmitEvent for
+// accurate session attribution. This helper exists for the paths that only
+// hold *Config (CogDocService.emitLedgerEvent, EmitIngestEvent, tests).
+//
+// Source (envelope.Metadata.Source): pulled from event["source"] if set,
+// otherwise defaults to "mcp-client". Type: event["type"]. All other keys
+// become envelope.data.
 func EmitLedgerEvent(cfg *Config, event map[string]any) error {
-	event["timestamp"] = time.Now().UTC().Format(time.RFC3339)
-
-	ledgerPath := filepath.Join(cfg.WorkspaceRoot, ".cog", "ledger", "events.jsonl")
-
-	// Ensure ledger directory exists
-	if err := os.MkdirAll(filepath.Dir(ledgerPath), 0755); err != nil {
-		return fmt.Errorf("mkdir ledger: %w", err)
+	if cfg == nil {
+		return fmt.Errorf("emit ledger: nil config")
+	}
+	eventType, _ := event["type"].(string)
+	if eventType == "" {
+		return fmt.Errorf("emit ledger: event missing 'type'")
+	}
+	source, _ := event["source"].(string)
+	if source == "" {
+		source = "mcp-client"
 	}
 
-	f, err := os.OpenFile(ledgerPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("open ledger: %w", err)
+	// Build data by stripping the control fields that landed in the
+	// envelope header.
+	data := make(map[string]any, len(event))
+	for k, v := range event {
+		switch k {
+		case "type", "source", "timestamp":
+			continue
+		}
+		data[k] = v
 	}
-	defer f.Close()
 
-	b, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("marshal event: %w", err)
+	// Callers that hold only *Config don't have access to the live process
+	// session id. Use a predictable bucket so events are still chained and
+	// live in a per-session directory — no more orphan flat file. Paths
+	// that want accurate session attribution should use
+	// (*Process).EmitEvent directly.
+	const sessionID = "mcp-client"
+
+	env := &EventEnvelope{
+		HashedPayload: EventPayload{
+			Type:      eventType,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			SessionID: sessionID,
+			Data:      data,
+		},
+		Metadata: EventMetadata{Source: source},
 	}
-	_, err = f.Write(append(b, '\n'))
-	return err
+	return AppendEvent(cfg.WorkspaceRoot, sessionID, env)
 }
 
 // BuildMemoryIndex builds a lightweight index of all CogDocs.

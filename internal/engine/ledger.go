@@ -199,6 +199,14 @@ func AppendEvent(workspaceRoot, sessionID string, envelope *EventEnvelope) error
 
 	// Update cache after successful write.
 	setCachedLastEvent(sessionID, envelope)
+
+	// Publish to every registered broker so live subscribers see this
+	// event without needing to tail the JSONL. Publish is fire-and-forget:
+	// a slow consumer cannot hold up the ledger (source of truth). When no
+	// broker is installed (unit tests), the snapshot is nil and we no-op.
+	for _, broker := range brokerSnapshot() {
+		broker.Publish(envelope)
+	}
 	return nil
 }
 

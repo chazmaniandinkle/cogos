@@ -88,6 +88,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// Block sync endpoints (Phase 3 block sync protocol)
 	s.registerBlockRoutes(mux)
 	s.registerCompatRoutes(mux)
+	s.registerEventBusRoutes(mux)
 	s.registerMCPRoutes(mux)
 	s.registerConfigRoutes(mux)
 

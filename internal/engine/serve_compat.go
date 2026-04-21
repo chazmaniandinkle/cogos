@@ -11,13 +11,16 @@
 //
 //	GET  /v1/card            — kernel capability card (OpenClaw auth flow)
 //	GET  /v1/models          — OpenAI-compatible model list
-//	GET  /v1/events/stream   — SSE stub (CogBus keepalive)
-//	POST /v1/bus/{bus_id}/ack — bus event acknowledgment stub
 //	GET  /memory/search      — memory search (was missing from v2 too)
 //	GET  /memory/read        — memory read (was missing from v2 too)
 //	GET  /coherence/check    — coherence check
 //	GET  /v1/providers       — provider list with health
 //	GET  /v1/taa             — TAA context visibility stub
+//
+// Removed in the event-bus PR (were always stubs):
+//
+//	GET  /v1/events/stream   — replaced by the real broker-backed handler in serve.go
+//	POST /v1/bus/{bus_id}/ack — dropped; no consumer, new SSE uses Last-Event-ID
 package engine
 
 import (
@@ -42,9 +45,9 @@ func (s *Server) registerCompatRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/card", s.handleCard)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 
-	// Tier B: blocking for CogBus plugin
-	mux.HandleFunc("GET /v1/events/stream", s.handleEventsStream)
-	mux.HandleFunc("POST /v1/bus/{bus_id}/ack", s.handleBusAck)
+	// Tier B: event stream + bus ack — now real, registered in serve.go
+	// (handleEvents + handleEventsStream). handleBusAck deleted — no
+	// consumer relied on it and the new SSE resume uses Last-Event-ID.
 
 	// Tier C: operational stability
 	mux.HandleFunc("GET /v1/providers", s.handleProviders)
@@ -167,63 +170,6 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			mkModel("local", "cogos"),
 		},
 	})
-}
-
-// ── Tier B: CogBus plugin ──────────────────────────────────────────────────────
-
-// handleEventsStream is a stub SSE endpoint that keeps CogBus connections alive.
-// Sends a heartbeat every 30s. Full event routing is Phase 1.
-func (s *Server) handleEventsStream(w http.ResponseWriter, r *http.Request) {
-	s.logCompatDeprecated(r)
-	busID := r.URL.Query().Get("bus_id")
-	consumer := r.URL.Query().Get("consumer")
-
-	slog.Info("compat: SSE connected", "bus_id", busID, "consumer", consumer)
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Connection", "keep-alive")
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-
-	// Send initial connected event.
-	fmt.Fprintf(w, "data: {\"type\":\"connected\",\"bus_id\":%q,\"consumer\":%q}\n\n", busID, consumer)
-	flusher.Flush()
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-r.Context().Done():
-			slog.Info("compat: SSE disconnected", "bus_id", busID, "consumer", consumer)
-			return
-		case <-ticker.C:
-			fmt.Fprintf(w, ": heartbeat\n\n")
-			flusher.Flush()
-		}
-	}
-}
-
-// handleBusAck is a stub that accepts bus event acknowledgments.
-func (s *Server) handleBusAck(w http.ResponseWriter, r *http.Request) {
-	s.logCompatDeprecated(r)
-	busID := r.PathValue("bus_id")
-	var req struct {
-		ConsumerID string `json:"consumer_id"`
-		Seq        int    `json:"seq"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-
-	slog.Debug("compat: bus ack", "bus_id", busID, "consumer", req.ConsumerID, "seq", req.Seq)
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "seq": req.Seq})
 }
 
 // ── Tier C: Operational stability ──────────────────────────────────────────────
