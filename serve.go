@@ -223,6 +223,7 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("/v1/requests", s.handleRequests)
 	mux.HandleFunc("/v1/requests/", s.handleRequestByID)
 	mux.HandleFunc("/v1/taa", s.handleTAA)                                    // TAA context visibility endpoint
+	mux.HandleFunc("POST /v1/context/build", otelMiddleware("POST /v1/context/build", s.handleContextBuild)) // Context engine, no inference (EA/EFM split)
 	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext)      // Iris-driven foveated rendering
 	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)                  // Per-session context list
 	mux.HandleFunc("/v1/sessions/", s.handleSessionContext)                   // Per-session context detail
