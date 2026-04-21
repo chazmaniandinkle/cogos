@@ -33,27 +33,39 @@ import (
 
 // MCPServer wraps the MCP server and its dependencies.
 type MCPServer struct {
-	server    *mcp.Server
-	handler   http.Handler
-	cfg       *Config
-	nucleus   *Nucleus
-	process   *Process
-	cogdocSvc *CogDocService
+	server          *mcp.Server
+	handler         http.Handler
+	cfg             *Config
+	nucleus         *Nucleus
+	process         *Process
+	cogdocSvc       *CogDocService
+	agentController AgentController // optional; nil when the kernel has no live agent
 }
 
 // NewMCPServer creates and configures the MCP server with all stage-1 tools.
+// The returned server has no AgentController attached. Call SetAgentController
+// to enable cog_list_agents / cog_get_agent_state / cog_trigger_agent_loop.
 func NewMCPServer(cfg *Config, nucleus *Nucleus, process *Process) *MCPServer {
+	return NewMCPServerWithAgentController(cfg, nucleus, process, nil)
+}
+
+// NewMCPServerWithAgentController creates the MCP server and attaches an
+// AgentController for the agent-state tools. The controller may be nil;
+// the tools remain registered and return a "not configured" response in
+// that case so clients get a consistent error shape.
+func NewMCPServerWithAgentController(cfg *Config, nucleus *Nucleus, process *Process, ctrl AgentController) *MCPServer {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "cogos-v3",
 		Version: BuildTime,
 	}, nil)
 
 	m := &MCPServer{
-		server:    server,
-		cfg:       cfg,
-		nucleus:   nucleus,
-		process:   process,
-		cogdocSvc: NewCogDocService(cfg, process),
+		server:          server,
+		cfg:             cfg,
+		nucleus:         nucleus,
+		process:         process,
+		cogdocSvc:       NewCogDocService(cfg, process),
+		agentController: ctrl,
 	}
 
 	m.registerTools()
@@ -65,6 +77,13 @@ func NewMCPServer(cfg *Config, nucleus *Nucleus, process *Process) *MCPServer {
 	)
 
 	return m
+}
+
+// SetAgentController wires a live AgentController into an already-built
+// MCPServer. Safe to call after construction; the tool registration is
+// unchanged because the tools resolve the current controller on each call.
+func (m *MCPServer) SetAgentController(ctrl AgentController) {
+	m.agentController = ctrl
 }
 
 // Handler returns the http.Handler for mounting at /mcp.
@@ -148,6 +167,22 @@ func (m *MCPServer) registerTools() {
 		Name:        "cog_tail_tool_calls",
 		Description: "Tail tool-call events live. Replays recent tool.call / tool.result events (up to max_events, default 50), applying the same filters as cog_read_tool_calls. When Agent N's event bus lands, this will stream new events live; until then it returns a snapshot of the latest matching rows. Fallback: tail -f .cog/ledger/<sid>/events.jsonl | grep '\"type\":\"tool\\.'",
 	}, withToolObserver(m, "cog_tail_tool_calls", m.toolTailToolCalls))
+
+	// Agent state / loop control — closes Agent F gap #8 per Agent T's design.
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_list_agents",
+		Description: "Enumerate active agent harness instances inside the kernel. Each entry summarises identity, state, and recent activity. Today returns one element (\"primary\") reflecting the ServeAgent singleton; forward-compatible for future multi-agent deployment. Fallback: curl http://localhost:6931/v1/agents",
+	}, m.toolListAgents)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_get_agent_state",
+		Description: "Full state snapshot of one agent instance — status summary, activity awareness, rolling cycle memory, pending proposals, inbox queue, and optionally the most recent cycle traces. Matches the shape of GET /v1/agents/{id}. Fallback: curl http://localhost:6931/v1/agents/primary",
+	}, m.toolGetAgentState)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_trigger_agent_loop",
+		Description: "Manually invoke one homeostatic cycle of the specified agent, outside the regular ticker. Equivalent to POST /v1/agents/{id}/tick. Returns immediately with a trigger receipt; cycle runs async unless wait=true. Refuses if a cycle is already in flight (overlap guard). Fallback: curl -X POST http://localhost:6931/v1/agents/primary/tick",
+	}, m.toolTriggerAgentLoop)
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name: "cog_read_conversation",
@@ -440,6 +475,22 @@ type ingestInput struct {
 	Format   string            `json:"format" jsonschema:"Input format: url, conversation, message, document"`
 	Data     string            `json:"data" jsonschema:"Raw material to ingest (URL, text, JSON)"`
 	Metadata map[string]string `json:"metadata,omitempty" jsonschema:"Optional context (discord_message_id, channel, etc.)"`
+}
+
+type listAgentsInput struct {
+	IncludeStopped bool `json:"include_stopped,omitempty" jsonschema:"Include agents that have stopped (default false). Reserved for future multi-agent pool managers."`
+}
+
+type getAgentStateInput struct {
+	AgentID      string `json:"agent_id,omitempty" jsonschema:"Which agent to inspect. Default \"primary\" (the ServeAgent singleton)."`
+	IncludeTrace bool   `json:"include_trace,omitempty" jsonschema:"Attach up to trace_limit most-recent full cycle traces (observation + result)."`
+	TraceLimit   int    `json:"trace_limit,omitempty" jsonschema:"If include_trace, how many recent traces to include. Range [1, 20]. Default 1."`
+}
+
+type triggerAgentLoopInput struct {
+	AgentID string `json:"agent_id,omitempty" jsonschema:"Which agent to trigger. Default \"primary\"."`
+	Reason  string `json:"reason,omitempty" jsonschema:"Free-text tag stored on a synthetic agent.wake event for audit (optional)."`
+	Wait    bool   `json:"wait,omitempty" jsonschema:"If true, block until the cycle completes (up to 90s) and return the outcome. Default false (fire-and-forget)."`
 }
 
 // readToolCallsInput mirrors ToolCallQuery for the MCP surface. Time bounds
@@ -1098,6 +1149,58 @@ func (m *MCPServer) toolIngest(ctx context.Context, req *mcp.CallToolRequest, in
 		"title":        result.Title,
 		"content_type": string(result.ContentType),
 	})
+}
+
+// --- Agent state / loop control tools -------------------------------------
+
+// toolListAgents implements cog_list_agents — returns the set of active
+// agents. Today always a one-element list ("primary"). See agent-T-agent-
+// state-design §4.1.
+func (m *MCPServer) toolListAgents(ctx context.Context, req *mcp.CallToolRequest, input listAgentsInput) (*mcp.CallToolResult, any, error) {
+	resp, err := QueryListAgents(ctx, m.agentController, ListAgentsRequest{IncludeStopped: input.IncludeStopped})
+	if err != nil {
+		return agentErrorResult(err, "curl http://localhost:6931/v1/agents")
+	}
+	return marshalResult(resp)
+}
+
+// toolGetAgentState implements cog_get_agent_state — full snapshot of
+// one agent. See agent-T-agent-state-design §4.1.
+func (m *MCPServer) toolGetAgentState(ctx context.Context, req *mcp.CallToolRequest, input getAgentStateInput) (*mcp.CallToolResult, any, error) {
+	snap, err := QueryGetAgent(ctx, m.agentController, GetAgentRequest{
+		AgentID:      input.AgentID,
+		IncludeTrace: input.IncludeTrace,
+		TraceLimit:   input.TraceLimit,
+	})
+	if err != nil {
+		return agentErrorResult(err, "curl http://localhost:6931/v1/agents/primary")
+	}
+	return marshalResult(snap)
+}
+
+// toolTriggerAgentLoop implements cog_trigger_agent_loop — manually
+// invoke one cycle. See agent-T-agent-state-design §4.1.
+func (m *MCPServer) toolTriggerAgentLoop(ctx context.Context, req *mcp.CallToolRequest, input triggerAgentLoopInput) (*mcp.CallToolResult, any, error) {
+	result, err := QueryTriggerAgent(ctx, m.agentController, TriggerAgentRequest{
+		AgentID: input.AgentID,
+		Reason:  input.Reason,
+		Wait:    input.Wait,
+	})
+	if err != nil {
+		return agentErrorResult(err, "curl -X POST http://localhost:6931/v1/agents/primary/tick")
+	}
+	return marshalResult(result)
+}
+
+// agentErrorResult translates AgentControllerError into the MCP fallback
+// format used by the rest of this file. Unknown errors are surfaced as
+// internal-error text responses.
+func agentErrorResult(err error, fallback string) (*mcp.CallToolResult, any, error) {
+	msg := err.Error()
+	if ace, ok := err.(*AgentControllerError); ok && ace != nil {
+		msg = ace.Message
+	}
+	return fallbackResult(msg, fallback)
 }
 
 // toolReadToolCalls is the MCP handler for cog_read_tool_calls. It parses the

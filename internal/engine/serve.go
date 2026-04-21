@@ -46,13 +46,15 @@ import (
 
 // Server wraps the HTTP server and its dependencies.
 type Server struct {
-	cfg          *Config
-	nucleus      *Nucleus
-	process      *Process
-	router       Router // nil until SetRouter is called
-	srv          *http.Server
-	debug        debugStore    // captures last request pipeline state
-	attentionLog *attentionLog // per-server log (avoids global write race)
+	cfg             *Config
+	nucleus         *Nucleus
+	process         *Process
+	router          Router // nil until SetRouter is called
+	srv             *http.Server
+	debug           debugStore    // captures last request pipeline state
+	attentionLog    *attentionLog // per-server log (avoids global write race)
+	agentController AgentController // nil until SetAgentController is called
+	mcpServer       *MCPServer      // so SetAgentController can propagate to tools
 }
 
 // NewServer constructs a Server bound to the configured port.
@@ -100,6 +102,19 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 // SetRouter wires an inference Router into the server.
 func (s *Server) SetRouter(r Router) {
 	s.router = r
+}
+
+// SetAgentController wires a live AgentController into the server so the
+// cog_list_agents / cog_get_agent_state / cog_trigger_agent_loop MCP
+// tools have a backing implementation. Callers outside engine (like the
+// root-package serveServer) can build the controller and pass it here.
+// Safe to call post-construction: the MCP tool registry resolves the
+// controller at call time.
+func (s *Server) SetAgentController(ctrl AgentController) {
+	s.agentController = ctrl
+	if s.mcpServer != nil {
+		s.mcpServer.SetAgentController(ctrl)
+	}
 }
 
 // Start begins serving. It blocks until the server stops.
