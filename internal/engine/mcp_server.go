@@ -146,6 +146,11 @@ func (m *MCPServer) registerTools() {
 		Name:        "cog_rollback_config",
 		Description: "Restore kernel.yaml from a prior .bak-<timestamp> backup. Pass list_only=true to enumerate available backups without restoring. If backup is empty, the most recent backup is used. Atomic restore; response carries updated backup list.",
 	}, m.toolRollbackConfig)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_search_traces",
+		Description: "Search kernel trace JSONL streams in .cog/run/ (turn_metrics, attention, proprioceptive, internal_requests). Filter by source, session_id, level, case-insensitive substring, and time range (since/until accept RFC3339 or duration like 5m/1h). Returns unified chronological results with per-source scan diagnostics. Fallback: ls .cog/run/*.jsonl && jq -c . .cog/run/<name>.jsonl | head",
+	}, m.toolSearchTraces)
 }
 
 // registerResources registers MCP Resources — read-only addressable data.
@@ -410,6 +415,17 @@ type ingestInput struct {
 	Metadata map[string]string `json:"metadata,omitempty" jsonschema:"Optional context (discord_message_id, channel, etc.)"`
 }
 
+type searchTracesInput struct {
+	Source    string `json:"source,omitempty" jsonschema:"Trace source filter. One of: turn_metrics, attention, proprioceptive, internal_requests, all (default)."`
+	Level     string `json:"level,omitempty" jsonschema:"Level-like filter (exact match, case-insensitive). For proprioceptive source this matches the event field."`
+	SessionID string `json:"session_id,omitempty" jsonschema:"Filter to rows whose session_id matches. Only meaningful for sources that carry a session_id (turn_metrics, internal_requests)."`
+	Substring string `json:"substring,omitempty" jsonschema:"Case-insensitive substring match against the raw JSONL line. Capped at 1024 characters."`
+	Since     string `json:"since,omitempty" jsonschema:"Lower time bound. RFC3339 timestamp or Go duration (e.g. 5m, 1h, 24h for 'since N ago')."`
+	Until     string `json:"until,omitempty" jsonschema:"Upper time bound. RFC3339 timestamp or Go duration."`
+	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum results (default 100, max 1000)."`
+	Order     string `json:"order,omitempty" jsonschema:"'desc' (default, newest first) or 'asc'."`
+}
+
 // ── Tool Implementations ─────────────────────────────────────────────────────
 
 // toolResolveURI — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
@@ -542,18 +558,18 @@ func (m *MCPServer) toolGetState(ctx context.Context, req *mcp.CallToolRequest, 
 	}
 
 	result := map[string]any{
-		"state":               m.process.State().String(),
-		"identity":            identity,
-		"session_id":          m.process.SessionID(),
-		"node_id":             m.process.NodeID,
-		"uptime_seconds":      int(time.Since(m.process.StartedAt()).Seconds()),
-		"field_size":          m.process.Field().Len(),
-		"trust_score":         trust.LocalScore,
-		"fingerprint":         m.process.Fingerprint(),
-		"last_heartbeat":      lastHeartbeat,
-		"coherence_state":     trust.CoherenceFingerprint,
-		"quarantined_count":   queue.Quarantined,
-		"deferred_count":      queue.Deferred,
+		"state":             m.process.State().String(),
+		"identity":          identity,
+		"session_id":        m.process.SessionID(),
+		"node_id":           m.process.NodeID,
+		"uptime_seconds":    int(time.Since(m.process.StartedAt()).Seconds()),
+		"field_size":        m.process.Field().Len(),
+		"trust_score":       trust.LocalScore,
+		"fingerprint":       m.process.Fingerprint(),
+		"last_heartbeat":    lastHeartbeat,
+		"coherence_state":   trust.CoherenceFingerprint,
+		"quarantined_count": queue.Quarantined,
+		"deferred_count":    queue.Deferred,
 	}
 
 	// Node health — sibling services probed on heartbeat.
@@ -1081,6 +1097,67 @@ func (m *MCPServer) resourceConfig(_ context.Context, req *mcp.ReadResourceReque
 			Text:     string(b),
 		}},
 	}, nil
+}
+
+// toolSearchTraces serves the MCP-side entry for `cog_search_traces`.
+// Mirrors the HTTP /v1/traces handler: validates inputs, delegates to
+// QueryTraces, returns a JSON-encoded TraceQueryResult.
+func (m *MCPServer) toolSearchTraces(ctx context.Context, req *mcp.CallToolRequest, input searchTracesInput) (*mcp.CallToolResult, any, error) {
+	tq, err := buildTraceQueryFromInput(input)
+	if err != nil {
+		return textResult(fmt.Sprintf("invalid trace query: %v", err))
+	}
+	res, err := QueryTraces(m.cfg.WorkspaceRoot, tq)
+	if err != nil {
+		return fallbackResult(
+			fmt.Sprintf("trace search failed: %v", err),
+			"ls .cog/run/*.jsonl && jq -c . .cog/run/<name>.jsonl | head",
+		)
+	}
+	return marshalResult(res)
+}
+
+// buildTraceQueryFromInput validates the MCP input shape and normalizes it
+// into a TraceQuery. Shares semantics with parseTraceQueryFromRequest so that
+// the HTTP and MCP surfaces agree on defaults and bounds.
+func buildTraceQueryFromInput(in searchTracesInput) (TraceQuery, error) {
+	q := TraceQuery{
+		Source:    TraceSource(strings.TrimSpace(in.Source)),
+		Level:     strings.TrimSpace(in.Level),
+		SessionID: strings.TrimSpace(in.SessionID),
+		Substring: in.Substring,
+		Limit:     in.Limit,
+		Order:     strings.TrimSpace(in.Order),
+	}
+	if q.Source == "" {
+		q.Source = SourceAll
+	}
+	if _, err := resolveSources(q.Source); err != nil {
+		return TraceQuery{}, err
+	}
+
+	now := time.Now()
+	if in.Since != "" {
+		t, err := ParseTraceDurationOrTime(in.Since, now)
+		if err != nil {
+			return TraceQuery{}, fmt.Errorf("since: %w", err)
+		}
+		q.Since = t
+	}
+	if in.Until != "" {
+		t, err := ParseTraceDurationOrTime(in.Until, now)
+		if err != nil {
+			return TraceQuery{}, fmt.Errorf("until: %w", err)
+		}
+		q.Until = t
+	}
+	if q.Limit < 0 {
+		return TraceQuery{}, fmt.Errorf("limit: expected non-negative integer, got %d", q.Limit)
+	}
+	if q.Limit > maxTracesLimit {
+		return TraceQuery{}, fmt.Errorf("limit: %d exceeds max %d", q.Limit, maxTracesLimit)
+	}
+	return q, nil
 }
 
 // slugify converts a string to a URL-friendly slug.
