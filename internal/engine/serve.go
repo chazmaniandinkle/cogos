@@ -72,8 +72,10 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	mux.HandleFunc("POST /v1/messages", s.handleAnthropicMessages)
 	mux.HandleFunc("GET /v1/proprioceptive", s.handleProprioceptive)
 	mux.HandleFunc("GET /v1/ledger", s.handleLedger)
+	mux.HandleFunc("GET /v1/traces", s.handleTraces)
 	mux.HandleFunc("GET /v1/lightcone", s.handleLightCone)
 	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext)
+	mux.HandleFunc("GET /v1/conversation", s.handleConversation)
 
 	// Constellation / attention endpoints (Phase 3)
 	s.registerAttentionRoutes(mux)
@@ -83,6 +85,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.registerCompatRoutes(mux)
 	s.registerEventBusRoutes(mux)
 	s.registerMCPRoutes(mux)
+	s.registerConfigRoutes(mux)
 
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
@@ -259,23 +262,23 @@ func (s *Server) handleCogDocRead(w http.ResponseWriter, r *http.Request) {
 // ── OpenAI-compatible wire types ─────────────────────────────────────────────
 
 type oaiChatRequest struct {
-	Model               string               `json:"model"`
-	Messages            []oaiMessage          `json:"messages"`
-	Stream              bool                  `json:"stream"`
-	Temperature         *float64              `json:"temperature,omitempty"`
-	MaxTokens           int                   `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int                   `json:"max_completion_tokens,omitempty"`
-	TopP                *float64              `json:"top_p,omitempty"`
-	Stop                []string              `json:"stop,omitempty"`
-	Tools               []oaiToolDefinition   `json:"tools,omitempty"`
-	ToolChoice          json.RawMessage       `json:"tool_choice,omitempty"`
-	ParallelToolCalls   *bool                 `json:"parallel_tool_calls,omitempty"`
-	FrequencyPenalty    *float64              `json:"frequency_penalty,omitempty"`
-	PresencePenalty     *float64              `json:"presence_penalty,omitempty"`
-	Seed                *int                  `json:"seed,omitempty"`
-	User                string                `json:"user,omitempty"`
-	N                   *int                  `json:"n,omitempty"`
-	StreamOptions       *oaiStreamOpts        `json:"stream_options,omitempty"`
+	Model               string              `json:"model"`
+	Messages            []oaiMessage        `json:"messages"`
+	Stream              bool                `json:"stream"`
+	Temperature         *float64            `json:"temperature,omitempty"`
+	MaxTokens           int                 `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int                 `json:"max_completion_tokens,omitempty"`
+	TopP                *float64            `json:"top_p,omitempty"`
+	Stop                []string            `json:"stop,omitempty"`
+	Tools               []oaiToolDefinition `json:"tools,omitempty"`
+	ToolChoice          json.RawMessage     `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool               `json:"parallel_tool_calls,omitempty"`
+	FrequencyPenalty    *float64            `json:"frequency_penalty,omitempty"`
+	PresencePenalty     *float64            `json:"presence_penalty,omitempty"`
+	Seed                *int                `json:"seed,omitempty"`
+	User                string              `json:"user,omitempty"`
+	N                   *int                `json:"n,omitempty"`
+	StreamOptions       *oaiStreamOpts      `json:"stream_options,omitempty"`
 }
 
 // oaiStreamOpts carries OpenAI stream_options (e.g. include_usage).
@@ -363,9 +366,9 @@ func extractContent(raw json.RawMessage) string {
 
 // oaiContentPart represents a single element in the OpenAI multi-part content array.
 type oaiContentPart struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text,omitempty"`
-	ImageURL *oaiImageURL    `json:"image_url,omitempty"`
+	Type     string       `json:"type"`
+	Text     string       `json:"text,omitempty"`
+	ImageURL *oaiImageURL `json:"image_url,omitempty"`
 }
 
 // oaiImageURL carries the URL (typically a data: base64 URI) for an image content part.
@@ -629,17 +632,37 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		instruments.ChatRequests.Add(ctx, 1)
 	}
 
+	// Prepare the turn record. Fully populated by the provider path (complete/stream)
+	// below, then persisted via RecordTurn once the response is on its way to the client.
+	turn := &TurnRecord{
+		TurnID:    uuid.New().String(),
+		TurnIndex: NextTurnIndex(s.cfg.WorkspaceRoot, block.SessionID),
+		SessionID: block.SessionID,
+		Timestamp: time.Now().UTC(),
+		Prompt:    query,
+		Provider:  provider.Name(),
+		Model:     model,
+		BlockID:   block.ID,
+	}
+
 	inferStart := time.Now()
 	if req.Stream {
-		s.streamChat(w, r.Context(), creq, provider, respID, model, req.StreamOptions)
+		s.streamChat(w, r.Context(), creq, provider, respID, model, req.StreamOptions, turn)
 	} else {
-		s.completeChat(w, r.Context(), creq, provider, respID, model)
+		s.completeChat(w, r.Context(), creq, provider, respID, model, turn)
 	}
 
 	inferMs := float64(time.Since(inferStart).Milliseconds())
 	span.SetAttributes(attribute.Float64("cogos.inference.latency_ms", inferMs))
 	if instruments.InferenceLatency != nil {
 		instruments.InferenceLatency.Record(ctx, inferMs)
+	}
+
+	// Persist the turn (ledger event + sidecar). Closes cogos#20 by
+	// capturing the full prompt/response pair, which RecordBlock drops.
+	turn.DurationMs = time.Since(inferStart).Milliseconds()
+	if err := s.process.RecordTurn(turn); err != nil {
+		slog.Warn("chat: RecordTurn failed", "err", err, "session", turn.SessionID)
 	}
 
 	// Capture debug snapshot (best-effort, non-blocking).
@@ -653,12 +676,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 // completeChat handles non-streaming chat completions.
+// The optional turn record is populated with the response text, usage, and
+// any tool-call traces so the caller can persist the full turn via RecordTurn.
 func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *CompletionRequest,
-	provider Provider, respID, model string) {
+	provider Provider, respID, model string, turn *TurnRecord) {
 
 	resp, err := provider.Complete(ctx, req)
 	if err != nil {
 		slog.Warn("chat: complete error", "err", err)
+		if turn != nil {
+			turn.Status = "error"
+			turn.Error = err.Error()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -670,6 +699,25 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 			},
 		})
 		return
+	}
+	if turn != nil {
+		turn.Response = resp.Content
+		turn.Usage = TurnUsage{
+			InputTokens:  resp.Usage.InputTokens,
+			OutputTokens: resp.Usage.OutputTokens,
+			TotalTokens:  resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		}
+		// Non-kernel tool calls returned to the client become transcript
+		// entries with empty result (the client will execute them).
+		if len(resp.ToolCalls) > 0 {
+			for _, tc := range resp.ToolCalls {
+				turn.ToolCalls = append(turn.ToolCalls, ToolCallRecord{
+					ID:        tc.ID,
+					Name:      tc.Name,
+					Arguments: tc.Arguments,
+				})
+			}
+		}
 	}
 
 	msg := &oaiMessage{Role: "assistant", Content: mustMarshalString(resp.Content)}
@@ -721,12 +769,18 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 }
 
 // streamChat handles streaming chat completions via SSE.
+// The optional turn record accumulates the response text (and usage from
+// the final chunk) so the caller can persist the full turn via RecordTurn.
 func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *CompletionRequest,
-	provider Provider, respID, model string, streamOpts *oaiStreamOpts) {
+	provider Provider, respID, model string, streamOpts *oaiStreamOpts, turn *TurnRecord) {
 
 	chunks, err := provider.Stream(ctx, req)
 	if err != nil {
 		slog.Warn("chat: stream error", "err", err)
+		if turn != nil {
+			turn.Status = "error"
+			turn.Error = err.Error()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -739,6 +793,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 		})
 		return
 	}
+	var respBuf strings.Builder
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -765,6 +820,10 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 	for sc := range chunks {
 		if sc.Error != nil {
 			slog.Warn("chat: stream chunk error", "err", sc.Error)
+			if turn != nil {
+				turn.Status = "error"
+				turn.Error = sc.Error.Error()
+			}
 			break
 		}
 
@@ -776,6 +835,17 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 				finishReason = "stop"
 				if sawToolCall {
 					finishReason = "tool_calls"
+				}
+			}
+			// Populate the turn record with accumulated response + final usage.
+			if turn != nil {
+				turn.Response = respBuf.String()
+				if sc.Usage != nil {
+					turn.Usage = TurnUsage{
+						InputTokens:  sc.Usage.InputTokens,
+						OutputTokens: sc.Usage.OutputTokens,
+						TotalTokens:  sc.Usage.InputTokens + sc.Usage.OutputTokens,
+					}
 				}
 			}
 			data := oaiChatResponse{
@@ -832,6 +902,9 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 
 		// Text delta.
 		if sc.Delta != "" {
+			if turn != nil {
+				respBuf.WriteString(sc.Delta)
+			}
 			delta := &oaiMessage{Role: "assistant", Content: mustMarshalString(sc.Delta)}
 			data := oaiChatResponse{
 				ID:      respID,
@@ -843,6 +916,11 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 			b, _ := json.Marshal(data)
 			writeSSE(b)
 		}
+	}
+	// Ensure the turn record picks up the response text even when the
+	// stream never sent a Done chunk (error mid-stream, client disconnect).
+	if turn != nil && turn.Response == "" {
+		turn.Response = respBuf.String()
 	}
 	_, _ = fmt.Fprint(bw, "data: [DONE]\n\n")
 	flush()
@@ -987,6 +1065,95 @@ func writeLedgerError(w http.ResponseWriter, code int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+// handleTraces exposes the unified kernel trace search surface.
+//
+// Per Agent Q's design (2026-04-21) this is additive — /v1/proprioceptive
+// stays byte-for-byte identical because dashboard.html:1265 and
+// canvas.html:1706 consume its exact {entries, light_cone} shape.
+//
+//	GET /v1/traces
+//	    ?source=turn_metrics   (or "all", default)
+//	    &level=…               (applies to sources with a level-like field)
+//	    &session_id=…
+//	    &substring=…           (case-insensitive, full-line match)
+//	    &since=5m              (RFC3339 OR Go duration)
+//	    &until=…               (RFC3339 upper bound)
+//	    &limit=100             (1..1000)
+//	    &order=desc            ("asc" | "desc")
+//
+//	200 → TraceQueryResult
+//	400 → unknown source / unparseable since|until / limit out of range / substring too long
+//	500 → I/O error
+func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request) {
+	q, err := parseTraceQueryFromRequest(r)
+	if err != nil {
+		writeTraceError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := QueryTraces(s.cfg.WorkspaceRoot, q)
+	if err != nil {
+		writeTraceError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// parseTraceQueryFromRequest maps query params onto a TraceQuery.
+// Defaults: source=all, limit=100, order=desc.
+func parseTraceQueryFromRequest(r *http.Request) (TraceQuery, error) {
+	q := TraceQuery{
+		Source:    TraceSource(strings.TrimSpace(r.URL.Query().Get("source"))),
+		Level:     strings.TrimSpace(r.URL.Query().Get("level")),
+		SessionID: strings.TrimSpace(r.URL.Query().Get("session_id")),
+		Substring: r.URL.Query().Get("substring"),
+		Order:     strings.TrimSpace(r.URL.Query().Get("order")),
+	}
+
+	if q.Source == "" {
+		q.Source = SourceAll
+	}
+	// Validate source upfront so unknown values surface as 400, not 500.
+	if _, err := resolveSources(q.Source); err != nil {
+		return TraceQuery{}, err
+	}
+
+	now := time.Now()
+	if s := r.URL.Query().Get("since"); s != "" {
+		t, err := ParseTraceDurationOrTime(s, now)
+		if err != nil {
+			return TraceQuery{}, fmt.Errorf("since: %w", err)
+		}
+		q.Since = t
+	}
+	if s := r.URL.Query().Get("until"); s != "" {
+		t, err := ParseTraceDurationOrTime(s, now)
+		if err != nil {
+			return TraceQuery{}, fmt.Errorf("until: %w", err)
+		}
+		q.Until = t
+	}
+	if s := r.URL.Query().Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 0 {
+			return TraceQuery{}, fmt.Errorf("limit: expected non-negative integer, got %q", s)
+		}
+		if n > maxTracesLimit {
+			return TraceQuery{}, fmt.Errorf("limit: %d exceeds max %d", n, maxTracesLimit)
+		}
+		q.Limit = n
+	}
+	return q, nil
+}
+
+// writeTraceError emits a {"error": "..."} JSON body with the given status.
+// Matches the existing serve.go convention (handleDebugLast etc.).
+func writeTraceError(w http.ResponseWriter, status int, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
+
 // handleLightCone returns light cone metadata from the LightConeManager.
 // When TRM is loaded, returns real per-conversation light cone states.
 // When TRM is not available, returns a placeholder indicating TRM is disabled.
@@ -1016,6 +1183,94 @@ func (s *Server) handleLightCone(w http.ResponseWriter, r *http.Request) {
 		"count":  len(cones),
 		"cones":  cones,
 	})
+}
+
+// handleConversation returns the conversation turns for a session.
+//
+//	GET /v1/conversation
+//	  ?session_id=…            default: current process session
+//	  &after_turn=N            pagination: turn_index > N
+//	  &before_turn=N           reverse pagination: turn_index < N
+//	  &since=RFC3339           time filter
+//	  &limit=20                default 20, max 200
+//	  &include_full=true       default true — hydrate from sidecar
+//	  &include_tools=true      default true — include tool-call transcript
+//	  &order=asc               asc (default) | desc
+//
+//	200 → ConversationQueryResult
+//	400 → parse error
+//
+// Backed by the turn.completed ledger event stream + the per-session
+// sidecar JSONL. Closes Agent F gap #4.
+func (s *Server) handleConversation(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	sessionID := q.Get("session_id")
+	if sessionID == "" && s.process != nil {
+		sessionID = s.process.SessionID()
+	}
+	cq := ConversationQuery{
+		SessionID:    sessionID,
+		IncludeFull:  parseBoolDefault(q.Get("include_full"), true),
+		IncludeTools: parseBoolDefault(q.Get("include_tools"), true),
+		Order:        q.Get("order"),
+	}
+	if v := q.Get("after_turn"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			writeConversationError(w, http.StatusBadRequest, "invalid after_turn: "+err.Error())
+			return
+		}
+		cq.AfterTurn = n
+	}
+	if v := q.Get("before_turn"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			writeConversationError(w, http.StatusBadRequest, "invalid before_turn: "+err.Error())
+			return
+		}
+		cq.BeforeTurn = n
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			writeConversationError(w, http.StatusBadRequest, "invalid limit: "+err.Error())
+			return
+		}
+		cq.Limit = n
+	}
+	if v := q.Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeConversationError(w, http.StatusBadRequest, "invalid since (want RFC3339): "+err.Error())
+			return
+		}
+		cq.Since = t
+	}
+
+	res, err := QueryConversation(s.cfg.WorkspaceRoot, cq)
+	if err != nil {
+		writeConversationError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+func writeConversationError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func parseBoolDefault(s string, def bool) bool {
+	if s == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(s)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 // readLastJSONLEntries reads the last n lines from a JSONL file and returns
