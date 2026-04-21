@@ -3,10 +3,13 @@ package engine
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTestServer builds a Server with a healthy nucleus and a fresh process.
@@ -355,4 +358,153 @@ func TestServerHandler(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d; want 200", resp.StatusCode)
 	}
+}
+
+// ── BindAddr wiring (cogos#12) ─────────────────────────────────────────────
+
+// TestNewServerUsesBindAddr verifies NewServer composes http.Server.Addr
+// from Config.BindAddr so --bind 0.0.0.0 actually listens on all interfaces.
+// This is the regression test for cogos#12: prior to the fix the Addr was
+// always ":<port>" and BindAddr was ignored.
+func TestNewServerUsesBindAddr(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		bind     string
+		wantAddr string
+	}{
+		{"loopback default", "127.0.0.1", "127.0.0.1:0"},
+		{"all interfaces", "0.0.0.0", "0.0.0.0:0"},
+		{"empty falls back to loopback", "", "127.0.0.1:0"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root := makeWorkspace(t)
+			cfg := makeConfig(t, root)
+			cfg.BindAddr = tc.bind
+			cfg.Port = 0
+			process := NewProcess(cfg, makeNucleus("T", "r"))
+			srv := NewServer(cfg, makeNucleus("T", "r"), process)
+			if srv.srv.Addr != tc.wantAddr {
+				t.Errorf("srv.Addr = %q; want %q", srv.srv.Addr, tc.wantAddr)
+			}
+		})
+	}
+}
+
+// TestServerBindsAllInterfaces spins up a server with BindAddr=0.0.0.0 and
+// probes the reachable address to confirm it actually listens beyond
+// loopback. We cannot easily synthesize a LAN client in unit tests, but a
+// dial to 127.0.0.1:<port> must still succeed when bound to 0.0.0.0
+// (loopback is a subset of "all interfaces"), and the resolved
+// net.Listener addr must NOT be tied to 127.0.0.1 only.
+func TestServerBindsAllInterfaces(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	cfg.BindAddr = "0.0.0.0"
+	cfg.Port = 0
+
+	// Use a raw net.Listen to probe what "0.0.0.0:0" means on this host.
+	// This sanity-checks the platform before the server starts.
+	probe, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Skipf("platform refuses 0.0.0.0 bind: %v", err)
+	}
+	probeAddr := probe.Addr().String()
+	probe.Close()
+	if !strings.HasPrefix(probeAddr, "0.0.0.0:") && !strings.HasPrefix(probeAddr, "[::]:") {
+		t.Fatalf("probe addr %q does not look all-interfaces", probeAddr)
+	}
+
+	process := NewProcess(cfg, makeNucleus("T", "r"))
+	srv := NewServer(cfg, makeNucleus("T", "r"), process)
+	// Override port so we can race-free dial after Start.
+	ln, err := net.Listen("tcp", srv.srv.Addr)
+	if err != nil {
+		t.Fatalf("pre-listen: %v", err)
+	}
+	actualPort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	srv.srv.Addr = fmt.Sprintf("0.0.0.0:%d", actualPort)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Start() }()
+	defer func() {
+		_ = srv.srv.Close()
+		select {
+		case <-errCh:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	// Poll a loopback dial until the server accepts (or we give up). A
+	// successful dial to 127.0.0.1 when bound to 0.0.0.0 confirms the
+	// socket is open on loopback too, which is the subset we can verify
+	// without spoofing a LAN client in unit tests.
+	deadline := time.Now().Add(2 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", actualPort), 100*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return // success
+		}
+		lastErr = err
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("could not reach 0.0.0.0-bound server via 127.0.0.1: %v", lastErr)
+}
+
+// TestServerBindsLoopbackOnly verifies that BindAddr=127.0.0.1 (the default)
+// remains reachable via 127.0.0.1 — i.e. we didn't break the loopback path
+// while adding the non-loopback bind option.
+func TestServerBindsLoopbackOnly(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	cfg.BindAddr = "127.0.0.1"
+	cfg.Port = 0
+
+	process := NewProcess(cfg, makeNucleus("T", "r"))
+	srv := NewServer(cfg, makeNucleus("T", "r"), process)
+
+	if !strings.HasPrefix(srv.srv.Addr, "127.0.0.1:") {
+		t.Fatalf("srv.Addr = %q; want 127.0.0.1:<port>", srv.srv.Addr)
+	}
+
+	ln, err := net.Listen("tcp", srv.srv.Addr)
+	if err != nil {
+		t.Fatalf("pre-listen: %v", err)
+	}
+	actualPort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	srv.srv.Addr = fmt.Sprintf("127.0.0.1:%d", actualPort)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Start() }()
+	defer func() {
+		_ = srv.srv.Close()
+		select {
+		case <-errCh:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", actualPort), 100*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		lastErr = err
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("could not reach 127.0.0.1-bound server: %v", lastErr)
 }

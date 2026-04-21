@@ -92,8 +92,15 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.registerMCPRoutes(mux)
 	s.registerConfigRoutes(mux)
 
+	// Resolve the bind address. Default stays 127.0.0.1 (loopback-only);
+	// callers may override via Config.BindAddr to listen on all interfaces
+	// ("0.0.0.0") for pod/LAN/Tailnet deployments.
+	bindAddr := cfg.BindAddr
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1"
+	}
 	s.srv = &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Port),
+		Addr:         fmt.Sprintf("%s:%d", bindAddr, cfg.Port),
 		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 300 * time.Second, // 5 min — streaming responses can be long
@@ -126,7 +133,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.srv.Addr, err)
 	}
-	slog.Info("server: listening", "addr", s.srv.Addr)
+	slog.Info("server: listening", "addr", s.srv.Addr, "bind", s.cfg.BindAddr)
 	return s.srv.Serve(ln)
 }
 

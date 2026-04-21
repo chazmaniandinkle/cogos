@@ -61,6 +61,7 @@ type workspaceContext struct {
 
 type serveServer struct {
 	port          int
+	bindAddr      string                       // bind interface (default 127.0.0.1; "0.0.0.0" for LAN)
 	kernel        *sdk.Kernel                  // default workspace kernel (backward compat)
 	workspaces    map[string]*workspaceContext // name → workspace context
 	defaultWS     string                       // default workspace name
@@ -95,9 +96,20 @@ type serveServer struct {
 }
 
 func newServeServer(port int, kernel *sdk.Kernel) *serveServer {
+	return newServeServerWithBind(port, "127.0.0.1", kernel)
+}
+
+// newServeServerWithBind is like newServeServer but lets the caller specify
+// the bind address. Used by cmdServeForeground when --bind is supplied.
+// An empty bindAddr falls back to the loopback default.
+func newServeServerWithBind(port int, bindAddr string, kernel *sdk.Kernel) *serveServer {
 	root, _, _ := ResolveWorkspace()
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1"
+	}
 	return &serveServer{
 		port:               port,
+		bindAddr:           bindAddr,
 		kernel:             kernel,
 		busBroker:          newBusEventBroker(),
 		toolBridge:         NewToolBridge(),
@@ -306,7 +318,11 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("GET /dashboard", s.handleDashboardPage) // Embedded web dashboard
 	mux.HandleFunc("/", s.handleRoot)
 
-	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
+	bindAddr := s.bindAddr
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1"
+	}
+	addr := fmt.Sprintf("%s:%d", bindAddr, s.port)
 
 	// Check port availability before printing banner
 	listener, err := net.Listen("tcp", addr)
@@ -372,7 +388,7 @@ func (s *serveServer) Start() error {
 		}
 	}()
 
-	fmt.Printf("CogOS unified server starting on http://localhost:%d\n", s.port)
+	fmt.Printf("CogOS unified server starting on http://%s:%d (bind %s)\n", displayHost(bindAddr), s.port, bindAddr)
 	fmt.Printf("\nAnthropic Messages API Proxy:\n")
 	fmt.Printf("  POST   /v1/messages         - Proxy to Anthropic (ANTHROPIC_BASE_URL=http://localhost:%d)\n", s.port)
 	fmt.Printf("\nInference (OpenAI-compatible):\n")
@@ -554,13 +570,62 @@ func (s *serveServer) checkOCIDigest() {
 	}
 }
 
+// displayHost returns a user-friendly host string for banner printing.
+// Shows "localhost" for loopback binds, or the actual bind address otherwise
+// (so "0.0.0.0" surfaces clearly to operators opting into LAN binds).
+func displayHost(bindAddr string) string {
+	if bindAddr == "" || bindAddr == "127.0.0.1" || bindAddr == "::1" {
+		return "localhost"
+	}
+	return bindAddr
+}
+
+// isLoopbackBind reports whether the given bind address is loopback-only.
+// Used to decide whether to tighten or relax WS/CORS origin patterns.
+func isLoopbackBind(bindAddr string) bool {
+	switch bindAddr {
+	case "", "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	return false
+}
+
+// originPatternsForBind returns the WebSocket OriginPatterns list
+// appropriate for the given bind address. Loopback binds stay tight
+// (localhost + 127.0.0.1 only); non-loopback binds relax to "*" because
+// the origin is no longer predictable (LAN hostnames, Tailscale MagicDNS,
+// pod DNS, etc.). Security of non-loopback binds must be provided at
+// the network boundary (trusted LAN, VPN, firewall).
+func originPatternsForBind(bindAddr string) []string {
+	if isLoopbackBind(bindAddr) {
+		return []string{"localhost:*", "127.0.0.1:*"}
+	}
+	return []string{"*"}
+}
+
 func (s *serveServer) corsMiddleware(next http.Handler) http.Handler {
+	loopback := isLoopbackBind(s.bindAddr)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == "" || strings.HasPrefix(origin, "http://localhost") || strings.HasPrefix(origin, "http://127.0.0.1") {
+		switch {
+		case origin == "":
+			// No Origin header — non-browser request. Still emit a permissive
+			// wildcard so downstream tooling doesn't choke on missing header.
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		case loopback:
+			// Tight policy for loopback: only echo back loopback origins;
+			// everything else falls through to a safe default.
+			if strings.HasPrefix(origin, "http://localhost") || strings.HasPrefix(origin, "http://127.0.0.1") {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5100")
+			}
+		default:
+			// Non-loopback bind (e.g. 0.0.0.0). The user has opted into a
+			// broader network surface and is responsible for boundary
+			// protection (trusted LAN / VPN / firewall). Echo the origin
+			// back so LAN / Tailnet / pod clients can connect.
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-		} else {
-			w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5100")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")

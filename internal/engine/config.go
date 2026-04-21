@@ -28,6 +28,13 @@ type Config struct {
 	// Port the HTTP API listens on. Default: 6931 (ln(2) × 10⁴).
 	Port int
 
+	// BindAddr is the interface the HTTP API binds to.
+	// Default: "127.0.0.1" (loopback-only). Set to "0.0.0.0" to listen
+	// on all interfaces — required for pod/LAN/Tailnet deployments.
+	// Users opting in to non-loopback binds are expected to handle the
+	// network boundary themselves (trusted network, VPN, firewall).
+	BindAddr string
+
 	// ConsolidationInterval is how often the consolidation loop fires (seconds).
 	ConsolidationInterval int
 
@@ -78,6 +85,7 @@ type Config struct {
 // kernelConfigSection holds settings that can appear at the top level or inside v3:.
 type kernelConfigSection struct {
 	Port                  int               `yaml:"port"`
+	BindAddr              string            `yaml:"bind_addr"`
 	ConsolidationInterval int               `yaml:"consolidation_interval"`
 	HeartbeatInterval     int               `yaml:"heartbeat_interval"`
 	SalienceDaysWindow    int               `yaml:"salience_days_window"`
@@ -121,6 +129,7 @@ func LoadConfig(workspaceRoot string, port int) (*Config, error) {
 		WorkspaceRoot:             workspaceRoot,
 		CogDir:                    filepath.Join(workspaceRoot, ".cog"),
 		Port:                      6931,
+		BindAddr:                  "127.0.0.1",
 		ConsolidationInterval:     3600,
 		HeartbeatInterval:         60,
 		SalienceDaysWindow:        90,
@@ -153,6 +162,9 @@ func LoadConfig(workspaceRoot string, port int) (*Config, error) {
 func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	if s.Port != 0 {
 		cfg.Port = s.Port
+	}
+	if s.BindAddr != "" {
+		cfg.BindAddr = s.BindAddr
 	}
 	if s.ConsolidationInterval != 0 {
 		cfg.ConsolidationInterval = s.ConsolidationInterval
