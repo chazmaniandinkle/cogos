@@ -31,7 +31,7 @@ GOOS := $(shell go env GOOS)
 GOARCH := $(shell go env GOARCH)
 
 # Build targets
-PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64
+PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64 windows-amd64 windows-arm64
 
 .PHONY: all build clean test test-coverage test-integration bench install push image run e2e e2e-local $(PLATFORMS)
 
@@ -61,6 +61,16 @@ linux-arm64:
 # Android requires PIE (position-independent executables)
 android-arm64:
 	GOOS=android GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -buildmode=pie -ldflags="$(LDFLAGS)" -o $(BINARY)-android-arm64 .
+
+# Windows cross-compile: matches .github/workflows/release.yml exactly.
+# CGO_ENABLED=0 avoids tree-sitter's CGO path; ./cmd/cogos/ is the real entry
+# point published by CI (the root package pulls in test-only deps).
+# .exe suffix is required to execute on Windows.
+windows-amd64:
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o $(BINARY)-windows-amd64.exe ./cmd/cogos/
+
+windows-arm64:
+	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 $(GO) build -ldflags="$(LDFLAGS)" -o $(BINARY)-windows-arm64.exe ./cmd/cogos/
 
 INSTALL_DIR := $(HOME)/.cog/bin
 INSTALL_TARGET := $(INSTALL_DIR)/cogos
