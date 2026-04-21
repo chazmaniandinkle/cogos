@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -195,25 +197,65 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		model = anthropicReq.Model
 	}
 
-	if anthropicReq.Stream {
-		s.streamAnthropicMessages(w, r.Context(), creq, provider, respID, model)
-		return
+	// Prepare the turn record — fills in during complete/stream, persisted below.
+	turn := &TurnRecord{
+		TurnID:    uuid.NewString(),
+		TurnIndex: NextTurnIndex(s.cfg.WorkspaceRoot, block.SessionID),
+		SessionID: block.SessionID,
+		Timestamp: time.Now().UTC(),
+		Prompt:    query,
+		Provider:  provider.Name(),
+		Model:     model,
+		BlockID:   block.ID,
 	}
-	s.completeAnthropicMessages(w, r.Context(), creq, provider, respID, model)
+
+	turnStart := time.Now()
+	if anthropicReq.Stream {
+		s.streamAnthropicMessages(w, r.Context(), creq, provider, respID, model, turn)
+	} else {
+		s.completeAnthropicMessages(w, r.Context(), creq, provider, respID, model, turn)
+	}
+
+	turn.DurationMs = time.Since(turnStart).Milliseconds()
+	if err := s.process.RecordTurn(turn); err != nil {
+		slog.Warn("anthropic: RecordTurn failed", "err", err, "session", turn.SessionID)
+	}
 }
 
 func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Context, req *CompletionRequest,
-	provider Provider, respID, model string) {
+	provider Provider, respID, model string, turn *TurnRecord) {
 
 	resp, err := provider.Complete(ctx, req)
 	if err != nil {
 		slog.Warn("anthropic: complete error", "err", err)
+		if turn != nil {
+			turn.Status = "error"
+			turn.Error = err.Error()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"error": map[string]string{"type": "inference_error", "message": err.Error()},
 		})
 		return
+	}
+
+	if turn != nil {
+		turn.Response = resp.Content
+		turn.Usage = TurnUsage{
+			InputTokens:  resp.Usage.InputTokens,
+			OutputTokens: resp.Usage.OutputTokens,
+			TotalTokens:  resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		}
+		if len(resp.ToolCalls) > 0 {
+			for _, tc := range resp.ToolCalls {
+				turn.ToolCalls = append(turn.ToolCalls, ToolCallRecord{
+					ID:        tc.ID,
+					Name:      tc.Name,
+					Arguments: tc.Arguments,
+				})
+			}
+		}
 	}
 
 	response := anthropicMessagesResponse{
@@ -234,11 +276,15 @@ func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Co
 }
 
 func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Context, req *CompletionRequest,
-	provider Provider, respID, model string) {
+	provider Provider, respID, model string, turn *TurnRecord) {
 
 	chunks, err := provider.Stream(ctx, req)
 	if err != nil {
 		slog.Warn("anthropic: stream error", "err", err)
+		if turn != nil {
+			turn.Status = "error"
+			turn.Error = err.Error()
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -281,10 +327,16 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 		},
 	})
 
+	var respBuf strings.Builder
 	usage := anthropicMessagesUsage{}
 	for sc := range chunks {
 		if sc.Error != nil {
 			slog.Warn("anthropic: stream chunk error", "err", sc.Error)
+			if turn != nil {
+				turn.Status = "error"
+				turn.Error = sc.Error.Error()
+				turn.Response = respBuf.String()
+			}
 			break
 		}
 		if sc.Usage != nil {
@@ -292,6 +344,9 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 			usage.OutputTokens = sc.Usage.OutputTokens
 		}
 		if sc.Delta != "" {
+			if turn != nil {
+				respBuf.WriteString(sc.Delta)
+			}
 			writeEvent("content_block_delta", map[string]any{
 				"type":  "content_block_delta",
 				"index": 0,
@@ -302,6 +357,14 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 			})
 		}
 		if sc.Done {
+			if turn != nil {
+				turn.Response = respBuf.String()
+				turn.Usage = TurnUsage{
+					InputTokens:  usage.InputTokens,
+					OutputTokens: usage.OutputTokens,
+					TotalTokens:  usage.InputTokens + usage.OutputTokens,
+				}
+			}
 			writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
 			writeEvent("message_delta", map[string]any{
 				"type": "message_delta",
@@ -313,5 +376,9 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 			writeEvent("message_stop", map[string]any{"type": "message_stop"})
 			return
 		}
+	}
+	// In case the loop exited without sc.Done (error path), preserve what we captured.
+	if turn != nil && turn.Response == "" {
+		turn.Response = respBuf.String()
 	}
 }
