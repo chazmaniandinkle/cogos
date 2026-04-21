@@ -168,6 +168,12 @@ type Process struct {
 	// AppendEvent publishes through the package-level CurrentBroker() set
 	// by NewProcess, so call sites don't need to thread this pointer.
 	broker *EventBroker
+
+	// pendingToolCalls correlates client-ownership tool.call emissions with
+	// the role=tool response that arrives on a later HTTP turn. Lazily
+	// initialized on first registerPendingToolCall; swept by
+	// RunPendingToolCallSweeper. See tool_observer.go.
+	pendingToolCalls *pendingToolCallRegistry
 }
 
 // NewProcess constructs and initialises the process.
