@@ -38,13 +38,11 @@ type BudgetConfig struct {
 
 // TemporalConfig controls Tier 2 extraction behavior.
 type TemporalConfig struct {
-	ExtractionMethod    string           `yaml:"extraction_method"`    // TODO: not yet wired — always "heuristic", reserved for future LLM extraction
-	AnchorKeywords      int              `yaml:"anchor_keywords"`
-	GoalKeywords        int              `yaml:"goal_keywords"`
-	RecencyWindow       int              `yaml:"recency_window"`
-	ConfidenceThreshold float64          `yaml:"confidence_threshold"` // TODO: not yet wired — extraction confidence not scored
-	RecentMessages      int              `yaml:"recent_messages"`      // Number of recent messages to echo in Tier 2 for momentary awareness (default: 6)
-	Peripheral          PeripheralConfig `yaml:"peripheral"`
+	AnchorKeywords int              `yaml:"anchor_keywords"`
+	GoalKeywords   int              `yaml:"goal_keywords"`
+	RecencyWindow  int              `yaml:"recency_window"`
+	RecentMessages int              `yaml:"recent_messages"` // Number of recent messages to echo in Tier 2 for momentary awareness (default: 6)
+	Peripheral     PeripheralConfig `yaml:"peripheral"`
 }
 
 // PeripheralConfig controls cross-session peripheral awareness in Tier 2.
@@ -86,16 +84,13 @@ type RankingConfig struct {
 
 // CoherenceConfig controls context refresh triggers.
 type CoherenceConfig struct {
-	MinScore    float64 `yaml:"min_score"`
-	FailureMode string  `yaml:"failure_mode"` // TODO: not yet wired — always "continue"
+	MinScore float64 `yaml:"min_score"`
 }
 
 // DebugConfig controls tracing and logging.
 type DebugConfig struct {
-	TraceTiers     bool   `yaml:"trace_tiers"`      // TODO: not yet wired — per-tier input/output tracing
-	TraceQueries   bool   `yaml:"trace_queries"`
-	TraceSubstance bool   `yaml:"trace_substance"`
-	TraceFile      string `yaml:"trace_file"`        // TODO: not yet wired — trace output file path
+	TraceQueries   bool `yaml:"trace_queries"`
+	TraceSubstance bool `yaml:"trace_substance"`
 }
 
 // DynamicBudgetConfig controls score-driven budget allocation with safety floors (Phase U.2).
@@ -133,12 +128,10 @@ var defaultTAAConfig = TAAConfig{
 		Tier4Semantic: 6,
 	},
 	Temporal: TemporalConfig{
-		ExtractionMethod:    "heuristic",
-		AnchorKeywords:      5,
-		GoalKeywords:        5,
-		RecencyWindow:       10,
-		ConfidenceThreshold: 0.6,
-		RecentMessages:      6,
+		AnchorKeywords: 5,
+		GoalKeywords:   5,
+		RecencyWindow:  10,
+		RecentMessages: 6,
 		Peripheral: PeripheralConfig{
 			MaxBuses:     5,
 			MaxAgeHours:  24,
@@ -169,14 +162,11 @@ var defaultTAAConfig = TAAConfig{
 		RecencyWeight:   0.2,
 	},
 	Coherence: CoherenceConfig{
-		MinScore:    0.66,
-		FailureMode: "continue",
+		MinScore: 0.66,
 	},
 	Debug: DebugConfig{
-		TraceTiers:     false,
 		TraceQueries:   false,
 		TraceSubstance: false,
-		TraceFile:      "",
 	},
 	Embedding: EmbeddingConfig{
 		Enabled:        false,
