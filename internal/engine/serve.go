@@ -9,6 +9,7 @@
 //	POST /v1/messages                      — Anthropic Messages-compatible chat
 //	POST /v1/context/foveated              — foveated context assembly for Claude Code hook
 //	GET  /v1/proprioceptive                — last 50 proprioceptive log entries + light cone status
+//	GET  /v1/ledger                        — query the hash-chained event ledger
 //	GET  /v1/lightcone                     — light cone metadata (placeholder)
 //
 // Constellation / attention endpoints (Phase 3, see serve_attention.go):
@@ -25,6 +26,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -33,6 +35,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -67,6 +71,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
 	mux.HandleFunc("POST /v1/messages", s.handleAnthropicMessages)
 	mux.HandleFunc("GET /v1/proprioceptive", s.handleProprioceptive)
+	mux.HandleFunc("GET /v1/ledger", s.handleLedger)
 	mux.HandleFunc("GET /v1/lightcone", s.handleLightCone)
 	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext)
 
@@ -900,6 +905,85 @@ func (s *Server) handleProprioceptive(w http.ResponseWriter, r *http.Request) {
 		"entries":    entries,
 		"light_cone": lcStatus,
 	})
+}
+
+// handleLedger exposes QueryLedger over HTTP. Query params map 1:1 with the
+// MCP tool input.
+//
+//	GET /v1/ledger?session_id=…&event_type=…&after_seq=…&since_timestamp=…&limit=…&verify_chain=…
+//	200 → { count, events, truncated, verification, next_after_seq? }
+//	400 → malformed query (bad int, bad RFC3339, after_seq without session_id)
+//	404 → session_id specified but no events.jsonl found
+//	500 → read/JSON failure
+//
+// Returns 200 with verification.valid=false when the chain is broken but data
+// read succeeded — tamper evidence is the point of the ledger, so hiding data
+// behind 500 would defeat the purpose.
+func (s *Server) handleLedger(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	q := r.URL.Query()
+	query := LedgerQuery{
+		SessionID:      q.Get("session_id"),
+		EventType:      q.Get("event_type"),
+		SinceTimestamp: q.Get("since_timestamp"),
+	}
+	if v := q.Get("after_seq"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			writeLedgerError(w, http.StatusBadRequest, fmt.Sprintf("after_seq: %v", err))
+			return
+		}
+		query.AfterSeq = n
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			writeLedgerError(w, http.StatusBadRequest, fmt.Sprintf("limit: %v", err))
+			return
+		}
+		if n < 0 {
+			writeLedgerError(w, http.StatusBadRequest, "limit must be non-negative")
+			return
+		}
+		query.Limit = n
+	}
+	if v := q.Get("verify_chain"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			writeLedgerError(w, http.StatusBadRequest, fmt.Sprintf("verify_chain: %v", err))
+			return
+		}
+		query.VerifyChain = b
+	}
+
+	result, err := QueryLedger(s.cfg.WorkspaceRoot, query)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrAfterSeqRequiresSession):
+			writeLedgerError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, ErrSessionNotFound):
+			writeLedgerError(w, http.StatusNotFound, err.Error())
+		default:
+			// Filter-parse errors from QueryLedger (e.g. bad since_timestamp)
+			// are user input problems. Everything else is a 500.
+			msg := err.Error()
+			if strings.Contains(msg, "since_timestamp") || strings.Contains(msg, "event_type") {
+				writeLedgerError(w, http.StatusBadRequest, msg)
+				return
+			}
+			writeLedgerError(w, http.StatusInternalServerError, msg)
+		}
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// writeLedgerError writes a JSON error response with the given status code.
+func writeLedgerError(w http.ResponseWriter, code int, msg string) {
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 // handleLightCone returns light cone metadata from the LightConeManager.
