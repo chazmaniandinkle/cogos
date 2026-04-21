@@ -1,7 +1,7 @@
 // mcp_server.go — MCP Streamable HTTP server for CogOS v3
 //
 // Embeds the MCP server into the existing HTTP server at /mcp.
-// Registers 10 MCP tools and 3 MCP resources. Four former tools
+// Registers 11 MCP tools and 3 MCP resources. Four former tools
 // (resolve_uri, get_trust, get_nucleus, get_index) are no longer
 // registered as MCP tools but their implementations remain — used
 // by the internal tool loop (tool_loop.go).
@@ -120,6 +120,11 @@ func (m *MCPServer) registerTools() {
 		Name:        "cog_emit_event",
 		Description: "Emit a typed event to the workspace ledger. Events: attention.boost (uri + weight), session.marker (label), insight.captured (summary), decision.made (decision + rationale). Fallback: events are JSONL in .cog/ledger/",
 	}, m.toolEmitEvent)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_read_ledger",
+		Description: "Read the hash-chained event ledger. Filter by session_id, event_type (exact or 'prefix.*' wildcard), after_seq (requires session_id), since_timestamp (RFC3339), or limit (default 100, max 1000). Set verify_chain=true to recompute hashes and validate prior_hash links. Fallback: cat .cog/ledger/<session_id>/events.jsonl",
+	}, m.toolReadLedger)
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_ingest",
@@ -359,6 +364,15 @@ type readCogdocResult struct {
 type emitEventInput struct {
 	Type    string         `json:"type" jsonschema:"Event type: attention.boost, session.marker, insight.captured, decision.made"`
 	Payload map[string]any `json:"payload,omitempty" jsonschema:"Event payload. attention.boost: {uri, weight}. session.marker: {label}. insight.captured: {summary, tags}. decision.made: {decision, rationale}."`
+}
+
+type readLedgerInput struct {
+	SessionID      string `json:"session_id,omitempty" jsonschema:"Filter to a single session; empty reads across all non-genesis sessions"`
+	EventType      string `json:"event_type,omitempty" jsonschema:"Exact event type, or a prefix wildcard like 'attention.*'"`
+	AfterSeq       int64  `json:"after_seq,omitempty" jsonschema:"Return events with seq greater than this. Requires session_id (seq is not monotonic across sessions)."`
+	SinceTimestamp string `json:"since_timestamp,omitempty" jsonschema:"RFC3339 timestamp; return events with timestamp >= this"`
+	Limit          int    `json:"limit,omitempty" jsonschema:"Maximum events to return. Default 100, capped at 1000."`
+	VerifyChain    bool   `json:"verify_chain,omitempty" jsonschema:"Recompute hashes and validate prior_hash links on returned events. Off by default (chain walk is O(N))."`
 }
 
 // getIndexInput — no longer an MCP tool; used by the internal tool loop (tool_loop.go).
@@ -825,6 +839,23 @@ func (m *MCPServer) toolEmitEvent(ctx context.Context, req *mcp.CallToolRequest,
 		"emitted": true,
 		"type":    input.Type,
 	})
+}
+
+func (m *MCPServer) toolReadLedger(ctx context.Context, req *mcp.CallToolRequest, input readLedgerInput) (*mcp.CallToolResult, any, error) {
+	q := LedgerQuery{
+		SessionID:      input.SessionID,
+		EventType:      input.EventType,
+		AfterSeq:       input.AfterSeq,
+		SinceTimestamp: input.SinceTimestamp,
+		Limit:          input.Limit,
+		VerifyChain:    input.VerifyChain,
+	}
+	result, err := QueryLedger(m.cfg.WorkspaceRoot, q)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("read ledger failed: %v", err),
+			"ls .cog/ledger/ && cat .cog/ledger/<session_id>/events.jsonl")
+	}
+	return marshalResult(result)
 }
 
 // toolGetIndex — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
