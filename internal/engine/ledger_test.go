@@ -124,6 +124,7 @@ func TestCanonicalizeEventWithData(t *testing.T) {
 
 func TestAppendEventChainIntegrity(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(resetLedgerCacheForTest)
 	root := t.TempDir()
 	sessionID := "chain-test-session"
 
@@ -182,6 +183,7 @@ func TestAppendEventChainIntegrity(t *testing.T) {
 
 func TestAppendEventConcurrent(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(resetLedgerCacheForTest)
 	root := t.TempDir()
 	sessionID := "concurrent-session"
 
@@ -267,6 +269,7 @@ func TestGetLastGlobalEventNoPriorSession(t *testing.T) {
 
 func TestGetLastGlobalEventFindsNewest(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(resetLedgerCacheForTest)
 	root := t.TempDir()
 
 	// Write events into two prior sessions.
@@ -299,6 +302,7 @@ func TestGetLastGlobalEventFindsNewest(t *testing.T) {
 
 func TestCrossSessionChain(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(resetLedgerCacheForTest)
 	root := t.TempDir()
 
 	// Session A: one event.

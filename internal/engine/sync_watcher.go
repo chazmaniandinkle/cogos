@@ -101,14 +101,37 @@ func (w *SyncWatcher) pollInterval() time.Duration {
 func (w *SyncWatcher) inspectFile(path string) SyncEvent {
 	event := SyncEvent{FilePath: path}
 
-	data, err := os.ReadFile(path)
-	if err != nil {
-		event.ValidationError = fmt.Sprintf("read envelope: %v", err)
-		return event
+	// Envelope files are created with Syncthing's rename-into-place or the
+	// tests' os.WriteFile — both of which briefly expose a zero-length or
+	// partial file to ReadDir before the content is flushed. A single read
+	// attempt is enough in production's 5s poll interval, but test setups
+	// using 10-50ms polls can race mid-write and see truncated JSON. Retry
+	// the read+parse a few times with a short backoff before giving up.
+	const maxAttempts = 3
+	const backoff = 20 * time.Millisecond
+
+	var data []byte
+	var readErr, parseErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		data, readErr = os.ReadFile(path)
+		if readErr != nil {
+			break
+		}
+		parseErr = json.Unmarshal(data, &event.Envelope)
+		if parseErr == nil {
+			break
+		}
+		if attempt+1 < maxAttempts {
+			time.Sleep(backoff)
+		}
 	}
 
-	if err := json.Unmarshal(data, &event.Envelope); err != nil {
-		event.ValidationError = fmt.Sprintf("parse envelope: %v", err)
+	if readErr != nil {
+		event.ValidationError = fmt.Sprintf("read envelope: %v", readErr)
+		return event
+	}
+	if parseErr != nil {
+		event.ValidationError = fmt.Sprintf("parse envelope: %v", parseErr)
 		return event
 	}
 

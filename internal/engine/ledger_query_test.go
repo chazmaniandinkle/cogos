@@ -22,6 +22,9 @@ import (
 // supplied via ts.
 func appendTestEvent(t *testing.T, root, sessionID, evtType string, data map[string]interface{}, ts string) *EventEnvelope {
 	t.Helper()
+	// Guard against stale entries leaking across -count iterations when the
+	// same sessionID literal reappears under a fresh workspace root.
+	t.Cleanup(resetLedgerCacheForTest)
 	env := &EventEnvelope{
 		HashedPayload: EventPayload{
 			Type:      evtType,
