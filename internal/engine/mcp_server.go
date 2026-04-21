@@ -33,27 +33,39 @@ import (
 
 // MCPServer wraps the MCP server and its dependencies.
 type MCPServer struct {
-	server    *mcp.Server
-	handler   http.Handler
-	cfg       *Config
-	nucleus   *Nucleus
-	process   *Process
-	cogdocSvc *CogDocService
+	server          *mcp.Server
+	handler         http.Handler
+	cfg             *Config
+	nucleus         *Nucleus
+	process         *Process
+	cogdocSvc       *CogDocService
+	agentController AgentController // optional; nil when the kernel has no live agent
 }
 
 // NewMCPServer creates and configures the MCP server with all stage-1 tools.
+// The returned server has no AgentController attached. Call SetAgentController
+// to enable cog_list_agents / cog_get_agent_state / cog_trigger_agent_loop.
 func NewMCPServer(cfg *Config, nucleus *Nucleus, process *Process) *MCPServer {
+	return NewMCPServerWithAgentController(cfg, nucleus, process, nil)
+}
+
+// NewMCPServerWithAgentController creates the MCP server and attaches an
+// AgentController for the agent-state tools. The controller may be nil;
+// the tools remain registered and return a "not configured" response in
+// that case so clients get a consistent error shape.
+func NewMCPServerWithAgentController(cfg *Config, nucleus *Nucleus, process *Process, ctrl AgentController) *MCPServer {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "cogos-v3",
 		Version: BuildTime,
 	}, nil)
 
 	m := &MCPServer{
-		server:    server,
-		cfg:       cfg,
-		nucleus:   nucleus,
-		process:   process,
-		cogdocSvc: NewCogDocService(cfg, process),
+		server:          server,
+		cfg:             cfg,
+		nucleus:         nucleus,
+		process:         process,
+		cogdocSvc:       NewCogDocService(cfg, process),
+		agentController: ctrl,
 	}
 
 	m.registerTools()
@@ -67,6 +79,13 @@ func NewMCPServer(cfg *Config, nucleus *Nucleus, process *Process) *MCPServer {
 	return m
 }
 
+// SetAgentController wires a live AgentController into an already-built
+// MCPServer. Safe to call after construction; the tool registration is
+// unchanged because the tools resolve the current controller on each call.
+func (m *MCPServer) SetAgentController(ctrl AgentController) {
+	m.agentController = ctrl
+}
+
 // Handler returns the http.Handler for mounting at /mcp.
 func (m *MCPServer) Handler() http.Handler {
 	return m.handler
@@ -75,51 +94,56 @@ func (m *MCPServer) Handler() http.Handler {
 // registerTools registers MCP tools.
 // Design: tools are actions with side effects or non-trivial computation.
 // Read-only state queries will migrate to MCP Resources in Phase 2.
+//
+// Every handler is wrapped with withToolObserver so an invocation emits a
+// paired tool.call + tool.result event to the hash-chained ledger. This
+// closes Agent F gap #6 and activates the gate.go:94 recognizer that has
+// been waiting for a producer.
 func (m *MCPServer) registerTools() {
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_search_memory",
 		Description: "Full-text and semantic search over the CogDoc memory corpus. Returns ranked results with salience scores. Fallback: ./scripts/cog memory search \"query\"",
-	}, m.toolSearchMemory)
+	}, withToolObserver(m, "cog_search_memory", m.toolSearchMemory))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_read_cogdoc",
 		Description: "Read a CogDoc by URI or path. Resolves cog: URIs automatically. Returns full content with parsed frontmatter and optional section extraction via #fragment. Fallback: ./scripts/cog memory read <path>",
-	}, m.toolReadCogdoc)
+	}, withToolObserver(m, "cog_read_cogdoc", m.toolReadCogdoc))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_write_cogdoc",
 		Description: "Write or update a CogDoc at the specified memory path. Creates the file with proper frontmatter if it doesn't exist. Fallback: ./scripts/cog memory write <path> \"Title\"",
-	}, m.toolWriteCogdoc)
+	}, withToolObserver(m, "cog_write_cogdoc", m.toolWriteCogdoc))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_patch_frontmatter",
 		Description: "Merge description, tags, or type patches into a CogDoc frontmatter block.",
-	}, m.toolPatchFrontmatter)
+	}, withToolObserver(m, "cog_patch_frontmatter", m.toolPatchFrontmatter))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_check_coherence",
 		Description: "Run coherence validation against the workspace. Checks URI resolution, frontmatter validity, and reference integrity. Fallback: ./scripts/cog coherence check",
-	}, m.toolCheckCoherence)
+	}, withToolObserver(m, "cog_check_coherence", m.toolCheckCoherence))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_get_state",
 		Description: "Get kernel state: process status, uptime, trust, node health (sibling services), field size, and heartbeat info. Includes identity and coherence metadata. Fallback: curl http://localhost:6931/health",
-	}, m.toolGetState)
+	}, withToolObserver(m, "cog_get_state", m.toolGetState))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_query_field",
 		Description: "Query the attentional field — the salience-scored map of all tracked CogDocs. Returns top-N items, optionally filtered by sector. Shows what the kernel considers most relevant right now.",
-	}, m.toolQueryField)
+	}, withToolObserver(m, "cog_query_field", m.toolQueryField))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_assemble_context",
 		Description: "Build a context package for a given token budget with an explicit focus topic. Use this for intentional context assembly (subtasks, specific investigations). The automatic foveated-context hook handles ambient context on every prompt.",
-	}, m.toolAssembleContext)
+	}, withToolObserver(m, "cog_assemble_context", m.toolAssembleContext))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_emit_event",
 		Description: "Emit a typed event to the workspace ledger. Events: attention.boost (uri + weight), session.marker (label), insight.captured (summary), decision.made (decision + rationale). Fallback: events are JSONL in .cog/ledger/",
-	}, m.toolEmitEvent)
+	}, withToolObserver(m, "cog_emit_event", m.toolEmitEvent))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_read_ledger",
@@ -129,7 +153,36 @@ func (m *MCPServer) registerTools() {
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_ingest",
 		Description: "Ingest external material into CogOS knowledge. Deterministic decomposition — no LLM calls. Supports URLs, conversations, documents. Applies membrane policy (accept/quarantine/defer/discard).",
-	}, m.toolIngest)
+	}, withToolObserver(m, "cog_ingest", m.toolIngest))
+
+	// Tool-call observability — reads the paired tool.call/tool.result events
+	// the wrapper above emits. Self-reflective: these two tools also go
+	// through withToolObserver and end up in their own query results.
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_read_tool_calls",
+		Description: "Query recent tool invocations and their outcomes. Returns call+result pairs from the ledger, filterable by tool_name, status (pending/success/error/rejected/timeout), source, ownership, call_id, or time window. Default limit 100, max 500. Arguments and output are opt-in via include_args/include_output. Fallback: grep '\"type\":\"tool\\.' .cog/ledger/<sid>/events.jsonl",
+	}, withToolObserver(m, "cog_read_tool_calls", m.toolReadToolCalls))
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_tail_tool_calls",
+		Description: "Tail tool-call events live. Replays recent tool.call / tool.result events (up to max_events, default 50), applying the same filters as cog_read_tool_calls. When Agent N's event bus lands, this will stream new events live; until then it returns a snapshot of the latest matching rows. Fallback: tail -f .cog/ledger/<sid>/events.jsonl | grep '\"type\":\"tool\\.'",
+	}, withToolObserver(m, "cog_tail_tool_calls", m.toolTailToolCalls))
+
+	// Agent state / loop control — closes Agent F gap #8 per Agent T's design.
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_list_agents",
+		Description: "Enumerate active agent harness instances inside the kernel. Each entry summarises identity, state, and recent activity. Today returns one element (\"primary\") reflecting the ServeAgent singleton; forward-compatible for future multi-agent deployment. Fallback: curl http://localhost:6931/v1/agents",
+	}, m.toolListAgents)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_get_agent_state",
+		Description: "Full state snapshot of one agent instance — status summary, activity awareness, rolling cycle memory, pending proposals, inbox queue, and optionally the most recent cycle traces. Matches the shape of GET /v1/agents/{id}. Fallback: curl http://localhost:6931/v1/agents/primary",
+	}, m.toolGetAgentState)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_trigger_agent_loop",
+		Description: "Manually invoke one homeostatic cycle of the specified agent, outside the regular ticker. Equivalent to POST /v1/agents/{id}/tick. Returns immediately with a trigger receipt; cycle runs async unless wait=true. Refuses if a cycle is already in flight (overlap guard). Fallback: curl -X POST http://localhost:6931/v1/agents/primary/tick",
+	}, m.toolTriggerAgentLoop)
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_tail_kernel_log",
@@ -435,6 +488,55 @@ type tailKernelLogInput struct {
 	Substring string `json:"substring,omitempty" jsonschema:"Case-insensitive substring filter applied to the raw JSON line. Max 1024 chars."`
 	Since     string `json:"since,omitempty" jsonschema:"Lower time bound. RFC3339 OR duration like '5m', '2h', '24h'."`
 	Until     string `json:"until,omitempty" jsonschema:"Upper time bound. RFC3339 OR duration."`
+}
+
+type listAgentsInput struct {
+	IncludeStopped bool `json:"include_stopped,omitempty" jsonschema:"Include agents that have stopped (default false). Reserved for future multi-agent pool managers."`
+}
+
+type getAgentStateInput struct {
+	AgentID      string `json:"agent_id,omitempty" jsonschema:"Which agent to inspect. Default \"primary\" (the ServeAgent singleton)."`
+	IncludeTrace bool   `json:"include_trace,omitempty" jsonschema:"Attach up to trace_limit most-recent full cycle traces (observation + result)."`
+	TraceLimit   int    `json:"trace_limit,omitempty" jsonschema:"If include_trace, how many recent traces to include. Range [1, 20]. Default 1."`
+}
+
+type triggerAgentLoopInput struct {
+	AgentID string `json:"agent_id,omitempty" jsonschema:"Which agent to trigger. Default \"primary\"."`
+	Reason  string `json:"reason,omitempty" jsonschema:"Free-text tag stored on a synthetic agent.wake event for audit (optional)."`
+	Wait    bool   `json:"wait,omitempty" jsonschema:"If true, block until the cycle completes (up to 90s) and return the outcome. Default false (fire-and-forget)."`
+}
+
+// readToolCallsInput mirrors ToolCallQuery for the MCP surface. Time bounds
+// accept RFC3339 strings; relative shorthand ("5m", "1h", "24h") is supported.
+type readToolCallsInput struct {
+	SessionID     string `json:"session_id,omitempty" jsonschema:"Filter to a session; empty = all sessions"`
+	ToolName      string `json:"tool_name,omitempty" jsonschema:"Exact match or wildcard (e.g. cog_read_*)"`
+	Status        string `json:"status,omitempty" jsonschema:"pending | success | error | rejected | timeout"`
+	Source        string `json:"source,omitempty" jsonschema:"mcp | openai-chat | anthropic-messages | kernel-loop"`
+	Ownership     string `json:"ownership,omitempty" jsonschema:"kernel | client"`
+	CallID        string `json:"call_id,omitempty" jsonschema:"Exact single-call lookup"`
+	Since         string `json:"since,omitempty" jsonschema:"Lower bound — RFC3339 timestamp or relative duration (e.g. 5m, 1h)"`
+	Until         string `json:"until,omitempty" jsonschema:"Upper bound — RFC3339 timestamp"`
+	Limit         int    `json:"limit,omitempty" jsonschema:"Default 100, max 500"`
+	Order         string `json:"order,omitempty" jsonschema:"desc (default) | asc"`
+	IncludeArgs   bool   `json:"include_args,omitempty" jsonschema:"Include arguments payload (default false — PII control)"`
+	IncludeOutput bool   `json:"include_output,omitempty" jsonschema:"Include output summary (default false — PII control)"`
+}
+
+// tailToolCallsInput is a snapshot-mode version of the live tail. Inherits
+// all of readToolCallsInput's filters; defaults include_args/include_output
+// to true (callers tailing are actively observing) and caps the returned set
+// with max_events + max_duration.
+type tailToolCallsInput struct {
+	SessionID   string `json:"session_id,omitempty" jsonschema:"Filter to a session; empty = all sessions"`
+	ToolName    string `json:"tool_name,omitempty" jsonschema:"Exact match or wildcard"`
+	Status      string `json:"status,omitempty" jsonschema:"pending | success | error | rejected | timeout"`
+	Source      string `json:"source,omitempty" jsonschema:"Source taxonomy filter"`
+	Ownership   string `json:"ownership,omitempty" jsonschema:"kernel | client"`
+	CallID      string `json:"call_id,omitempty" jsonschema:"Exact single-call lookup"`
+	Since       string `json:"since,omitempty" jsonschema:"Lower bound — RFC3339 or relative"`
+	MaxEvents   int    `json:"max_events,omitempty" jsonschema:"Stop after N matching events (default 50, max 500)"`
+	MaxDuration string `json:"max_duration,omitempty" jsonschema:"Hard cap on wall-clock (default 60s, max 10m)"`
 }
 
 // readConversationInput drives cog_read_conversation — see Agent R §5.2.
@@ -1098,6 +1200,162 @@ func intToStr(n int) string {
 		return ""
 	}
 	return fmt.Sprintf("%d", n)
+}
+
+// --- Agent state / loop control tools -------------------------------------
+
+// toolListAgents implements cog_list_agents — returns the set of active
+// agents. Today always a one-element list ("primary"). See agent-T-agent-
+// state-design §4.1.
+func (m *MCPServer) toolListAgents(ctx context.Context, req *mcp.CallToolRequest, input listAgentsInput) (*mcp.CallToolResult, any, error) {
+	resp, err := QueryListAgents(ctx, m.agentController, ListAgentsRequest{IncludeStopped: input.IncludeStopped})
+	if err != nil {
+		return agentErrorResult(err, "curl http://localhost:6931/v1/agents")
+	}
+	return marshalResult(resp)
+}
+
+// toolGetAgentState implements cog_get_agent_state — full snapshot of
+// one agent. See agent-T-agent-state-design §4.1.
+func (m *MCPServer) toolGetAgentState(ctx context.Context, req *mcp.CallToolRequest, input getAgentStateInput) (*mcp.CallToolResult, any, error) {
+	snap, err := QueryGetAgent(ctx, m.agentController, GetAgentRequest{
+		AgentID:      input.AgentID,
+		IncludeTrace: input.IncludeTrace,
+		TraceLimit:   input.TraceLimit,
+	})
+	if err != nil {
+		return agentErrorResult(err, "curl http://localhost:6931/v1/agents/primary")
+	}
+	return marshalResult(snap)
+}
+
+// toolTriggerAgentLoop implements cog_trigger_agent_loop — manually
+// invoke one cycle. See agent-T-agent-state-design §4.1.
+func (m *MCPServer) toolTriggerAgentLoop(ctx context.Context, req *mcp.CallToolRequest, input triggerAgentLoopInput) (*mcp.CallToolResult, any, error) {
+	result, err := QueryTriggerAgent(ctx, m.agentController, TriggerAgentRequest{
+		AgentID: input.AgentID,
+		Reason:  input.Reason,
+		Wait:    input.Wait,
+	})
+	if err != nil {
+		return agentErrorResult(err, "curl -X POST http://localhost:6931/v1/agents/primary/tick")
+	}
+	return marshalResult(result)
+}
+
+// agentErrorResult translates AgentControllerError into the MCP fallback
+// format used by the rest of this file. Unknown errors are surfaced as
+// internal-error text responses.
+func agentErrorResult(err error, fallback string) (*mcp.CallToolResult, any, error) {
+	msg := err.Error()
+	if ace, ok := err.(*AgentControllerError); ok && ace != nil {
+		msg = ace.Message
+	}
+	return fallbackResult(msg, fallback)
+}
+
+// toolReadToolCalls is the MCP handler for cog_read_tool_calls. It parses the
+// input filters, invokes QueryToolCalls, and returns the stitched result.
+func (m *MCPServer) toolReadToolCalls(ctx context.Context, req *mcp.CallToolRequest, input readToolCallsInput) (*mcp.CallToolResult, any, error) {
+	q := ToolCallQuery{
+		SessionID:     input.SessionID,
+		ToolName:      input.ToolName,
+		Status:        input.Status,
+		Source:        input.Source,
+		Ownership:     input.Ownership,
+		CallID:        input.CallID,
+		Limit:         input.Limit,
+		Order:         input.Order,
+		IncludeArgs:   input.IncludeArgs,
+		IncludeOutput: input.IncludeOutput,
+	}
+	if input.Since != "" {
+		ts, err := parseTimeOrDuration(input.Since)
+		if err != nil {
+			return textResult(fmt.Sprintf("parse since: %v", err))
+		}
+		q.Since = ts
+	}
+	if input.Until != "" {
+		ts, err := parseTimeOrDuration(input.Until)
+		if err != nil {
+			return textResult(fmt.Sprintf("parse until: %v", err))
+		}
+		q.Until = ts
+	}
+	result, err := QueryToolCalls(m.cfg.WorkspaceRoot, q)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("query failed: %v", err),
+			"grep '\"type\":\"tool\\.' .cog/ledger/*/events.jsonl")
+	}
+	return marshalResult(result)
+}
+
+// toolTailToolCalls returns a snapshot of the most recent tool-call rows for
+// the filter set. When Agent N's event bus lands this will become a proper
+// SSE-style stream; the snapshot behavior is a safe stand-in (same data, same
+// shape) that does not rely on a broker.
+func (m *MCPServer) toolTailToolCalls(ctx context.Context, req *mcp.CallToolRequest, input tailToolCallsInput) (*mcp.CallToolResult, any, error) {
+	limit := input.MaxEvents
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	q := ToolCallQuery{
+		SessionID: input.SessionID,
+		ToolName:  input.ToolName,
+		Status:    input.Status,
+		Source:    input.Source,
+		Ownership: input.Ownership,
+		CallID:    input.CallID,
+		Limit:     limit,
+		Order:     "desc",
+		// Tails default to showing full rows — callers here are actively
+		// observing so the PII opt-out is moot.
+		IncludeArgs:   true,
+		IncludeOutput: true,
+	}
+	if input.Since != "" {
+		ts, err := parseTimeOrDuration(input.Since)
+		if err != nil {
+			return textResult(fmt.Sprintf("parse since: %v", err))
+		}
+		q.Since = ts
+	}
+	// MaxDuration is accepted for forward compatibility with a real stream.
+	// The snapshot path is instantaneous; no wait is needed.
+	_ = input.MaxDuration
+
+	result, err := QueryToolCalls(m.cfg.WorkspaceRoot, q)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("tail failed: %v", err),
+			"tail -f .cog/ledger/*/events.jsonl | grep '\"type\":\"tool\\.'")
+	}
+	stopped := "snapshot"
+	return marshalResult(map[string]any{
+		"count":          result.Count,
+		"events":         result.Calls,
+		"stopped_reason": stopped,
+		"truncated":      result.Truncated,
+	})
+}
+
+// parseTimeOrDuration accepts either an RFC3339 timestamp ("2026-04-21T…") or
+// a relative duration ("5m", "1h", "24h"). Durations subtract from "now".
+func parseTimeOrDuration(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if ts, err := time.Parse(time.RFC3339, s); err == nil {
+		return ts, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return time.Now().UTC().Add(-d), nil
+	}
+	return time.Time{}, fmt.Errorf("not RFC3339 and not a Go duration: %q", s)
 }
 
 // toolReadConversation is the MCP handler for cog_read_conversation.
