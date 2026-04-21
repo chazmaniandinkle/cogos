@@ -77,6 +77,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.registerBlockRoutes(mux)
 	s.registerCompatRoutes(mux)
 	s.registerMCPRoutes(mux)
+	s.registerConfigRoutes(mux)
 
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
