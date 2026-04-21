@@ -220,7 +220,7 @@ func TestQueryIncludeArgsDefault(t *testing.T) {
 	}
 }
 
-func TestQueryTruncation(t *testing.T) {
+func TestToolCallsQueryTruncation(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
 	now := time.Now().UTC()
@@ -239,7 +239,7 @@ func TestQueryTruncation(t *testing.T) {
 	}
 }
 
-func TestQueryOrderAsc(t *testing.T) {
+func TestToolCallsQueryOrderAsc(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
 	base := time.Now().UTC().Add(-1 * time.Hour)

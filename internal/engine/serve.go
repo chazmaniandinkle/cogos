@@ -72,6 +72,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	mux.HandleFunc("POST /v1/messages", s.handleAnthropicMessages)
 	mux.HandleFunc("GET /v1/proprioceptive", s.handleProprioceptive)
 	mux.HandleFunc("GET /v1/ledger", s.handleLedger)
+	mux.HandleFunc("GET /v1/traces", s.handleTraces)
 	mux.HandleFunc("GET /v1/lightcone", s.handleLightCone)
 	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext)
 	mux.HandleFunc("GET /v1/tool-calls", s.handleToolCalls)
@@ -260,23 +261,23 @@ func (s *Server) handleCogDocRead(w http.ResponseWriter, r *http.Request) {
 // ── OpenAI-compatible wire types ─────────────────────────────────────────────
 
 type oaiChatRequest struct {
-	Model               string               `json:"model"`
-	Messages            []oaiMessage          `json:"messages"`
-	Stream              bool                  `json:"stream"`
-	Temperature         *float64              `json:"temperature,omitempty"`
-	MaxTokens           int                   `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int                   `json:"max_completion_tokens,omitempty"`
-	TopP                *float64              `json:"top_p,omitempty"`
-	Stop                []string              `json:"stop,omitempty"`
-	Tools               []oaiToolDefinition   `json:"tools,omitempty"`
-	ToolChoice          json.RawMessage       `json:"tool_choice,omitempty"`
-	ParallelToolCalls   *bool                 `json:"parallel_tool_calls,omitempty"`
-	FrequencyPenalty    *float64              `json:"frequency_penalty,omitempty"`
-	PresencePenalty     *float64              `json:"presence_penalty,omitempty"`
-	Seed                *int                  `json:"seed,omitempty"`
-	User                string                `json:"user,omitempty"`
-	N                   *int                  `json:"n,omitempty"`
-	StreamOptions       *oaiStreamOpts        `json:"stream_options,omitempty"`
+	Model               string              `json:"model"`
+	Messages            []oaiMessage        `json:"messages"`
+	Stream              bool                `json:"stream"`
+	Temperature         *float64            `json:"temperature,omitempty"`
+	MaxTokens           int                 `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int                 `json:"max_completion_tokens,omitempty"`
+	TopP                *float64            `json:"top_p,omitempty"`
+	Stop                []string            `json:"stop,omitempty"`
+	Tools               []oaiToolDefinition `json:"tools,omitempty"`
+	ToolChoice          json.RawMessage     `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool               `json:"parallel_tool_calls,omitempty"`
+	FrequencyPenalty    *float64            `json:"frequency_penalty,omitempty"`
+	PresencePenalty     *float64            `json:"presence_penalty,omitempty"`
+	Seed                *int                `json:"seed,omitempty"`
+	User                string              `json:"user,omitempty"`
+	N                   *int                `json:"n,omitempty"`
+	StreamOptions       *oaiStreamOpts      `json:"stream_options,omitempty"`
 }
 
 // oaiStreamOpts carries OpenAI stream_options (e.g. include_usage).
@@ -364,9 +365,9 @@ func extractContent(raw json.RawMessage) string {
 
 // oaiContentPart represents a single element in the OpenAI multi-part content array.
 type oaiContentPart struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text,omitempty"`
-	ImageURL *oaiImageURL    `json:"image_url,omitempty"`
+	Type     string       `json:"type"`
+	Text     string       `json:"text,omitempty"`
+	ImageURL *oaiImageURL `json:"image_url,omitempty"`
 }
 
 // oaiImageURL carries the URL (typically a data: base64 URI) for an image content part.
@@ -1107,6 +1108,95 @@ func (s *Server) handleLedger(w http.ResponseWriter, r *http.Request) {
 func writeLedgerError(w http.ResponseWriter, code int, msg string) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// handleTraces exposes the unified kernel trace search surface.
+//
+// Per Agent Q's design (2026-04-21) this is additive — /v1/proprioceptive
+// stays byte-for-byte identical because dashboard.html:1265 and
+// canvas.html:1706 consume its exact {entries, light_cone} shape.
+//
+//	GET /v1/traces
+//	    ?source=turn_metrics   (or "all", default)
+//	    &level=…               (applies to sources with a level-like field)
+//	    &session_id=…
+//	    &substring=…           (case-insensitive, full-line match)
+//	    &since=5m              (RFC3339 OR Go duration)
+//	    &until=…               (RFC3339 upper bound)
+//	    &limit=100             (1..1000)
+//	    &order=desc            ("asc" | "desc")
+//
+//	200 → TraceQueryResult
+//	400 → unknown source / unparseable since|until / limit out of range / substring too long
+//	500 → I/O error
+func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request) {
+	q, err := parseTraceQueryFromRequest(r)
+	if err != nil {
+		writeTraceError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := QueryTraces(s.cfg.WorkspaceRoot, q)
+	if err != nil {
+		writeTraceError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// parseTraceQueryFromRequest maps query params onto a TraceQuery.
+// Defaults: source=all, limit=100, order=desc.
+func parseTraceQueryFromRequest(r *http.Request) (TraceQuery, error) {
+	q := TraceQuery{
+		Source:    TraceSource(strings.TrimSpace(r.URL.Query().Get("source"))),
+		Level:     strings.TrimSpace(r.URL.Query().Get("level")),
+		SessionID: strings.TrimSpace(r.URL.Query().Get("session_id")),
+		Substring: r.URL.Query().Get("substring"),
+		Order:     strings.TrimSpace(r.URL.Query().Get("order")),
+	}
+
+	if q.Source == "" {
+		q.Source = SourceAll
+	}
+	// Validate source upfront so unknown values surface as 400, not 500.
+	if _, err := resolveSources(q.Source); err != nil {
+		return TraceQuery{}, err
+	}
+
+	now := time.Now()
+	if s := r.URL.Query().Get("since"); s != "" {
+		t, err := ParseTraceDurationOrTime(s, now)
+		if err != nil {
+			return TraceQuery{}, fmt.Errorf("since: %w", err)
+		}
+		q.Since = t
+	}
+	if s := r.URL.Query().Get("until"); s != "" {
+		t, err := ParseTraceDurationOrTime(s, now)
+		if err != nil {
+			return TraceQuery{}, fmt.Errorf("until: %w", err)
+		}
+		q.Until = t
+	}
+	if s := r.URL.Query().Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 0 {
+			return TraceQuery{}, fmt.Errorf("limit: expected non-negative integer, got %q", s)
+		}
+		if n > maxTracesLimit {
+			return TraceQuery{}, fmt.Errorf("limit: %d exceeds max %d", n, maxTracesLimit)
+		}
+		q.Limit = n
+	}
+	return q, nil
+}
+
+// writeTraceError emits a {"error": "..."} JSON body with the given status.
+// Matches the existing serve.go convention (handleDebugLast etc.).
+func writeTraceError(w http.ResponseWriter, status int, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 }
 
 // handleLightCone returns light cone metadata from the LightConeManager.
