@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+_(no entries yet)_
+
+## [0.3.0] - 2026-04-22 — Track 5 consolidation + Agent F gap closure
+
+The pre-1.0 reset. This release consolidates Track 5 dead-code removal and the full 8-gap Agent F critical MCP surface buildout. The prior `v2.x` numbering was aspirational; `v0.3.0` begins a deliberate path toward `v1.0`. See [Pre-reset history](#pre-reset-history) for the prior entries.
+
 ### Added
 - `POST /v1/context/build` — context engine exposed without inference (#8)
 - Hash-chained ledger exposed via `cog_read_ledger` MCP + `GET /v1/ledger`, with hash-chain verification (#11)
@@ -17,6 +23,7 @@
 - Kernel slog capture — `teeHandler` fans slog to stderr + JSONL sink at `.cog/run/kernel.log.jsonl`; `cog_tail_kernel_log` MCP + `GET /v1/kernel-log` (#28)
 - `--bind` flag + `bind_addr` YAML — wires long-dormant `BindAddr` config field; default remains `127.0.0.1`; CORS relaxed on non-loopback bind (closes #12) (#33)
 - `cog bus send` subcommand — write symmetry for bus CLI; defaults to direct JSONL write, `--http` opt-in for kernel broadcast (closes #26) (#34)
+- Kernel-native session management (hybrid) — closes last Agent F critical MCP gap. `SessionRegistry` + `HandoffRegistry` with atomic-claim semantics (bus-level first-wins, not just cache); `POST /v1/sessions/{register,heartbeat,end}` + `POST /v1/handoffs/{offer,claim,complete}` + `GET /v1/sessions/presence` + `GET /v1/handoffs` HTTP routes; 8 `cog_*_session|handoff_*` MCP tools alongside the 8 existing `cogos_*` Python bridge tools. Bus stays ground truth; registries are derived views rebuilt via seq-sorted replay on startup. `handoff.claim_rejected` observability event emitted on every rejection with reason + attempting_session + conflicting_session. (#43)
 
 ### Changed
 - `make build` / `make install` now produce an engine-based binary (`go build
@@ -52,6 +59,12 @@
   longer needed now that MCP is always-on. (#9)
 - `turn_metrics.jsonl` fossil source — no production writers, superseded by `turn.completed` ledger events (closes #21) (#32)
 - 5 unused TAA config fields (`ExtractionMethod`, `ConfidenceThreshold`, `FailureMode`, `TraceTiers`, `TraceFile` — all marked `// TODO: not yet wired`) (closes #22) (#29)
+
+---
+
+## Pre-reset history
+
+The entries below describe releases under the prior aspirational `v2.x` numbering scheme. The corresponding commits exist in git history but were never tagged as `v2.x`; `v0.3.0` is the first tag in the reset series.
 
 ## [2.6.0] - 2026-04-15 — Decomposition pipeline workbench
 
