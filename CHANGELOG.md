@@ -19,6 +19,18 @@
 - `cog bus send` subcommand — write symmetry for bus CLI; defaults to direct JSONL write, `--http` opt-in for kernel broadcast (closes #26) (#34)
 
 ### Changed
+- `make build` / `make install` now produce an engine-based binary (`go build
+  -o cog ./cmd/cogos`) instead of the root package (Track 5 Phase 4). The
+  Dockerfile + per-platform cross-compile targets flip to the same path. The
+  installed `cogos` binary gains engine-native subcommands (`start`, `stop`,
+  `restart`, `logs`, `chat`, `bench`, `blobs`, `docs`, `experiment`,
+  `manifest`) and keeps parity for the three blocking root subcommands
+  (`emit` — Phase 1, `mcp serve` — Phase 2, `serve` with `/v1/bus/*` +
+  `/v1/sessions` — Phase 3). Root-only dormant subcommands (`run`, `tasks`,
+  `cache`, `fleet`, `research`, `registry`, `plan`, `apply`, `components`,
+  `snapshot`, `refresh`, `import`, `migrate`, `watch`, `reconcile`, `index`,
+  `drift`, `channel`, `cluster`, `extract`, `oci`, `service`, `decompose`)
+  are no longer in the installed binary — Phase 5 audits them for deletion.
 - MCP server + ingestion pipeline + tool loop + cogdoc service + membrane policy
   are now always compiled into the kernel. The `mcpserver` build tag has been
   removed from all 14 gated files in `internal/engine/`. Rationale: no release
