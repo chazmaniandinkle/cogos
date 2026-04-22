@@ -17,6 +17,15 @@ import (
 	"testing"
 )
 
+// capturedReply records a respond-tool publish call so tests can assert
+// on the fan-out shape. Previously shared with agent_user_turn_reply_test.go
+// (deleted in Track 5), now defined locally.
+type capturedReply struct {
+	Text      string
+	Reasoning string
+	SessionID string
+}
+
 // respondSink captures respond-tool publish calls without a live bus.
 // Goroutine-safe because the respond tool may run concurrently in real
 // deployments, and tests should tolerate the same.
@@ -42,6 +51,37 @@ func (r *respondSink) snapshot() []capturedReply {
 	out := make([]capturedReply, len(r.calls))
 	copy(out, r.calls)
 	return out
+}
+
+// sessionIDsOf extracts the session_id field from a list of captured
+// replies. Used for set-comparison assertions that don't depend on
+// goroutine order.
+func sessionIDsOf(calls []capturedReply) []string {
+	out := make([]string, len(calls))
+	for i, c := range calls {
+		out[i] = c.SessionID
+	}
+	return out
+}
+
+// sameStringSet returns true if got and want contain the same strings,
+// regardless of ordering. Used to assert fan-out recipients without
+// being sensitive to which goroutine happened to land first.
+func sameStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	gotMap := make(map[string]int, len(got))
+	for _, s := range got {
+		gotMap[s]++
+	}
+	for _, s := range want {
+		if gotMap[s] == 0 {
+			return false
+		}
+		gotMap[s]--
+	}
+	return true
 }
 
 // withRespondSink swaps respondPublish for the duration of fn, restoring the
