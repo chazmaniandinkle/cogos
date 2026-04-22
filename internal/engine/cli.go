@@ -92,6 +92,8 @@ func Main() {
 			return
 		case "emit":
 			os.Exit(runEmitCmd(args[1:], *workspace))
+		case "mcp":
+			os.Exit(runMCPCmd(args[1:], *workspace))
 		}
 	}
 
