@@ -12,11 +12,49 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// healthCheckClient is a dedicated HTTP client for service health checks.
+var healthCheckClient = &http.Client{Timeout: 15 * time.Second}
+
+// checkServiceHealth performs an HTTP health check against a ServiceCRD's
+// declared health endpoint. Returns "healthy", "unhealthy", "error", or "—"
+// when no health endpoint is configured.
+func checkServiceHealth(ctx context.Context, crd *ServiceCRD) string {
+	if crd.Spec.Health.Endpoint == "" || crd.Spec.Health.Port == 0 {
+		return "—"
+	}
+
+	timeout, _ := ParseServiceDuration(crd.Spec.Health.Timeout)
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+
+	healthCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	url := fmt.Sprintf("http://localhost:%d%s", crd.Spec.Health.Port, crd.Spec.Health.Endpoint)
+	req, err := http.NewRequestWithContext(healthCtx, "GET", url, nil)
+	if err != nil {
+		return "error"
+	}
+
+	resp, err := healthCheckClient.Do(req)
+	if err != nil {
+		return "unhealthy"
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		return "healthy"
+	}
+	return "unhealthy"
+}
 
 // ServiceProvider implements Reconcilable for container service management.
 type ServiceProvider struct {

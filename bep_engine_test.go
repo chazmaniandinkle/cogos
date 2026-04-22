@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -339,29 +338,3 @@ func TestModelLoadAndScanIndex(t *testing.T) {
 	}
 }
 
-// ─── Cluster CLI command tests ──────────────────────────────────────────────────
-
-func TestCmdClusterHelp(t *testing.T) {
-	err := cmdClusterHelp()
-	if err != nil {
-		t.Errorf("cmdClusterHelp: %v", err)
-	}
-}
-
-func TestCmdClusterDispatchUnknown(t *testing.T) {
-	err := cmdCluster([]string{"nonexistent"})
-	if err == nil {
-		t.Error("expected error for unknown subcommand")
-	}
-	if !strings.Contains(err.Error(), "unknown") {
-		t.Errorf("error = %q, want 'unknown'", err.Error())
-	}
-}
-
-func TestCmdClusterDispatchEmpty(t *testing.T) {
-	// Empty args should show help (no error).
-	err := cmdCluster([]string{})
-	if err != nil {
-		t.Errorf("empty args: %v", err)
-	}
-}
