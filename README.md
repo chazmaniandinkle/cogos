@@ -33,7 +33,9 @@ make build && ./cogos serve --workspace ~/my-project
 
 - **Native agent harness** -- A homeostatic agent loop that runs as a goroutine inside the kernel process. Calls Gemma E4B via Ollama's native `/api/chat` endpoint with six kernel-native tools. Adaptive interval (5m-30m) based on assessment urgency, with panic recovery. Loop triggers, state snapshots, and listings now reachable over MCP and REST.
 
-- **MCP Streamable HTTP** -- Full MCP transport at `POST /mcp` with JSON-RPC 2.0, session management, and 30-minute expiry. Always-on (no build tag). 22 tools spanning observability, agent control, config, memory, and voice.
+- **MCP Streamable HTTP** -- Full MCP transport at `POST /mcp` with JSON-RPC 2.0, session management, and 30-minute expiry. Always-on (no build tag). 30 tools spanning observability, agent control, config, memory, sessions, handoffs, and voice.
+
+- **Kernel-native session management** -- `SessionRegistry` + `HandoffRegistry` with atomic-claim semantics: first-wins enforced at the bus boundary, not just in the in-memory cache. `POST /v1/sessions/{register,heartbeat,end}`, `GET /v1/sessions/presence`, `POST /v1/handoffs/{offer,claim,complete}`, `GET /v1/handoffs`, plus 8 MCP tools. Bus stays ground truth; the registries are derived views rebuilt from seq-sorted replay on startup. `handoff.claim_rejected` observability event emits on every rejection with reason + attempting_session + conflicting_session. Coexists with the Python `cog-sandbox-mcp` bridge's 8 `cogos_*` tools, which now layer over these canonical kernel routes.
 
 - **Anthropic Messages API proxy** -- Transparent proxy at `POST /v1/messages` that forwards to the real Anthropic API with streaming SSE passthrough. Enables `cog claude` to route Claude Code through the kernel via `ANTHROPIC_BASE_URL`.
 
@@ -159,6 +161,13 @@ Six kernel-native tools are available to the agent itself:
 | `POST /v1/config/rollback` | Roll back to a previous atomic backup |
 | `GET /v1/agents` · `GET /v1/agents/:id/state` · `POST /v1/agents/:id/trigger` | Plural agent control surface |
 | `GET /v1/agent/status` · `GET /v1/agent/traces` · `POST /v1/agent/trigger` | Singular agent routes (preserved for dashboard byte-compat) |
+| `POST /v1/sessions/register` | Register a session on `bus_sessions` (kernel validates id + mints in-memory state) |
+| `POST /v1/sessions/{id}/heartbeat` · `POST /v1/sessions/{id}/end` | Lifecycle (409 on ended-session heartbeat; no side effects on rejection) |
+| `GET /v1/sessions/presence` | Aggregated roster with active-within-window flag (in-memory derived view) |
+| `POST /v1/handoffs/offer` | Mint a handoff offer with kernel-side id; payload validated, TTL enforced |
+| `POST /v1/handoffs/{id}/claim` | Atomic first-wins claim under registry lock; bus append before in-memory commit |
+| `POST /v1/handoffs/{id}/complete` | Complete a claimed handoff; optional `next_handoff_id` links recursive relays |
+| `GET /v1/handoffs` | List handoffs; filter by `state` (open, claimed, complete) and `for_session` |
 | `GET /v1/bus/:id/events/stream` | SSE stream of broker events |
 | `GET /health` | Liveness probe (identity, state, trust) |
 | `GET /dashboard` | Embedded web dashboard |
@@ -166,7 +175,7 @@ Six kernel-native tools are available to the agent itself:
 
 All endpoints serve on port **6931** by default. `--bind <addr>` (or `bind_addr` in YAML) overrides; CORS is strict on loopback and relaxed on non-loopback binds.
 
-### MCP tools (22 total)
+### MCP tools (30 total)
 
 The always-on MCP server groups tools by surface. `mcpserver` build tag was removed in #9 -- MCP ships in every binary.
 
@@ -186,6 +195,14 @@ The always-on MCP server groups tools by surface. `mcpserver` build tag was remo
 | **Config** | `cog_read_config` | Read the live config |
 | | `cog_write_config` | RFC 7396 merge-patch (atomic write, rotating backups, `requires_restart=true` in v1) |
 | | `cog_rollback_config` | Restore a prior atomic backup |
+| **Sessions** | `cog_register_session` | Register a session on `bus_sessions` (kernel validates id, mints in-memory state) |
+| | `cog_heartbeat_session` | Emit a heartbeat; rejected with 409 on ended sessions (no side effects) |
+| | `cog_end_session` | Graceful shutdown marker; optional `handoff_id` links the chain |
+| | `cog_list_sessions` | Aggregated roster with active-within-window flag |
+| **Handoffs** | `cog_offer_handoff` | Mint an offer with kernel-side id; payload validated, TTL enforced |
+| | `cog_claim_handoff` | Atomic first-wins claim under registry lock; bus append before in-memory commit |
+| | `cog_complete_handoff` | Complete a claimed handoff; `next_handoff_id` links recursive relays |
+| | `cog_list_handoffs` | List handoffs by `state` (open, claimed, complete) and `for_session` |
 | **Memory** | `cogos_memory_search` | Search CogDocs |
 | | `cogos_memory_read` | Read a memory document |
 | | `cogos_memory_write` | Write or update a memory document |
@@ -323,7 +340,8 @@ scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
 - Config mutation API (MCP + REST, merge-patch, atomic write, rollback)
 - Agent state and loop control over MCP and REST (singular routes preserved)
 - Multi-provider routing (Ollama, Anthropic, Claude Code, Codex)
-- Always-on MCP Streamable HTTP server (22 tools, sessions, JSON-RPC 2.0)
+- Always-on MCP Streamable HTTP server (30 tools, sessions, JSON-RPC 2.0)
+- Kernel-native session management with atomic handoff claim (bus-level first-wins via append-before-apply; seq-sorted replay on startup)
 - Anthropic Messages API proxy with streaming SSE
 - Native Go agent harness with adaptive interval and 6 kernel tools
 - Embedded web dashboard with agent status, cycle history, and decomposition panel
