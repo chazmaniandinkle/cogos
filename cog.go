@@ -4563,14 +4563,6 @@ Inference:
     --model, -m <model>     Model to use (default: claude)
     --json                  Output as JSON (for programmatic use)
     --origin <origin>       Tag request origin (default: "cli")
-  serve [command] [--port]  OpenAI-compatible HTTP server (default port: 5100)
-    (no command)            Run in foreground
-    start                   Start as background daemon
-    stop                    Stop the background daemon
-    status                  Show server status and stats
-    enable                  Register with launchd for auto-start
-    disable                 Remove from launchd
-
 Workspace (Multi-Workspace Management):
   workspace                  Show current workspace
   workspace list             List registered workspaces
@@ -5594,12 +5586,8 @@ func main() {
 		code = cmdEmit(os.Args[2:])
 	case "infer":
 		code = cmdInfer(os.Args[2:])
-	case "mcp":
-		code = cmdMCP(os.Args[2:])
 	case "claude":
 		code = cmdClaude(os.Args[2:])
-	case "serve":
-		code = cmdServe(os.Args[2:])
 	case "health":
 		code = cmdHealth(os.Args[2:])
 	case "read":
