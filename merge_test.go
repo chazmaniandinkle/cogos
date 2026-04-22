@@ -21,16 +21,22 @@ import (
 func setupTestRepo(t *testing.T) string {
 	tempDir := t.TempDir()
 
-	// Initialize git repo
-	cmd := exec.Command("git", "init") // bare-ok: test infrastructure
+	// Initialize git repo with main as default branch (git init -b requires git 2.28+)
+	cmd := exec.Command("git", "init", "-b", "main") // bare-ok: test infrastructure
 	cmd.Dir = tempDir
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("failed to init git repo: %v", err)
 	}
 
-	// Configure git
-	exec.Command("git", "config", "user.name", "Test User").Run()  // bare-ok: test infrastructure
-	exec.Command("git", "config", "user.email", "test@example.com").Run() // bare-ok: test infrastructure
+	// Configure git locally on the temp repo so tests don't depend on global config
+	setLocal := func(key, value string) {
+		c := exec.Command("git", "config", key, value) // bare-ok: test infrastructure
+		c.Dir = tempDir
+		_ = c.Run()
+	}
+	setLocal("user.name", "Test User")
+	setLocal("user.email", "test@example.com")
+	setLocal("commit.gpgsign", "false")
 
 	// Create .cog directory structure
 	cogDir := filepath.Join(tempDir, ".cog")

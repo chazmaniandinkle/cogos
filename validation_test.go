@@ -346,17 +346,16 @@ func TestValidateWithRetry_ConvergesAfterDiagnostic(t *testing.T) {
 		},
 	}
 
-	// Run with retry (should succeed on second attempt)
+	// Run with retry (should succeed on second attempt).
+	// ValidateWithRetry now does a real retry loop, so the validator's second
+	// call (which returns Pass=true) should make the overall call succeed.
 	err := ValidateWithRetry(validator, "test-artifact", 3)
-
-	// In MVP, we don't actually retry with corrected input,
-	// so this should fail. This test documents expected future behavior.
-	if err == nil {
-		t.Error("Expected error (MVP doesn't implement correction loop)")
+	if err != nil {
+		t.Errorf("Expected success after retry, got error: %v", err)
 	}
 
-	if attempts != 1 {
-		t.Errorf("Expected 1 attempt before giving up, got %d", attempts)
+	if attempts != 2 {
+		t.Errorf("Expected 2 attempts (fail, then pass), got %d", attempts)
 	}
 }
 
@@ -534,7 +533,15 @@ func createTestCogdoc(t *testing.T, frontmatter map[string]interface{}) string {
 	}
 
 	for key, value := range frontmatter {
-		_, err = tmpfile.WriteString(fmt.Sprintf("%s: %v\n", key, value))
+		// Quote string values so YAML parses them as strings (not Dates for values
+		// like "2026-01-16", which otherwise fail string-type schema validation).
+		var line string
+		if s, ok := value.(string); ok {
+			line = fmt.Sprintf("%s: %q\n", key, s)
+		} else {
+			line = fmt.Sprintf("%s: %v\n", key, value)
+		}
+		_, err = tmpfile.WriteString(line)
 		if err != nil {
 			t.Fatal(err)
 		}

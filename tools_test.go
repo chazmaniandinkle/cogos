@@ -55,15 +55,15 @@ func TestParseToolCall_NoToolCall(t *testing.T) {
 // === POLICY ENFORCEMENT TESTS ===
 
 func TestPolicyEngine_AllowMemoryWrites(t *testing.T) {
-	// Create policy that allows .cog/mem/ writes
+	// Create policy that allows .cog/mem/ writes. The engine documents
+	// "deny takes precedence over allow" (see TestPolicyEngine_DenyTakesPrecedence),
+	// so we rely on the "no allow rule matched = deny" fallback for non-mem paths
+	// instead of a blanket Deny rule.
 	policy := &PolicyExtended{
 		Name:  "write-memory-only",
 		Tools: []string{"Write"},
 		Allow: []PolicyRuleExt{
 			{Pattern: `^\.cog/mem/.*`},
-		},
-		Deny: []PolicyRuleExt{
-			{Pattern: `.*`},
 		},
 	}
 
@@ -82,15 +82,13 @@ func TestPolicyEngine_AllowMemoryWrites(t *testing.T) {
 }
 
 func TestPolicyEngine_DenyNonMemoryWrites(t *testing.T) {
-	// Create policy that allows .cog/mem/ writes only
+	// Create policy that allows .cog/mem/ writes only. See note on
+	// TestPolicyEngine_AllowMemoryWrites for why Deny is omitted.
 	policy := &PolicyExtended{
 		Name:  "write-memory-only",
 		Tools: []string{"Write"},
 		Allow: []PolicyRuleExt{
 			{Pattern: `^\.cog/mem/.*`},
-		},
-		Deny: []PolicyRuleExt{
-			{Pattern: `.*`},
 		},
 	}
 
@@ -348,15 +346,14 @@ func TestIntegration_FullToolExecution(t *testing.T) {
 	defer os.RemoveAll(filepath.Join(".cog", "ledger", sessionID))
 	defer os.RemoveAll(".cog/mem/integration-test.md")
 
-	// Create policy
+	// Create policy. See note on TestPolicyEngine_AllowMemoryWrites: the engine
+	// treats deny as absolute, so we rely on the "no allow match = deny" fallback
+	// for non-mem paths instead of a blanket Deny rule that would also block mem paths.
 	policy := &PolicyExtended{
 		Name:  "write-memory-only",
 		Tools: []string{"Write"},
 		Allow: []PolicyRuleExt{
 			{Pattern: `^\.cog/mem/.*`},
-		},
-		Deny: []PolicyRuleExt{
-			{Pattern: `.*`},
 		},
 	}
 	engine := NewPolicyEngine([]*PolicyExtended{policy})
@@ -391,8 +388,9 @@ func TestIntegration_FullToolExecution(t *testing.T) {
 		t.Errorf("File content doesn't match")
 	}
 
-	// Verify artifact was stored
-	artifactPath := filepath.Join(".cog", "ledger", sessionID, "artifacts", result.ArtifactHash+".txt")
+	// Verify artifact was stored. WriteTool stores with content type "text/markdown",
+	// so StoreArtifact uses the ".md" extension.
+	artifactPath := filepath.Join(".cog", "ledger", sessionID, "artifacts", result.ArtifactHash+".md")
 	if _, err := os.Stat(artifactPath); os.IsNotExist(err) {
 		t.Errorf("Artifact not stored at %s", artifactPath)
 	}

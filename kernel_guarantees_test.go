@@ -410,7 +410,9 @@ func TestEventRoundtrip(t *testing.T) {
 func TestCogdocIndex(t *testing.T) {
 	tmpDir := t.TempDir()
 	cogRoot := filepath.Join(tmpDir, ".cog")
-	memoryDir := filepath.Join(cogRoot, "memory", "semantic")
+	// BuildCogdocIndex walks .cog/mem/ (not .cog/memory/) — match that layout
+	// and the expected URIs like cog://mem/semantic/doc1.
+	memoryDir := filepath.Join(cogRoot, "mem", "semantic")
 
 	if err := os.MkdirAll(memoryDir, 0755); err != nil {
 		t.Fatalf("Failed to create memory directory: %v", err)
