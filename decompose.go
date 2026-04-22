@@ -15,7 +15,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"math"
@@ -271,124 +270,6 @@ Do not include markdown formatting in JSON string values. All values must be pla
 
 func tierUserPrompt(input string) string {
 	return "Decompose the following:\n\n" + input
-}
-
-// === Wave 1: Assembly — CLI Flag Parsing ===
-
-func cmdDecompose(args []string) int {
-	fs := flag.NewFlagSet("decompose", flag.ContinueOnError)
-	tierFlag := fs.String("tier", "all", "Tiers to generate: all, 0, 1, 2, 3, or comma-separated (e.g. 0,1)")
-	jsonFlag := fs.Bool("json", false, "Output raw JSON")
-	modelFlag := fs.String("model", "", "Model override (default: gemma4:e4b)")
-	ollamaFlag := fs.String("ollama-url", "", "Ollama URL override")
-	noStoreFlag := fs.Bool("no-store", false, "Skip embedding generation and CogDoc storage")
-	workbenchFlag := fs.Bool("workbench", false, "Launch interactive TUI workbench")
-
-	if err := fs.Parse(args); err != nil {
-		fmt.Fprintf(os.Stderr, "Usage: cog decompose [flags] [file|-]\n")
-		return 1
-	}
-
-	// Parse tier selection
-	tiers, err := parseTierFlag(*tierFlag)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-
-	// Normalize input
-	input, err := normalizeDecompInput(fs.Args(), os.Stdin)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-
-	// Resolve model and URL
-	model := "gemma4:e4b"
-	if *modelFlag != "" {
-		model = *modelFlag
-	} else if env := os.Getenv("COG_AGENT_MODEL"); env != "" {
-		model = env
-	}
-
-	ollamaURL := "http://localhost:11434"
-	if *ollamaFlag != "" {
-		ollamaURL = *ollamaFlag
-	} else if env := os.Getenv("OLLAMA_HOST"); env != "" {
-		ollamaURL = env
-	}
-
-	// Create runner with file-based event callback when in a workspace
-	harness := NewAgentHarness(AgentHarnessConfig{
-		OllamaURL: ollamaURL,
-		Model:     model,
-	})
-
-	var callback DecompEventCallback
-	if wd, err := os.Getwd(); err == nil {
-		if root := findWorkspaceRoot(wd); root != "" {
-			callback = newFileEventCallback(root)
-		}
-	}
-
-	runner := NewDecompositionRunner(harness, callback)
-	runner.tiers = tiers
-
-	// Interactive workbench mode
-	if *workbenchFlag {
-		if err := runDecompWorkbench(input, runner); err != nil {
-			fmt.Fprintf(os.Stderr, "Workbench error: %v\n", err)
-			return 1
-		}
-		return 0
-	}
-
-	// Run decomposition
-	ctx := context.Background()
-	result, err := runner.Run(ctx, input)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-
-	// Post-processing: embeddings, quality, storage (best-effort, skip with --no-store)
-	if !*noStoreFlag {
-		embedResults(ctx, ollamaURL, result)
-
-		// Compute quality metrics after embeddings are available
-		quality := computeQuality(result)
-		quality.SchemaConformant = !runner.retried
-		result.Quality = quality
-
-		// Find workspace root (look for .cog/ directory)
-		if wd, err := os.Getwd(); err == nil {
-			root := findWorkspaceRoot(wd)
-			if root != "" {
-				storeResult(root, result)
-
-				// C4: Index the CogDoc in constellation for vector+FTS retrieval.
-				// Best-effort — log warning on failure, don't block output.
-				cogdocPath := filepath.Join(root, ".cog", "mem", "semantic", "decompositions", result.InputHash+".cog.md")
-				if err := indexInConstellation(root, cogdocPath); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: constellation index failed: %v\n", err)
-				}
-			}
-		}
-	}
-
-	// Output
-	if *jsonFlag {
-		data, err := json.MarshalIndent(result, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error marshalling result: %v\n", err)
-			return 1
-		}
-		fmt.Println(string(data))
-	} else {
-		printDecompResult(result)
-	}
-
-	return 0
 }
 
 // parseTierFlag parses the --tier flag value into a slice of tier numbers.

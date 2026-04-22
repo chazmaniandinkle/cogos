@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -375,25 +374,7 @@ func copyPermissions(perms []PermOverwriteConf) []PermOverwriteConf {
 	return cp
 }
 
-// ─── Migration: YAML → HCL ─────────────────────────────────────────────────
-
-func cmdDiscordMigrate(root string) error {
-	cfg, configPath, err := loadDiscordServerConfig(root)
-	if err != nil {
-		return fmt.Errorf("loading config from %s: %w", configPath, err)
-	}
-
-	hclContent := discordConfigToHCL(cfg)
-
-	outPath := filepath.Join(root, ".cog", "config", "discord", "server.hcl")
-	if err := os.WriteFile(outPath, []byte(hclContent), 0644); err != nil {
-		return fmt.Errorf("writing %s: %w", outPath, err)
-	}
-
-	fmt.Printf("Migrated %s → %s\n", PathToURI(root, configPath), PathToURI(root, outPath))
-	fmt.Println("\nReview server.hcl, then run `cog plan discord` to verify zero diff.")
-	return nil
-}
+// ─── HCL emission (used by tests) ──────────────────────────────────────────
 
 func discordConfigToHCL(cfg *DiscordServerConfig) string {
 	var b strings.Builder

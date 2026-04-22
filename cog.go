@@ -4508,15 +4508,6 @@ Identity & Verification:
   hash             Print git tree hash
   health           Check workspace health
 
-Task Orchestration:
-  run <task-name>           Execute task with dependency resolution
-  tasks list                List all available tasks
-  tasks graph <task-name>   Show dependency graph for task
-  tasks show <task-name>    Show task definition
-  cache stats               Show cache statistics
-  cache list                List cached tasks
-  cache clean               Clear task cache
-
 Coherence:
   coherence check     Check current state against canonical
   coherence baseline  Record current state as baseline
@@ -4565,13 +4556,6 @@ Projection:
 Hook Dispatch:
   dispatch <event> [tool]   Dispatch event to handlers
 
-Fleet (Agent Orchestration):
-  fleet spawn <config> --task "..."   Spawn agent fleet
-  fleet status [fleet_id]             Show fleet status
-  fleet reap <fleet_id>               Collect results
-  fleet logs <fleet_id>               View fleet logs
-  fleet configs                       List available configs
-
 Inference:
   infer [options] <prompt>  Run inference using shared engine
     --schema, -s <path>     JSON schema file for structured output
@@ -4579,10 +4563,6 @@ Inference:
     --model, -m <model>     Model to use (default: claude)
     --json                  Output as JSON (for programmatic use)
     --origin <origin>       Tag request origin (default: "cli")
-  inference list            List all providers with status
-  inference status          Show health status of all providers
-  inference use <name>      Switch to a different provider
-  inference test [name]     Test a specific provider (or all if none specified)
   serve [command] [--port]  OpenAI-compatible HTTP server (default port: 5100)
     (no command)            Run in foreground
     start                   Start as background daemon
@@ -4605,18 +4585,6 @@ Observability:
   ontology show    Display parsed ontology structure
   ontology types   List valid cogdoc types
   ontology relations  List valid reference relations
-
-Infrastructure as Code:
-  plan <resource>              Generate reconciliation plan (read-only)
-  apply <resource>             Apply reconciliation plan
-  status <resource>            Show config vs live summary
-  snapshot <resource>          Crawl live server → config + state
-  refresh <resource>           Update state from live (detect drift)
-  import <resource> [type] [id]  Import resource into state
-  migrate <resource>           Convert config format (e.g. YAML → HCL)
-
-  Resources: discord
-  Flags: --token TOKEN, --json (plan only)
 
 Info:
   info             Show kernel, workspace, server, and CLI versions
@@ -5624,25 +5592,8 @@ func main() {
 		code = cmdDispatch(os.Args[2:])
 	case "emit":
 		code = cmdEmit(os.Args[2:])
-	case "run":
-		code = cmdRun(os.Args[2:])
-	case "tasks":
-		code = cmdTasks(os.Args[2:])
-	case "cache":
-		code = cmdCache(os.Args[2:])
-	case "fleet":
-		code = cmdFleet(os.Args[2:])
-	case "research":
-		code = cmdResearch(os.Args[2:])
-	case "registry":
-		if err := cmdRegistry(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			code = 1
-		}
 	case "infer":
 		code = cmdInfer(os.Args[2:])
-	case "inference":
-		code = cmdInference(os.Args[2:])
 	case "mcp":
 		code = cmdMCP(os.Args[2:])
 	case "claude":
@@ -5703,55 +5654,13 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			code = 1
 		}
-	case "plan":
-		code = cmdPlan(os.Args[2:])
-	case "apply":
-		code = cmdApply(os.Args[2:])
-	case "status":
-		code = cmdStatus(os.Args[2:])
-	case "components":
-		code = cmdComponents(os.Args[2:])
-	case "snapshot":
-		code = cmdSnapshot(os.Args[2:])
-	case "refresh":
-		code = cmdRefresh(os.Args[2:])
-	case "import":
-		code = cmdImport(os.Args[2:])
-	case "migrate":
-		code = cmdMigrate(os.Args[2:])
-	case "watch":
-		code = cmdWatch(os.Args[2:])
-	case "reconcile":
-		code = cmdReconcile(os.Args[2:])
 	case "node":
 		if err := cmdNode(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			code = 1
 		}
-	case "index":
-		code = cmdIndex(os.Args[2:])
-	case "drift":
-		code = cmdDrift(os.Args[2:])
 	case "bus":
 		code = cmdBus(os.Args[2:])
-	case "channel":
-		code = cmdChannel(os.Args[2:])
-	case "cluster":
-		if err := cmdCluster(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			code = 1
-		}
-	case "extract":
-		if err := cmdExtract(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			code = 1
-		}
-	case "oci":
-		code = cmdOCI(os.Args[2:])
-	case "service":
-		code = cmdService(os.Args[2:])
-	case "decompose":
-		code = cmdDecompose(os.Args[2:])
 	case "version", "-v", "--version":
 		code = cmdVersion()
 	case "info":

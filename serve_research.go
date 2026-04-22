@@ -5,9 +5,23 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// parseDuration parses human-friendly durations like "8h", "30m", "1h30m", "2d".
+func parseDuration(s string) (time.Duration, error) {
+	// Handle "d" suffix (days) by converting to hours
+	if strings.HasSuffix(s, "d") {
+		days, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
+}
 
 // ---------------------------------------------------------------------------
 // Research HTTP handlers — mounted on serveServer
