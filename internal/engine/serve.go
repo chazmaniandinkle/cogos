@@ -56,11 +56,30 @@ type Server struct {
 	attentionLog    *attentionLog // per-server log (avoids global write race)
 	agentController AgentController // nil until SetAgentController is called
 	mcpServer       *MCPServer      // so SetAgentController can propagate to tools
+
+	// Track 5 Phase 3 surface — per-bus event store, SSE broker, and
+	// consumer cursor registry. Scoped to the server so tests can create
+	// isolated instances.
+	busSessions  *BusSessionManager
+	busBroker    *BusEventBroker
+	busConsumers *ConsumerRegistry
+	sessions     *SessionContextStore
 }
 
 // NewServer constructs a Server bound to the configured port.
 func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s := &Server{cfg: cfg, nucleus: nucleus, process: process}
+
+	// Phase 3 bus/session surface. Managers are always instantiated so
+	// handlers don't need nil-safety for the common case; tests can
+	// override via the exported fields if they want an isolated fixture.
+	s.busSessions = NewBusSessionManager(cfg.WorkspaceRoot)
+	s.busBroker = NewBusEventBroker()
+	s.busConsumers = NewConsumerRegistry(
+		// Match root's persistence path: .cog/run/bus/{bus_id}.cursors.jsonl
+		filepath.Join(cfg.WorkspaceRoot, ".cog", "run", "bus"),
+	)
+	s.sessions = NewSessionContextStore()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", handleDashboard)
@@ -91,6 +110,9 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.registerEventBusRoutes(mux)
 	s.registerMCPRoutes(mux)
 	s.registerConfigRoutes(mux)
+
+	// Track 5 Phase 3: /v1/bus/* and /v1/sessions routes.
+	s.registerBusRoutes(mux)
 
 	// Resolve the bind address. Default stays 127.0.0.1 (loopback-only);
 	// callers may override via Config.BindAddr to listen on all interfaces
