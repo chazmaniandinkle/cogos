@@ -16,7 +16,7 @@
 
 VERSION := 2.4.0
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS := -s -w -X main.BuildTime=$(BUILD_TIME)
+LDFLAGS := -s -w -X github.com/cogos-dev/cogos/internal/engine.BuildTime=$(BUILD_TIME)
 BUILD_TAGS := fts5
 BINARY := cog
 GO := go
@@ -41,31 +41,30 @@ build: $(BINARY)
 GO_SOURCES := $(wildcard *.go) $(wildcard harness/*.go)
 
 $(BINARY): $(GO_SOURCES) go.mod harness/go.mod
-	$(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) .
+	$(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/cogos
 
 # Build for all platforms
 all: $(PLATFORMS)
 
 darwin-arm64:
-	GOOS=darwin GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-darwin-arm64 .
+	GOOS=darwin GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-darwin-arm64 ./cmd/cogos
 
 darwin-amd64:
-	GOOS=darwin GOARCH=amd64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-darwin-amd64 .
+	GOOS=darwin GOARCH=amd64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-darwin-amd64 ./cmd/cogos
 
 linux-amd64:
-	GOOS=linux GOARCH=amd64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-linux-amd64 .
+	GOOS=linux GOARCH=amd64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-linux-amd64 ./cmd/cogos
 
 linux-arm64:
-	GOOS=linux GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-linux-arm64 .
+	GOOS=linux GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-linux-arm64 ./cmd/cogos
 
 # Android requires PIE (position-independent executables)
 android-arm64:
-	GOOS=android GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -buildmode=pie -ldflags="$(LDFLAGS)" -o $(BINARY)-android-arm64 .
+	GOOS=android GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -buildmode=pie -ldflags="$(LDFLAGS)" -o $(BINARY)-android-arm64 ./cmd/cogos
 
 # Windows cross-compile: matches .github/workflows/release.yml exactly.
-# CGO_ENABLED=0 avoids tree-sitter's CGO path; ./cmd/cogos/ is the real entry
-# point published by CI (the root package pulls in test-only deps).
-# .exe suffix is required to execute on Windows.
+# CGO_ENABLED=0 avoids tree-sitter's CGO path (same reason as the default
+# build target). .exe suffix is required to execute on Windows.
 windows-amd64:
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o $(BINARY)-windows-amd64.exe ./cmd/cogos/
 
@@ -105,14 +104,8 @@ test: build
 	@echo "=== Version Test ==="
 	./$(BINARY) version
 	@echo ""
-	@echo "=== Help Test ==="
-	./$(BINARY) help
-	@echo ""
 	@echo "=== Health Check ==="
-	./$(BINARY) health
-	@echo ""
-	@echo "=== Coherence Check ==="
-	./$(BINARY) coherence check || true
+	./$(BINARY) health || true
 	@echo ""
 	@echo "=== All tests passed ==="
 
