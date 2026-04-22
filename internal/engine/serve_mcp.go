@@ -11,6 +11,12 @@ import "net/http"
 // have a backing implementation.
 func (s *Server) registerMCPRoutes(mux *http.ServeMux) {
 	mcpSrv := NewMCPServerWithAgentController(s.cfg, s.nucleus, s.process, s.agentController)
+	// Wire session-management deps so the cog_register_session /
+	// cog_offer_handoff / etc. tools can hit the same in-memory registries
+	// the HTTP surface uses. The tools fall back to an error message if
+	// these are nil — NewMCPServer (used by tests that only care about
+	// memory tools) doesn't call this, which is fine.
+	mcpSrv.SetSessionsBackend(s.busSessions, s.sessionRegistry, s.handoffRegistry)
 	s.mcpServer = mcpSrv
 	h := mcpSrv.Handler()
 	mux.Handle("GET /mcp", h)

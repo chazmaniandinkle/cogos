@@ -64,6 +64,13 @@ type Server struct {
 	busBroker    *BusEventBroker
 	busConsumers *ConsumerRegistry
 	sessions     *SessionContextStore
+
+	// Kernel-native session-management registries (hybrid design —
+	// cog://mem/semantic/surveys/2026-04-21-consolidation/
+	// agent-P-session-management-evaluation). The bus is ground truth;
+	// these are derived views rebuilt from bus replay at startup.
+	sessionRegistry *SessionRegistry
+	handoffRegistry *HandoffRegistry
 }
 
 // NewServer constructs a Server bound to the configured port.
@@ -80,6 +87,12 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 		filepath.Join(cfg.WorkspaceRoot, ".cog", "run", "bus"),
 	)
 	s.sessions = NewSessionContextStore()
+
+	// Kernel-native session + handoff registries. Replay from bus is done
+	// below, after the bus manager + its handlers are wired up, so that
+	// the warm cache is ready before any HTTP request lands.
+	s.sessionRegistry = NewSessionRegistry()
+	s.handoffRegistry = NewHandoffRegistry()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", handleDashboard)
@@ -113,6 +126,18 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 
 	// Track 5 Phase 3: /v1/bus/* and /v1/sessions routes.
 	s.registerBusRoutes(mux)
+
+	// Kernel-native session & handoff management routes — the hybrid
+	// design's invariance layer. Registered AFTER registerBusRoutes so
+	// the specific patterns (POST /v1/sessions/register, etc.) coexist
+	// cleanly with the pre-existing GET /v1/sessions[/{id}] surface.
+	s.registerSessionMgmtRoutes(mux)
+
+	// Replay bus_sessions + bus_handoffs into the in-memory registries so
+	// the kernel starts with an accurate derived view. Bus is authoritative
+	// either way; this just warms the read path.
+	_ = ReplaySessionRegistry(s.busSessions, s.sessionRegistry)
+	_ = ReplayHandoffRegistry(s.busSessions, s.handoffRegistry)
 
 	// Resolve the bind address. Default stays 127.0.0.1 (loopback-only);
 	// callers may override via Config.BindAddr to listen on all interfaces
