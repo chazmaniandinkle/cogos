@@ -40,6 +40,13 @@ type MCPServer struct {
 	process         *Process
 	cogdocSvc       *CogDocService
 	agentController AgentController // optional; nil when the kernel has no live agent
+
+	// Session management backends (see SetSessionsBackend). Optional —
+	// NewMCPServer without a live HTTP server skips wiring and the
+	// session tools return a graceful "not configured" error.
+	busSessions     *BusSessionManager
+	sessionRegistry *SessionRegistry
+	handoffRegistry *HandoffRegistry
 }
 
 // NewMCPServer creates and configures the MCP server with all stage-1 tools.
@@ -228,6 +235,12 @@ func (m *MCPServer) registerTools() {
 		Name:        "cog_search_traces",
 		Description: "Search kernel trace JSONL streams in .cog/run/ (attention, proprioceptive, internal_requests). Filter by source, session_id, level, case-insensitive substring, and time range (since/until accept RFC3339 or duration like 5m/1h). Returns unified chronological results with per-source scan diagnostics. Fallback: ls .cog/run/*.jsonl && jq -c . .cog/run/<name>.jsonl | head",
 	}, m.toolSearchTraces)
+
+	// Kernel-native session/handoff tools (mcp_sessions.go). The 8 tools
+	// complement the 8 cogos_* bridge tools living in cog-sandbox-mcp:
+	// both surfaces coexist by design — same kernel truth, two MCP
+	// doorways (amendment #5 of the Agent P hybrid plan).
+	m.registerSessionTools()
 }
 
 // registerResources registers MCP Resources — read-only addressable data.
