@@ -136,16 +136,13 @@ func (s *Server) handleSessionRegister(w http.ResponseWriter, r *http.Request) {
 		RegisteredAt: now,
 		LastSeen:     now,
 	}
-	stored, created, err := s.sessionRegistry.ApplyRegister(
-		state,
-		time.Duration(defaultActiveWithinSeconds)*time.Second,
-		now,
-	)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	// Mirror to the bus.
+	// Build the bus payload up front so the appendFn closure can reference
+	// it. The registered_at field is derived from the final stored state's
+	// RegisteredAt (which may have been preserved from a prior re-register
+	// by ApplyRegister); since we don't yet know if this is a new row vs
+	// an update, we use `now` here and let ApplyRegister correct lineage
+	// internally. The bus event's ts field is authoritative for ordering
+	// anyway.
 	payload := map[string]interface{}{
 		"session_id":    req.SessionID,
 		"workspace":     req.Workspace,
@@ -156,7 +153,7 @@ func (s *Server) handleSessionRegister(w http.ResponseWriter, r *http.Request) {
 		"status":        req.Status,
 		"current_task":  req.CurrentTask,
 		"context_usage": req.ContextUsage,
-		"registered_at": stored.RegisteredAt.Format(time.RFC3339Nano),
+		"registered_at": now.Format(time.RFC3339Nano),
 	}
 	if req.Extras != nil {
 		for k, v := range req.Extras {
@@ -165,7 +162,21 @@ func (s *Server) handleSessionRegister(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	evt, err := s.busSessions.AppendEvent(BusSessions, EvtSessionRegister, req.SessionID, payload)
+	// Validation has already happened above (ValidateSessionID + required
+	// fields), so the only error ApplyRegister can return now is from
+	// appendFn — i.e. bus-append failure, which is always a 500.
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = s.busSessions.AppendEvent(BusSessions, EvtSessionRegister, req.SessionID, payload)
+		return err
+	}
+	stored, created, err := s.sessionRegistry.ApplyRegister(
+		state,
+		time.Duration(defaultActiveWithinSeconds)*time.Second,
+		now,
+		appendFn,
+	)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "bus_append_failed", err.Error())
 		return
@@ -199,19 +210,6 @@ func (s *Server) handleSessionHeartbeat(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	now := time.Now().UTC()
-	stored, ok := s.sessionRegistry.ApplyHeartbeat(
-		id, req.ContextUsage, req.Status, req.CurrentTask, now,
-	)
-	if !ok {
-		writeJSONError(w, http.StatusNotFound, "not_found",
-			fmt.Sprintf("session %q is not registered", id))
-		return
-	}
-	if stored.Ended {
-		writeJSONError(w, http.StatusConflict, "conflict",
-			fmt.Sprintf("session %q is already ended", id))
-		return
-	}
 	payload := map[string]interface{}{
 		"session_id":    id,
 		"status":        req.Status,
@@ -219,8 +217,31 @@ func (s *Server) handleSessionHeartbeat(w http.ResponseWriter, r *http.Request) 
 		"current_task":  req.CurrentTask,
 		"at":            now.Format(time.RFC3339Nano),
 	}
-	evt, err := s.busSessions.AppendEvent(BusSessions, EvtSessionHeartbeat, id, payload)
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = s.busSessions.AppendEvent(BusSessions, EvtSessionHeartbeat, id, payload)
+		return err
+	}
+	stored, ok, err := s.sessionRegistry.ApplyHeartbeat(
+		id, req.ContextUsage, req.Status, req.CurrentTask, now, appendFn,
+	)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "not_found",
+			fmt.Sprintf("session %q is not registered", id))
+		return
+	}
 	if err != nil {
+		// Two shapes of err land here:
+		//   1. "session already ended" — the registry was NOT mutated
+		//      (LastSeen unchanged) and no bus event was appended.
+		//      Return 409.
+		//   2. bus append failure — also no mutation. Return 500.
+		if stored != nil && stored.Ended && evt == nil {
+			writeJSONError(w, http.StatusConflict, "conflict",
+				fmt.Sprintf("session %q is already ended", id))
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, "bus_append_failed", err.Error())
 		return
 	}
@@ -251,25 +272,32 @@ func (s *Server) handleSessionEnd(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	now := time.Now().UTC()
-	stored, known, err := s.sessionRegistry.ApplyEnd(id, req.Reason, req.HandoffID, now)
-	if !known {
-		writeJSONError(w, http.StatusNotFound, "not_found",
-			fmt.Sprintf("session %q is not registered", id))
-		return
-	}
-	if err != nil {
-		writeJSONError(w, http.StatusConflict, "conflict", err.Error())
-		return
-	}
 	payload := map[string]interface{}{
 		"session_id": id,
 		"reason":     req.Reason,
 		"handoff_id": req.HandoffID,
 		"ended_at":   now.Format(time.RFC3339Nano),
 	}
-	evt, errEmit := s.busSessions.AppendEvent(BusSessions, EvtSessionEnd, id, payload)
-	if errEmit != nil {
-		writeJSONError(w, http.StatusInternalServerError, "bus_append_failed", errEmit.Error())
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = s.busSessions.AppendEvent(BusSessions, EvtSessionEnd, id, payload)
+		return err
+	}
+	stored, known, err := s.sessionRegistry.ApplyEnd(id, req.Reason, req.HandoffID, now, appendFn)
+	if !known {
+		writeJSONError(w, http.StatusNotFound, "not_found",
+			fmt.Sprintf("session %q is not registered", id))
+		return
+	}
+	if err != nil {
+		// "already ended" sentinel → 409. Bus-append failure → 500.
+		// Disambiguate by whether evt was populated.
+		if evt == nil && stored != nil && stored.Ended {
+			writeJSONError(w, http.StatusConflict, "conflict", err.Error())
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "bus_append_failed", err.Error())
 		return
 	}
 	writeJSONResp(w, http.StatusOK, sessionWriteResponse{
@@ -340,6 +368,14 @@ func (s *Server) handleHandoffOffer(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "body must be JSON")
 		return
 	}
+	// Per design spec, the kernel ALWAYS mints handoff_id. A caller-
+	// supplied value is rejected so path-based claim/complete routes can
+	// rely on the canonical ho-<ms>-<hex> shape.
+	if req.HandoffID != "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request",
+			"handoff_id must not be provided; kernel mints it server-side")
+		return
+	}
 	if err := ValidateSessionID(req.FromSession); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request",
 			"from_session: "+err.Error())
@@ -378,17 +414,21 @@ func (s *Server) handleHandoffOffer(w http.ResponseWriter, r *http.Request) {
 			"task.next_steps must be a non-empty list")
 		return
 	}
-
-	if req.HandoffID == "" {
-		req.HandoffID = mintHandoffID(time.Now())
+	if req.TTLSeconds < 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request",
+			"ttl_seconds must be >= 0")
+		return
 	}
 	if req.TTLSeconds == 0 {
 		req.TTLSeconds = 3600
 	}
 
+	// Single `now` for the whole operation — no skew between the minted
+	// handoff_id's embedded timestamp and the stored created_at.
 	now := time.Now().UTC()
+	handoffID := mintHandoffID(now)
 	state := HandoffState{
-		HandoffID:   req.HandoffID,
+		HandoffID:   handoffID,
 		FromSession: req.FromSession,
 		ToSession:   req.ToSession,
 		Reason:      req.Reason,
@@ -399,7 +439,7 @@ func (s *Server) handleHandoffOffer(w http.ResponseWriter, r *http.Request) {
 	// The full payload we put on the bus is the canonical offer — mirror it
 	// to OfferPayload so claimants can read it verbatim.
 	payload := map[string]interface{}{
-		"handoff_id":       req.HandoffID,
+		"handoff_id":       handoffID,
 		"from_session":     req.FromSession,
 		"to_session":       req.ToSession,
 		"reason":           req.Reason,
@@ -411,15 +451,20 @@ func (s *Server) handleHandoffOffer(w http.ResponseWriter, r *http.Request) {
 		"memory_refs":      req.MemoryRefs,
 	}
 	state.OfferPayload = payload
-	stored := s.handoffRegistry.ApplyOffer(state, now)
 
-	evt, err := s.busSessions.AppendEvent(BusHandoffs, EvtHandoffOffer, req.FromSession, payload)
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = s.busSessions.AppendEvent(BusHandoffs, EvtHandoffOffer, req.FromSession, payload)
+		return err
+	}
+	stored, err := s.handoffRegistry.ApplyOffer(state, now, appendFn)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "bus_append_failed", err.Error())
 		return
 	}
 	writeJSONResp(w, http.StatusOK, handoffWriteResponse{
-		OK: true, HandoffID: req.HandoffID,
+		OK: true, HandoffID: handoffID,
 		Seq: evt.Seq, Hash: evt.Hash, Handoff: stored,
 	})
 }
@@ -487,7 +532,25 @@ func (s *Server) handleHandoffClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	result := s.handoffRegistry.ApplyClaim(id, req.ClaimingSession, now)
+	// The bus append for the winning claim runs WHILE the handoff lock
+	// is held inside ApplyClaim, so first-wins is enforced on the
+	// authoritative bus, not just the in-memory registry.
+	claimPayload := map[string]interface{}{
+		"handoff_id":       id,
+		"claiming_session": req.ClaimingSession,
+		"claimed_at":       now.Format(time.RFC3339Nano),
+	}
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = s.busSessions.AppendEvent(BusHandoffs, EvtHandoffClaim, req.ClaimingSession, claimPayload)
+		return err
+	}
+	result, appendErr := s.handoffRegistry.ApplyClaim(id, req.ClaimingSession, now, appendFn)
+	if appendErr != nil {
+		writeJSONError(w, http.StatusInternalServerError, "bus_append_failed", appendErr.Error())
+		return
+	}
 	if result.Rejection != "" {
 		s.emitClaimRejected(id, req.ClaimingSession, result, now)
 		status := http.StatusConflict
@@ -498,17 +561,6 @@ func (s *Server) handleHandoffClaim(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSONError(w, status, kind, fmt.Sprintf(
 			"claim rejected: %s", result.Rejection))
-		return
-	}
-	// Successful claim — emit and return offer payload.
-	claimPayload := map[string]interface{}{
-		"handoff_id":       id,
-		"claiming_session": req.ClaimingSession,
-		"claimed_at":       now.Format(time.RFC3339Nano),
-	}
-	evt, err := s.busSessions.AppendEvent(BusHandoffs, EvtHandoffClaim, req.ClaimingSession, claimPayload)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "bus_append_failed", err.Error())
 		return
 	}
 	writeJSONResp(w, http.StatusOK, map[string]any{
@@ -524,16 +576,19 @@ func (s *Server) handleHandoffClaim(w http.ResponseWriter, r *http.Request) {
 // emitClaimRejected writes a handoff.claim_rejected event to bus_handoffs so
 // observers can audit failed claim attempts (amendment #4). Emission failure
 // is logged but non-fatal — the handler already returned the HTTP error.
+//
+// Per the amendment the payload ALWAYS includes reason, attempting_session,
+// and conflicting_session (empty string when inapplicable, e.g. the offer
+// never existed or TTL expired). This gives audit consumers a stable schema
+// to query against.
 func (s *Server) emitClaimRejected(handoffID, attemptingSession string,
 	result ClaimResult, now time.Time) {
 	payload := map[string]interface{}{
-		"handoff_id":         handoffID,
-		"attempting_session": attemptingSession,
-		"reason":             string(result.Rejection),
-		"rejected_at":        now.Format(time.RFC3339Nano),
-	}
-	if result.ConflictingSession != "" {
-		payload["conflicting_session"] = result.ConflictingSession
+		"handoff_id":          handoffID,
+		"attempting_session":  attemptingSession,
+		"conflicting_session": result.ConflictingSession, // "" when N/A
+		"reason":              string(result.Rejection),
+		"rejected_at":         now.Format(time.RFC3339Nano),
 	}
 	if _, err := s.busSessions.AppendEvent(BusHandoffs, EvtHandoffClaimRejected, attemptingSession, payload); err != nil {
 		slog.Warn("handoff: claim_rejected emit failed",
@@ -571,19 +626,6 @@ func (s *Server) handleHandoffComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	stored, reason := s.handoffRegistry.ApplyComplete(
-		id, req.CompletingSession, req.Outcome, req.Notes, req.NextHandoffID, now,
-	)
-	if reason == ClaimRejectedOfferNotFound {
-		writeJSONError(w, http.StatusNotFound, "not_found",
-			fmt.Sprintf("handoff %q not found", id))
-		return
-	}
-	if reason == ClaimRejectedOutOfOrder {
-		writeJSONError(w, http.StatusConflict, "conflict",
-			fmt.Sprintf("handoff %q cannot complete in state %q", id, stored.State))
-		return
-	}
 	payload := map[string]interface{}{
 		"handoff_id":         id,
 		"completing_session": req.CompletingSession,
@@ -592,9 +634,27 @@ func (s *Server) handleHandoffComplete(w http.ResponseWriter, r *http.Request) {
 		"next_handoff_id":    req.NextHandoffID,
 		"completed_at":       now.Format(time.RFC3339Nano),
 	}
-	evt, err := s.busSessions.AppendEvent(BusHandoffs, EvtHandoffComplete, req.CompletingSession, payload)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "bus_append_failed", err.Error())
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = s.busSessions.AppendEvent(BusHandoffs, EvtHandoffComplete, req.CompletingSession, payload)
+		return err
+	}
+	stored, reason, appendErr := s.handoffRegistry.ApplyComplete(
+		id, req.CompletingSession, req.Outcome, req.Notes, req.NextHandoffID, now, appendFn,
+	)
+	if appendErr != nil {
+		writeJSONError(w, http.StatusInternalServerError, "bus_append_failed", appendErr.Error())
+		return
+	}
+	if reason == ClaimRejectedOfferNotFound {
+		writeJSONError(w, http.StatusNotFound, "not_found",
+			fmt.Sprintf("handoff %q not found", id))
+		return
+	}
+	if reason == ClaimRejectedOutOfOrder {
+		writeJSONError(w, http.StatusConflict, "conflict",
+			fmt.Sprintf("handoff %q cannot complete in state %q", id, stored.State))
 		return
 	}
 	writeJSONResp(w, http.StatusOK, handoffWriteResponse{

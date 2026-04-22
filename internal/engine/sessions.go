@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -63,12 +64,19 @@ const (
 )
 
 // sessionIDPattern enforces the three-component hyphen-separated lowercase
-// format the handoff protocol recommends. Same regex the design doc calls out.
+// format the handoff protocol design spec requires. Three components —
+// <machine>-<role>-<nonce> — or more. The first component is a single
+// non-empty token; the second and third may themselves contain hyphens, which
+// is why the pattern is written as "token-hyphenable-hyphenable" rather than
+// "exactly three tokens."
+//
 // Example: slowbro-laptop-cogos-gap-closure → passes.
-var sessionIDPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)+$`)
+//          alpha-beta-gamma                 → passes (exactly 3 tokens).
+//          a-b                              → REJECTED (only 2 tokens).
+var sessionIDPattern = regexp.MustCompile(`^[a-z0-9]+-[a-z0-9-]+-[a-z0-9-]+$`)
 
 // ValidateSessionID returns nil iff id matches the lowercase-hyphen format
-// with at least two components. Exported so tests and the HTTP handlers can
+// with at least three components. Exported so tests and the HTTP handlers can
 // share the single source of truth.
 func ValidateSessionID(id string) error {
 	if id == "" {
@@ -76,8 +84,15 @@ func ValidateSessionID(id string) error {
 	}
 	if !sessionIDPattern.MatchString(id) {
 		return fmt.Errorf(
-			"session_id %q must be ascii-lowercase with at least two "+
+			"session_id %q must be ascii-lowercase with at least three "+
 				"hyphen-separated components", id)
+	}
+	// Reject trailing/leading hyphens on inner components — the regex
+	// alone would accept "a--b-c" which is visually confusing. A
+	// single explicit double-hyphen check catches the common typos.
+	if strings.Contains(id, "--") {
+		return fmt.Errorf(
+			"session_id %q must not contain consecutive hyphens", id)
 	}
 	return nil
 }
@@ -125,6 +140,12 @@ func (s *SessionState) IsActive(window time.Duration, now time.Time) bool {
 
 // SessionRegistry is the in-memory, RWMutex-guarded map of session_id →
 // SessionState. The bus is ground truth; this map is a derived, warm cache.
+//
+// The mutating methods take an optional `appendFn` callback that writes the
+// corresponding event to the bus WHILE the registry lock is held. On
+// appendFn() error, the in-memory row is left untouched so the derived view
+// can never run ahead of the authoritative ledger. This fixes the inverted
+// write-path critical raised in codex's PR#43 review.
 type SessionRegistry struct {
 	mu   sync.RWMutex
 	rows map[string]*SessionState
@@ -171,12 +192,18 @@ func (r *SessionRegistry) Snapshot() []*SessionState {
 // after end is allowed only if the prior session is ended or its heartbeat is
 // outside the active window.
 //
-// Returns the resulting state (copy) and a flag indicating whether the
-// registry row was newly created vs updated.
+// If appendFn is non-nil it is invoked AFTER validation but BEFORE the
+// registry mutation is committed, while the registry lock is held. An error
+// from appendFn aborts the mutation and is returned verbatim — the registry
+// is left unchanged, preserving the bus-is-ground-truth invariant.
+//
+// Returns the resulting state (copy), a flag indicating whether the registry
+// row was newly created vs updated, and an error.
 func (r *SessionRegistry) ApplyRegister(
 	state SessionState,
 	activeWindow time.Duration,
 	now time.Time,
+	appendFn func() error,
 ) (*SessionState, bool, error) {
 	if err := ValidateSessionID(state.SessionID); err != nil {
 		return nil, false, err
@@ -203,27 +230,53 @@ func (r *SessionRegistry) ApplyRegister(
 	state.EndedAt = time.Time{}
 	state.EndReason = ""
 	state.EndHandoffID = ""
+	// Append to the bus FIRST — if that fails, the registry is unchanged.
+	if appendFn != nil {
+		if err := appendFn(); err != nil {
+			return nil, false, err
+		}
+	}
 	row := state
 	r.rows[state.SessionID] = &row
 	cp := row
 	return &cp, !found, nil
 }
 
-// ApplyHeartbeat bumps LastSeen + optional fields. Returns (state, ok).
-//   - ok=false when session is unknown.
-//   - ok=true but Ended=true when the session was already ended — the caller
-//     should translate that to a 409 before emitting to the bus.
+// ApplyHeartbeat bumps LastSeen + optional fields. Returns (state, ok, err).
+//   - ok=false when session is unknown → caller returns 404.
+//   - ok=true with non-nil err when the session was already ended. In that
+//     case the registry is NOT mutated (no LastSeen update, no status bump)
+//     and no appendFn is invoked — the caller translates to 409.
+//   - ok=true, err=nil on success — the mutation and (optional) bus append
+//     both happened atomically under the registry lock.
+//
+// appendFn, if non-nil, is invoked AFTER validation/ended-check but BEFORE
+// the LastSeen mutation commits. An appendFn error aborts the mutation and
+// is returned verbatim so the registry stays in lockstep with the bus.
 func (r *SessionRegistry) ApplyHeartbeat(
 	id string,
 	contextUsage float64,
 	status, currentTask string,
 	now time.Time,
-) (*SessionState, bool) {
+	appendFn func() error,
+) (*SessionState, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	row, ok := r.rows[id]
 	if !ok {
-		return nil, false
+		return nil, false, nil
+	}
+	if row.Ended {
+		// Return the CURRENT (unmutated) state so the caller can still
+		// surface fields like EndedAt if needed, but signal the rejection.
+		cp := *row
+		return &cp, true, errors.New("session already ended")
+	}
+	// Append FIRST — if that fails, LastSeen is NOT bumped.
+	if appendFn != nil {
+		if err := appendFn(); err != nil {
+			return nil, true, err
+		}
 	}
 	row.LastSeen = now
 	if contextUsage > 0 {
@@ -236,16 +289,21 @@ func (r *SessionRegistry) ApplyHeartbeat(
 		row.CurrentTask = currentTask
 	}
 	cp := *row
-	return &cp, true
+	return &cp, true, nil
 }
 
 // ApplyEnd transitions a session to ended. Returns:
 //   - (nil, false, nil)            when the session is unknown → 404.
 //   - (&state, true, errAlready)   when the session was already ended → 409.
 //   - (&state, true, nil)          on success.
+//   - (nil, true, appendErr)       if appendFn failed — registry unchanged.
+//
+// appendFn runs AFTER validation but BEFORE the Ended transition commits,
+// under the registry lock. If it errors, no mutation is applied.
 func (r *SessionRegistry) ApplyEnd(
 	id, reason, handoffID string,
 	now time.Time,
+	appendFn func() error,
 ) (*SessionState, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -256,6 +314,11 @@ func (r *SessionRegistry) ApplyEnd(
 	if row.Ended {
 		cp := *row
 		return &cp, true, errors.New("session already ended")
+	}
+	if appendFn != nil {
+		if err := appendFn(); err != nil {
+			return nil, true, err
+		}
 	}
 	row.Ended = true
 	row.EndedAt = now
@@ -311,8 +374,15 @@ func (h *HandoffState) IsExpired(now time.Time) bool {
 // HandoffRegistry guards in-memory handoff state. The bus is still the
 // source of truth; this struct is how we atomically enforce first-wins on
 // claim and state-order on complete.
+//
+// The mutex is held across the bus append in mutating methods (via the
+// appendFn callback). Yes this serializes concurrent offers/claims/completes
+// against disk I/O, but: (a) these operations are low-rate, (b) the append
+// is local disk — typical <10ms — and (c) correctness demands the bus-append
+// and registry mutation commit as one atomic unit so the derived view can't
+// run ahead of the ground-truth ledger.
 type HandoffRegistry struct {
-	mu   sync.Mutex // write-mostly; snapshot also takes the lock briefly
+	mu   sync.RWMutex // write-heavy callers take Lock(); read paths use RLock()
 	rows map[string]*HandoffState
 }
 
@@ -323,15 +393,15 @@ func NewHandoffRegistry() *HandoffRegistry {
 
 // Len returns the number of tracked handoffs (open + claimed + completed).
 func (r *HandoffRegistry) Len() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return len(r.rows)
 }
 
 // Get returns a copy, or (nil, false).
 func (r *HandoffRegistry) Get(id string) (*HandoffState, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	row, ok := r.rows[id]
 	if !ok {
 		return nil, false
@@ -342,8 +412,8 @@ func (r *HandoffRegistry) Get(id string) (*HandoffState, bool) {
 
 // Snapshot returns a copy of every handoff row.
 func (r *HandoffRegistry) Snapshot() []*HandoffState {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := make([]*HandoffState, 0, len(r.rows))
 	for _, row := range r.rows {
 		cp := *row
@@ -356,7 +426,13 @@ func (r *HandoffRegistry) Snapshot() []*HandoffState {
 // the row; this shouldn't happen in normal flow (IDs are unique) but mirrors
 // the bus semantics (re-emitting the same offer would just append another
 // event).
-func (r *HandoffRegistry) ApplyOffer(h HandoffState, now time.Time) *HandoffState {
+//
+// appendFn, if non-nil, runs under the registry lock BEFORE the mutation is
+// committed. An error aborts the mutation and is returned; on nil-error the
+// in-memory row is installed atomically with the bus append.
+func (r *HandoffRegistry) ApplyOffer(
+	h HandoffState, now time.Time, appendFn func() error,
+) (*HandoffState, error) {
 	if h.CreatedAt.IsZero() {
 		h.CreatedAt = now
 	}
@@ -366,10 +442,15 @@ func (r *HandoffRegistry) ApplyOffer(h HandoffState, now time.Time) *HandoffStat
 	h.State = HandoffStateOpen
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if appendFn != nil {
+		if err := appendFn(); err != nil {
+			return nil, err
+		}
+	}
 	row := h
 	r.rows[h.HandoffID] = &row
 	cp := row
-	return &cp
+	return &cp, nil
 }
 
 // ClaimRejection reasons for the handoff.claim_rejected event (amendment #4).
@@ -389,53 +470,84 @@ type ClaimResult struct {
 	ConflictingSession string         // set on already_claimed
 }
 
-// ApplyClaim is the ATOMIC first-wins check. Returns a ClaimResult whose
-// Rejection is non-empty if the claim should be rejected (and a
-// claim_rejected event emitted). On success, updates the in-memory row and
-// returns the full offer copy with State=claimed.
+// ApplyClaim is the ATOMIC first-wins check + bus-append path. Semantics:
+//
+//   - If the offer is missing, already claimed/completed, or TTL-expired,
+//     returns a ClaimResult with a non-empty Rejection; NO mutation, and
+//     appendFn is NOT invoked (the caller emits handoff.claim_rejected
+//     independently for audit).
+//   - Otherwise appendFn is invoked WHILE THE LOCK IS HELD. If it errors,
+//     the claim is aborted — the in-memory row stays open and the error is
+//     returned on the second return value. The "losing" session thus sees
+//     an internal error, not a conflict, and can retry.
+//   - On appendFn success, the row transitions to Claimed and the second
+//     return value is nil. This makes the claim first-wins on the bus as
+//     well as in memory — the whole point of the PR.
+//
+// Holding a lock across disk I/O is deliberate. Claims are rare, appends are
+// local (<10ms typical), and correctness here beats throughput. See codex
+// review of PR#43.
 func (r *HandoffRegistry) ApplyClaim(
 	id, claimingSession string,
 	now time.Time,
-) ClaimResult {
+	appendFn func() error,
+) (ClaimResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	row, ok := r.rows[id]
 	if !ok {
-		return ClaimResult{Rejection: ClaimRejectedOfferNotFound}
+		return ClaimResult{Rejection: ClaimRejectedOfferNotFound}, nil
 	}
 	if row.State == HandoffStateClaimed || row.State == HandoffStateCompleted {
 		return ClaimResult{
 			Rejection:          ClaimRejectedAlreadyClaimed,
 			ConflictingSession: row.ClaimingSession,
-		}
+		}, nil
 	}
 	if row.IsExpired(now) {
-		return ClaimResult{Rejection: ClaimRejectedTTLExpired}
+		return ClaimResult{Rejection: ClaimRejectedTTLExpired}, nil
+	}
+	// All invariants pass — write to the bus FIRST, under the lock, so the
+	// winning claim is durable before the derived view reflects it.
+	if appendFn != nil {
+		if err := appendFn(); err != nil {
+			return ClaimResult{}, err
+		}
 	}
 	row.State = HandoffStateClaimed
 	row.ClaimingSession = claimingSession
 	row.ClaimedAt = now
 	cp := *row
-	return ClaimResult{Offer: &cp}
+	return ClaimResult{Offer: &cp}, nil
 }
 
-// ApplyComplete transitions a claimed handoff to completed. Returns
-// (&state, true) on success; returns (&state, false) with reason
-// ClaimRejectedOutOfOrder if called before claim; returns (nil, false) if
-// unknown (caller translates to 404 vs 409).
+// ApplyComplete transitions a claimed handoff to completed. Returns:
+//   - (nil,   ClaimRejectedOfferNotFound, nil)      when unknown     → 404.
+//   - (&row,  ClaimRejectedOutOfOrder,    nil)      not claimed yet  → 409.
+//   - (nil,   "",                         appendErr) append failed.
+//   - (&row,  "",                         nil)      success.
+//
+// appendFn runs under the lock AFTER the state-order check but BEFORE the
+// Completed transition commits; an error aborts the mutation.
 func (r *HandoffRegistry) ApplyComplete(
 	id, completingSession, outcome, notes, nextHandoffID string,
 	now time.Time,
-) (*HandoffState, ClaimRejection) {
+	appendFn func() error,
+) (*HandoffState, ClaimRejection, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	row, ok := r.rows[id]
 	if !ok {
-		return nil, ClaimRejectedOfferNotFound
+		return nil, ClaimRejectedOfferNotFound, nil
 	}
 	if row.State != HandoffStateClaimed {
 		cp := *row
-		return &cp, ClaimRejectedOutOfOrder
+		return &cp, ClaimRejectedOutOfOrder, nil
+	}
+	if appendFn != nil {
+		if err := appendFn(); err != nil {
+			return nil, "", err
+		}
 	}
 	row.State = HandoffStateCompleted
 	row.CompletingSession = completingSession
@@ -444,7 +556,7 @@ func (r *HandoffRegistry) ApplyComplete(
 	row.CompletionNotes = notes
 	row.NextHandoffID = nextHandoffID
 	cp := *row
-	return &cp, ""
+	return &cp, "", nil
 }
 
 // ─── Replay-from-bus warmers ─────────────────────────────────────────────────
@@ -454,6 +566,12 @@ func (r *HandoffRegistry) ApplyComplete(
 // function just gets the derived view ready for read-traffic before the HTTP
 // server starts serving. Errors are logged but non-fatal — an empty registry
 // is a safe degraded start.
+//
+// Events are sorted ascending by Seq before replay so the reconstructed
+// state is deterministic regardless of on-disk line order. ReadEvents
+// already de-dupes by Seq; a seq collision with conflicting payloads keeps
+// the FIRST occurrence (insertion order). Callers that need "last-write-wins
+// within a seq" semantics should not rely on replay ordering beyond Seq.
 func ReplaySessionRegistry(mgr *BusSessionManager, reg *SessionRegistry) error {
 	if mgr == nil || reg == nil {
 		return nil
@@ -463,6 +581,9 @@ func ReplaySessionRegistry(mgr *BusSessionManager, reg *SessionRegistry) error {
 		slog.Warn("sessions: replay read failed", "bus", BusSessions, "err", err)
 		return err
 	}
+	sort.SliceStable(events, func(i, j int) bool {
+		return events[i].Seq < events[j].Seq
+	})
 	// bridge-v0.1 payload shape: the entire session dict lives at the top
 	// level of the bus event's payload map. Some bridge code writes a
 	// nested "content" (the message text) plus flat fields; we tolerate
@@ -551,6 +672,9 @@ func ReplaySessionRegistry(mgr *BusSessionManager, reg *SessionRegistry) error {
 }
 
 // ReplayHandoffRegistry replays bus_handoffs into the handoff registry.
+// Events are sorted by Seq ascending before consumption so replay is
+// deterministic even if the on-disk file has out-of-order lines (e.g. from
+// a resumed write after crash). See also ReplaySessionRegistry.
 func ReplayHandoffRegistry(mgr *BusSessionManager, reg *HandoffRegistry) error {
 	if mgr == nil || reg == nil {
 		return nil
@@ -560,6 +684,9 @@ func ReplayHandoffRegistry(mgr *BusSessionManager, reg *HandoffRegistry) error {
 		slog.Warn("handoffs: replay read failed", "bus", BusHandoffs, "err", err)
 		return err
 	}
+	sort.SliceStable(events, func(i, j int) bool {
+		return events[i].Seq < events[j].Seq
+	})
 	for _, evt := range events {
 		payload := evt.Payload
 		if payload == nil {

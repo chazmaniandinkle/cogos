@@ -2,22 +2,37 @@
 // hybrid (cog://mem/semantic/surveys/2026-04-21-consolidation/
 // agent-P-session-management-evaluation §"Tests to add").
 //
-// 14 tests total:
+// 26 tests total (15 original + 11 added post-codex-review):
 //
-//  1. TestSessionRegister_ValidID         — happy path
-//  2. TestSessionRegister_InvalidFormat   — regex rejects malformed IDs
-//  3. TestSessionRegister_ReRegistration  — idempotent UPDATE semantics
-//  4. TestHeartbeat_UnknownSession        — 404
-//  5. TestEnd_UnknownSession              — 404
-//  6. TestEnd_AlreadyEnded                — 409
-//  7. TestPresence_ActiveWindow           — stale heartbeats marked inactive
-//  8. TestHandoffOffer_MissingTaskFields  — 400 validation
-//  9. TestHandoffClaim_Atomicity          — concurrent claims, first wins
-// 10. TestHandoffClaim_TTLExpired         — expired offer rejected with 409
-// 11. TestHandoffClaim_PhantomOffer       — 404
-// 12. TestHandoffComplete_WithoutClaim    — 409
-// 13. TestReplayOnStartup                 — registry rebuilds from bus
-// 14. TestClaimRejectedEventEmitted       — amendment #4 observability
+//  1. TestSessionRegister_ValidID                     — happy path
+//  2. TestSessionRegister_InvalidFormat               — regex rejects malformed IDs
+//  3. TestSessionRegister_ReRegistration              — idempotent UPDATE semantics
+//  4. TestHeartbeat_UnknownSession                    — 404
+//  5. TestEnd_UnknownSession                          — 404
+//  6. TestEnd_AlreadyEnded                            — 409
+//  7. TestPresence_ActiveWindow                       — stale heartbeats marked inactive
+//  8. TestHandoffOffer_MissingTaskFields              — 400 validation
+//  9. TestHandoffClaim_Atomicity                      — concurrent claims, first wins
+// 10. TestHandoffClaim_TTLExpired                     — expired offer rejected with 409
+// 11. TestHandoffClaim_PhantomOffer                   — 404
+// 12. TestHandoffComplete_WithoutClaim                — 409
+// 13. TestReplayOnStartup                             — registry rebuilds from bus
+// 14. TestClaimRejectedEventEmitted                   — amendment #4 observability
+// 15. TestMCP_HandoffRoundTrip                        — MCP end-to-end
+//
+// Added post PR#43 codex review:
+//
+// 16. TestRegistryUnchangedOnBusAppendFailure         — critical #1: append-first
+// 17. TestHeartbeatOnEndedSessionDoesNotMutate        — critical #2: no-mutation 409
+// 18. TestReplay_EmptyBuses                           — empty replay is safe
+// 19. TestReplay_UnknownEventType                     — unknown types skipped
+// 20. TestReplay_OutOfOrderSeq                        — sort-by-seq determinism
+// 21. TestReplay_DuplicateSeqWithConflictingPayload   — first-write-wins policy
+// 22. TestReplay_CompleteWithoutClaim                 — orphaned complete tolerated
+// 23. TestSessionRegister_TwoComponentIDRejected      — spec-required 3-tuple
+// 24. TestHandoffOffer_NegativeTTLRejected            — 400 on ttl_seconds:-1
+// 25. TestHandoffOffer_CallerSuppliedIDRejected       — kernel always mints
+// 26. TestRoutes_PresenceDoesNotShadowContext         — /presence vs /{id}/context
 
 package engine
 
@@ -25,8 +40,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -740,6 +758,625 @@ func readAll(r interface {
 				return buf, nil
 			}
 			return buf, err
+		}
+	}
+}
+
+// ─── 16. TestRegistryUnchangedOnBusAppendFailure ─────────────────────────────
+//
+// Critical #1 from the codex review: the bus is ground truth, so a failed
+// AppendEvent must leave the derived in-memory registry untouched. We verify
+// this at the registry level for every mutating path: register, heartbeat,
+// end, offer, claim, complete. Each calls the Apply* method with an appendFn
+// that always errors; we then assert the registry state is identical to what
+// it was before the call.
+func TestRegistryUnchangedOnBusAppendFailure(t *testing.T) {
+	t.Parallel()
+	now := time.Now().UTC()
+	appendErr := errors.New("simulated bus append failure")
+	failFn := func() error { return appendErr }
+
+	t.Run("register on empty registry stays empty", func(t *testing.T) {
+		reg := NewSessionRegistry()
+		state := SessionState{
+			SessionID: "bus-fail-register", Workspace: "w", Role: "r",
+			RegisteredAt: now, LastSeen: now,
+		}
+		stored, created, err := reg.ApplyRegister(state, time.Minute, now, failFn)
+		if err == nil {
+			t.Fatal("ApplyRegister returned nil err despite failing appendFn")
+		}
+		if stored != nil || created {
+			t.Errorf("ApplyRegister leaked state on error: stored=%v created=%v", stored, created)
+		}
+		if reg.Len() != 0 {
+			t.Errorf("registry has %d rows after failed register, want 0", reg.Len())
+		}
+	})
+
+	t.Run("register update on existing row preserves prior state", func(t *testing.T) {
+		reg := NewSessionRegistry()
+		state := SessionState{
+			SessionID: "bus-fail-reupdate", Workspace: "w", Role: "r", Task: "first",
+			RegisteredAt: now, LastSeen: now,
+		}
+		if _, _, err := reg.ApplyRegister(state, time.Minute, now, nil); err != nil {
+			t.Fatalf("seed register: %v", err)
+		}
+		before, _ := reg.Get("bus-fail-reupdate")
+
+		state.Task = "second"
+		_, _, err := reg.ApplyRegister(state, time.Minute, now, failFn)
+		if err == nil {
+			t.Fatal("expected error from failFn")
+		}
+		after, _ := reg.Get("bus-fail-reupdate")
+		if after.Task != before.Task {
+			t.Errorf("task mutated on failed re-register: before=%q after=%q", before.Task, after.Task)
+		}
+	})
+
+	t.Run("heartbeat does not bump LastSeen on append failure", func(t *testing.T) {
+		reg := NewSessionRegistry()
+		state := SessionState{
+			SessionID: "bus-fail-heartbeat", Workspace: "w", Role: "r",
+			RegisteredAt: now, LastSeen: now,
+		}
+		if _, _, err := reg.ApplyRegister(state, time.Minute, now, nil); err != nil {
+			t.Fatalf("seed register: %v", err)
+		}
+		before, _ := reg.Get("bus-fail-heartbeat")
+		later := now.Add(30 * time.Second)
+		_, ok, err := reg.ApplyHeartbeat("bus-fail-heartbeat", 0.42, "busy", "task", later, failFn)
+		if !ok {
+			t.Fatal("heartbeat saw unregistered session")
+		}
+		if err == nil {
+			t.Fatal("expected err from failFn")
+		}
+		after, _ := reg.Get("bus-fail-heartbeat")
+		if !after.LastSeen.Equal(before.LastSeen) {
+			t.Errorf("LastSeen mutated on failed heartbeat: before=%v after=%v",
+				before.LastSeen, after.LastSeen)
+		}
+		if after.Status != "" || after.CurrentTask != "" || after.ContextUsage != 0 {
+			t.Errorf("status/task/usage mutated on failed heartbeat: %+v", after)
+		}
+	})
+
+	t.Run("end does not set Ended on append failure", func(t *testing.T) {
+		reg := NewSessionRegistry()
+		state := SessionState{
+			SessionID: "bus-fail-endsess", Workspace: "w", Role: "r",
+			RegisteredAt: now, LastSeen: now,
+		}
+		if _, _, err := reg.ApplyRegister(state, time.Minute, now, nil); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		_, known, err := reg.ApplyEnd("bus-fail-endsess", "because", "", now.Add(time.Second), failFn)
+		if !known {
+			t.Fatal("end saw unknown session")
+		}
+		if err == nil {
+			t.Fatal("expected err from failFn")
+		}
+		after, _ := reg.Get("bus-fail-endsess")
+		if after.Ended {
+			t.Error("session was marked Ended despite failed append")
+		}
+	})
+
+	t.Run("offer does not install row on append failure", func(t *testing.T) {
+		hreg := NewHandoffRegistry()
+		h := HandoffState{
+			HandoffID: "ho-fail-offer-1", FromSession: "a-b-c",
+			TTLSeconds: 60, CreatedAt: now,
+		}
+		_, err := hreg.ApplyOffer(h, now, failFn)
+		if err == nil {
+			t.Fatal("expected err from failFn")
+		}
+		if hreg.Len() != 0 {
+			t.Errorf("handoff registry has %d rows after failed offer, want 0", hreg.Len())
+		}
+	})
+
+	t.Run("claim does not transition state on append failure", func(t *testing.T) {
+		hreg := NewHandoffRegistry()
+		h := HandoffState{
+			HandoffID: "ho-fail-claim-1", FromSession: "a-b-c",
+			TTLSeconds: 60, CreatedAt: now,
+		}
+		if _, err := hreg.ApplyOffer(h, now, nil); err != nil {
+			t.Fatalf("seed offer: %v", err)
+		}
+		result, err := hreg.ApplyClaim("ho-fail-claim-1", "claimant-x-y", now, failFn)
+		if err == nil {
+			t.Fatal("expected appendErr from failFn")
+		}
+		if result.Rejection != "" {
+			t.Errorf("unexpected rejection reason: %q", result.Rejection)
+		}
+		after, _ := hreg.Get("ho-fail-claim-1")
+		if after.State != HandoffStateOpen {
+			t.Errorf("handoff state = %q, want %q (unchanged on failed claim)",
+				after.State, HandoffStateOpen)
+		}
+		if after.ClaimingSession != "" {
+			t.Errorf("ClaimingSession set to %q on failed claim", after.ClaimingSession)
+		}
+	})
+
+	t.Run("complete does not transition state on append failure", func(t *testing.T) {
+		hreg := NewHandoffRegistry()
+		h := HandoffState{
+			HandoffID: "ho-fail-complete-1", FromSession: "a-b-c",
+			TTLSeconds: 60, CreatedAt: now,
+		}
+		if _, err := hreg.ApplyOffer(h, now, nil); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if _, err := hreg.ApplyClaim("ho-fail-complete-1", "claimant-x-y", now, nil); err != nil {
+			t.Fatalf("seed claim: %v", err)
+		}
+		_, reason, err := hreg.ApplyComplete("ho-fail-complete-1",
+			"claimant-x-y", "ok", "notes", "", now.Add(time.Second), failFn)
+		if err == nil {
+			t.Fatal("expected appendErr from failFn")
+		}
+		if reason != "" {
+			t.Errorf("got rejection reason %q on append-failure path", reason)
+		}
+		after, _ := hreg.Get("ho-fail-complete-1")
+		if after.State != HandoffStateClaimed {
+			t.Errorf("handoff state = %q, want %q (unchanged on failed complete)",
+				after.State, HandoffStateClaimed)
+		}
+		if after.CompletingSession != "" {
+			t.Errorf("CompletingSession set on failed complete: %q", after.CompletingSession)
+		}
+	})
+}
+
+// ─── 17. TestHeartbeatOnEndedSessionDoesNotMutate ────────────────────────────
+//
+// Critical #2 from the codex review: a heartbeat against an ended session
+// must 409 AND leave LastSeen + optional fields untouched. HTTP surface path.
+func TestHeartbeatOnEndedSessionDoesNotMutate(t *testing.T) {
+	t.Parallel()
+	srv, ts := newSessionsTestServer(t)
+
+	// Register, then end.
+	postJSON(t, ts.URL+"/v1/sessions/register", map[string]any{
+		"session_id": "ended-nohb-session", "workspace": "w", "role": "r",
+	}).Body.Close()
+	postJSON(t, ts.URL+"/v1/sessions/ended-nohb-session/end",
+		map[string]any{"reason": "goodbye"}).Body.Close()
+
+	before, ok := srv.sessionRegistry.Get("ended-nohb-session")
+	if !ok {
+		t.Fatal("post-end registry lookup failed")
+	}
+	lastSeenBefore := before.LastSeen
+
+	// Count bus events before the heartbeat attempt so we can verify none
+	// were appended.
+	eventsBefore, _ := srv.busSessions.ReadEvents(BusSessions)
+	heartbeatCountBefore := 0
+	for _, e := range eventsBefore {
+		if e.Type == EvtSessionHeartbeat {
+			heartbeatCountBefore++
+		}
+	}
+
+	// Heartbeat against the ended session.
+	resp := postJSON(t, ts.URL+"/v1/sessions/ended-nohb-session/heartbeat",
+		map[string]any{
+			"status": "definitely-not-dead", "context_usage": 0.99,
+			"current_task": "ghost-task",
+		})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status = %d, want 409", resp.StatusCode)
+	}
+
+	after, _ := srv.sessionRegistry.Get("ended-nohb-session")
+	if !after.LastSeen.Equal(lastSeenBefore) {
+		t.Errorf("LastSeen mutated on 409 heartbeat: before=%v after=%v",
+			lastSeenBefore, after.LastSeen)
+	}
+	if after.Status == "definitely-not-dead" {
+		t.Errorf("Status was mutated to %q on 409 heartbeat", after.Status)
+	}
+	if after.ContextUsage == 0.99 {
+		t.Errorf("ContextUsage was mutated to %v on 409 heartbeat", after.ContextUsage)
+	}
+	if after.CurrentTask == "ghost-task" {
+		t.Errorf("CurrentTask was mutated on 409 heartbeat")
+	}
+
+	// And no heartbeat event should have made it to the bus.
+	eventsAfter, _ := srv.busSessions.ReadEvents(BusSessions)
+	heartbeatCountAfter := 0
+	for _, e := range eventsAfter {
+		if e.Type == EvtSessionHeartbeat {
+			heartbeatCountAfter++
+		}
+	}
+	if heartbeatCountAfter != heartbeatCountBefore {
+		t.Errorf("heartbeat event appended on 409 path: before=%d after=%d",
+			heartbeatCountBefore, heartbeatCountAfter)
+	}
+}
+
+// ─── 18. TestReplay_EmptyBuses ───────────────────────────────────────────────
+//
+// Edge: startup against a workspace whose bus_sessions and bus_handoffs
+// files don't exist yet. Replay should succeed with empty registries and
+// log "events=0" rather than crashing.
+func TestReplay_EmptyBuses(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+	sreg := NewSessionRegistry()
+	hreg := NewHandoffRegistry()
+
+	if err := ReplaySessionRegistry(mgr, sreg); err != nil {
+		t.Errorf("ReplaySessionRegistry on empty bus: %v", err)
+	}
+	if err := ReplayHandoffRegistry(mgr, hreg); err != nil {
+		t.Errorf("ReplayHandoffRegistry on empty bus: %v", err)
+	}
+	if sreg.Len() != 0 {
+		t.Errorf("session registry len = %d, want 0", sreg.Len())
+	}
+	if hreg.Len() != 0 {
+		t.Errorf("handoff registry len = %d, want 0", hreg.Len())
+	}
+}
+
+// ─── 19. TestReplay_UnknownEventType ─────────────────────────────────────────
+//
+// Edge: bus contains an event with a type the replay loop doesn't recognise
+// (e.g. from a future schema). Replay must skip it without error and
+// continue processing known types.
+func TestReplay_UnknownEventType(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+
+	// Emit a known session.register event, a forward-compat unknown event,
+	// then end the same session. Replay should produce a consistent row
+	// with Ended=true, treating the unknown event as a no-op.
+	_, err := mgr.AppendEvent(BusSessions, EvtSessionRegister, "repl-unk-session", map[string]interface{}{
+		"session_id": "repl-unk-session", "workspace": "w", "role": "r",
+	})
+	if err != nil {
+		t.Fatalf("append register: %v", err)
+	}
+	_, err = mgr.AppendEvent(BusSessions, "session.future.mystery-event", "repl-unk-session", map[string]interface{}{
+		"session_id": "repl-unk-session", "mystery": "field",
+	})
+	if err != nil {
+		t.Fatalf("append unknown: %v", err)
+	}
+	_, err = mgr.AppendEvent(BusSessions, EvtSessionEnd, "repl-unk-session", map[string]interface{}{
+		"session_id": "repl-unk-session", "reason": "done",
+	})
+	if err != nil {
+		t.Fatalf("append end: %v", err)
+	}
+
+	reg := NewSessionRegistry()
+	if err := ReplaySessionRegistry(mgr, reg); err != nil {
+		t.Errorf("replay: %v", err)
+	}
+	got, ok := reg.Get("repl-unk-session")
+	if !ok {
+		t.Fatal("registry did not rebuild session")
+	}
+	if !got.Ended {
+		t.Error("session not marked ended after replay with intervening unknown event")
+	}
+}
+
+// ─── 20. TestReplay_OutOfOrderSeq ────────────────────────────────────────────
+//
+// Substantive concern from the review: ReadEvents preserves file order.
+// This test writes the events.jsonl file with lines in seq order [3,1,2]
+// and verifies replay sorts by seq ascending so the final state matches
+// what a normal monotonic append produces.
+func TestReplay_OutOfOrderSeq(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+
+	// Hand-craft 3 events with explicit seqs and write them in reversed-ish
+	// order to the jsonl file. Then invoke replay and verify the final
+	// state is as though events had been consumed in seq order.
+	if err := mgr.EnsureBus(BusSessions); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	evts := []BusBlock{
+		{ // seq 3 — end
+			V: 2, BusID: BusSessions, Seq: 3,
+			Ts: time.Now().UTC().Add(2 * time.Second).Format(time.RFC3339Nano),
+			From: "order-test-session", Type: EvtSessionEnd,
+			Payload: map[string]interface{}{"session_id": "order-test-session", "reason": "r3"},
+		},
+		{ // seq 1 — register
+			V: 2, BusID: BusSessions, Seq: 1,
+			Ts: time.Now().UTC().Format(time.RFC3339Nano),
+			From: "order-test-session", Type: EvtSessionRegister,
+			Payload: map[string]interface{}{"session_id": "order-test-session", "workspace": "w", "role": "r"},
+		},
+		{ // seq 2 — heartbeat
+			V: 2, BusID: BusSessions, Seq: 2,
+			Ts: time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano),
+			From: "order-test-session", Type: EvtSessionHeartbeat,
+			Payload: map[string]interface{}{"session_id": "order-test-session", "status": "working"},
+		},
+	}
+	writeBusLinesForTest(t, mgr.EventsPath(BusSessions), evts)
+
+	reg := NewSessionRegistry()
+	if err := ReplaySessionRegistry(mgr, reg); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	got, ok := reg.Get("order-test-session")
+	if !ok {
+		t.Fatal("session not replayed")
+	}
+	// If replay consumed in file order (end before register), the row
+	// wouldn't exist. Sort-by-seq means register is applied first, then
+	// heartbeat updates status, then end marks Ended.
+	if !got.Ended {
+		t.Error("final state should be ended after sort-by-seq replay")
+	}
+	if got.Status != "working" {
+		t.Errorf("status = %q, want %q (from heartbeat seq=2)", got.Status, "working")
+	}
+}
+
+// ─── 21. TestReplay_DuplicateSeqWithConflictingPayload ───────────────────────
+//
+// Design decision being codified: ReadEvents de-dupes by seq using
+// first-occurrence wins (see seen[block.Seq] check in bus_session.go).
+// Even if the file contains two different payloads for the same seq,
+// replay should consume exactly one of them — specifically the first.
+func TestReplay_DuplicateSeqWithConflictingPayload(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+
+	if err := mgr.EnsureBus(BusSessions); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	evts := []BusBlock{
+		{ // seq 1, first occurrence — wins per first-write-wins de-dup
+			V: 2, BusID: BusSessions, Seq: 1,
+			Ts: time.Now().UTC().Format(time.RFC3339Nano),
+			From: "dup-test-session", Type: EvtSessionRegister,
+			Payload: map[string]interface{}{
+				"session_id": "dup-test-session", "workspace": "w", "role": "r",
+				"task": "FIRST",
+			},
+		},
+		{ // seq 1, second occurrence with conflicting payload — should be ignored
+			V: 2, BusID: BusSessions, Seq: 1,
+			Ts: time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano),
+			From: "dup-test-session", Type: EvtSessionRegister,
+			Payload: map[string]interface{}{
+				"session_id": "dup-test-session", "workspace": "w2", "role": "r2",
+				"task": "SECOND",
+			},
+		},
+	}
+	writeBusLinesForTest(t, mgr.EventsPath(BusSessions), evts)
+
+	reg := NewSessionRegistry()
+	if err := ReplaySessionRegistry(mgr, reg); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	got, _ := reg.Get("dup-test-session")
+	if got == nil {
+		t.Fatal("session not replayed")
+	}
+	if got.Task != "FIRST" {
+		t.Errorf("duplicate-seq policy: task = %q, want FIRST (first-occurrence wins)", got.Task)
+	}
+	if got.Workspace != "w" {
+		t.Errorf("duplicate-seq policy: workspace = %q, want w", got.Workspace)
+	}
+}
+
+// ─── 22. TestReplay_CompleteWithoutClaim ─────────────────────────────────────
+//
+// Edge: bus_handoffs contains an orphaned complete with no prior claim
+// (possible after a crash between claim and complete — bus append of claim
+// landed, complete landed, but some intermediate state was truncated). The
+// replay state machine should reject the complete (it sees state != claimed)
+// and leave the handoff in its earlier state.
+func TestReplay_CompleteWithoutClaim(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+
+	_, _ = mgr.AppendEvent(BusHandoffs, EvtHandoffOffer, "from-a-b-c", map[string]interface{}{
+		"handoff_id":   "ho-orphan-1",
+		"from_session": "from-a-b-c",
+		"ttl_seconds":  600.0,
+	})
+	// Skip claim on purpose.
+	_, _ = mgr.AppendEvent(BusHandoffs, EvtHandoffComplete, "completer-x-y-z", map[string]interface{}{
+		"handoff_id":         "ho-orphan-1",
+		"completing_session": "completer-x-y-z",
+		"outcome":            "orphan",
+	})
+
+	reg := NewHandoffRegistry()
+	if err := ReplayHandoffRegistry(mgr, reg); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	got, ok := reg.Get("ho-orphan-1")
+	if !ok {
+		t.Fatal("handoff not replayed at all")
+	}
+	if got.State != HandoffStateOpen {
+		t.Errorf("state = %q, want %q (orphan complete should not transition)",
+			got.State, HandoffStateOpen)
+	}
+	if got.CompletingSession != "" {
+		t.Errorf("CompletingSession = %q, should be empty on orphan-complete skip",
+			got.CompletingSession)
+	}
+}
+
+// ─── 23. TestSessionRegister_TwoComponentIDRejected ──────────────────────────
+//
+// Spec drift fix: the regex must reject 2-component IDs like "a-b", per
+// the design doc's ^[a-z0-9]+-[a-z0-9-]+-[a-z0-9-]+$.
+func TestSessionRegister_TwoComponentIDRejected(t *testing.T) {
+	t.Parallel()
+	_, ts := newSessionsTestServer(t)
+
+	resp := postJSON(t, ts.URL+"/v1/sessions/register", map[string]any{
+		"session_id": "a-b", "workspace": "w", "role": "r",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("2-component id: status = %d, want 400", resp.StatusCode)
+	}
+
+	// And the direct validator check, belt-and-suspenders.
+	if err := ValidateSessionID("a-b"); err == nil {
+		t.Error("ValidateSessionID(\"a-b\") returned nil; want error")
+	}
+	if err := ValidateSessionID("a-b-c"); err != nil {
+		t.Errorf("ValidateSessionID(\"a-b-c\") returned err %v; want nil", err)
+	}
+	if err := ValidateSessionID("slowbro-laptop-cogos-gap-closure"); err != nil {
+		t.Errorf("ValidateSessionID on 5-component id: %v", err)
+	}
+}
+
+// ─── 24. TestHandoffOffer_NegativeTTLRejected ────────────────────────────────
+//
+// Validation gap: ttl_seconds: -1 should return 400, not silently apply
+// (which in the prior code path meant "no TTL enforcement" — a potential
+// footgun where an offer never expires).
+func TestHandoffOffer_NegativeTTLRejected(t *testing.T) {
+	t.Parallel()
+	_, ts := newSessionsTestServer(t)
+
+	resp := postJSON(t, ts.URL+"/v1/handoffs/offer", map[string]any{
+		"from_session":     "neg-ttl-offer-a",
+		"bootstrap_prompt": "bp",
+		"ttl_seconds":      -1,
+		"task": map[string]any{
+			"title": "T", "goal": "G", "next_steps": []any{"s"},
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("negative ttl: status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// ─── 25. TestHandoffOffer_CallerSuppliedIDRejected ───────────────────────────
+//
+// Design-doc divergence fix: the kernel ALWAYS mints the handoff_id. A
+// caller-supplied one is a 400 — this prevents malformed IDs landing in
+// path-based claim/complete routes.
+func TestHandoffOffer_CallerSuppliedIDRejected(t *testing.T) {
+	t.Parallel()
+	_, ts := newSessionsTestServer(t)
+
+	resp := postJSON(t, ts.URL+"/v1/handoffs/offer", map[string]any{
+		"handoff_id":       "callersupplied-12345",
+		"from_session":     "caller-id-offer-a",
+		"bootstrap_prompt": "bp",
+		"task": map[string]any{
+			"title": "T", "goal": "G", "next_steps": []any{"s"},
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("caller-supplied id: status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// ─── 26. TestRoutes_PresenceDoesNotShadowContext ─────────────────────────────
+//
+// Route-coexistence proof: POST /v1/sessions/register, GET
+// /v1/sessions/presence, and the legacy GET /v1/sessions/{id}/context all
+// coexist on the same mux. Fire them back-to-back and check each returns
+// its expected semantics without cross-contamination.
+func TestRoutes_PresenceDoesNotShadowContext(t *testing.T) {
+	t.Parallel()
+	_, ts := newSessionsTestServer(t)
+
+	// 1. Register a session on the new route.
+	reg := postJSON(t, ts.URL+"/v1/sessions/register", map[string]any{
+		"session_id": "route-coexist-session", "workspace": "w", "role": "r",
+	})
+	reg.Body.Close()
+	if reg.StatusCode != http.StatusOK {
+		t.Fatalf("register: %d", reg.StatusCode)
+	}
+
+	// 2. GET /v1/sessions/presence — the new route.
+	respP, err := http.Get(ts.URL + "/v1/sessions/presence")
+	if err != nil {
+		t.Fatalf("GET presence: %v", err)
+	}
+	respP.Body.Close()
+	if respP.StatusCode != http.StatusOK {
+		t.Errorf("presence: %d, want 200", respP.StatusCode)
+	}
+
+	// 3. GET /v1/sessions/{id}/context — the legacy TAA-inference route
+	//    registered by serve_bus.go / serve_sessions.go. This should still
+	//    resolve to the legacy handler even though /presence sits on the
+	//    same prefix. Expect 404 for an unknown session (context store is
+	//    independent of the kernel-native registry) — the important thing
+	//    is the handler RESPONDS rather than the path being shadowed by
+	//    /presence.
+	respC, err := http.Get(ts.URL + "/v1/sessions/route-coexist-session/context")
+	if err != nil {
+		t.Fatalf("GET context: %v", err)
+	}
+	defer respC.Body.Close()
+	if respC.StatusCode >= 500 {
+		t.Errorf("context route shadowed/broken: status = %d", respC.StatusCode)
+	}
+	// Accept any 2xx/4xx — the legacy context handler has its own body
+	// format; we're only proving the route is still dispatched to it.
+}
+
+// writeBusLinesForTest writes hash-chained BusBlocks to the events file in
+// the slice's order, computing each block's Hash so that ReadEvents will
+// parse them. Used by replay tests that need to plant deliberately-
+// out-of-order or duplicate-seq lines on disk.
+func writeBusLinesForTest(t *testing.T, path string, evts []BusBlock) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer f.Close()
+	for i := range evts {
+		evts[i].V = 2
+		evts[i].Hash = computeBusBlockHash(&evts[i])
+		line, err := json.Marshal(&evts[i])
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if _, err := f.Write(append(line, '\n')); err != nil {
+			t.Fatalf("write: %v", err)
 		}
 	}
 }

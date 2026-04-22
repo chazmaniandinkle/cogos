@@ -46,7 +46,7 @@ func (m *MCPServer) registerSessionTools() {
 		Name: "cog_register_session",
 		Description: "Register (or idempotently update) a session on " +
 			"bus_sessions. Validates the session_id format " +
-			"(lowercase, hyphen-separated, ≥2 components). Required: " +
+			"(lowercase, hyphen-separated, 3-component required). Required: " +
 			"session_id, workspace, role. Optional: task, model, hostname, " +
 			"status, current_task, context_usage.",
 	}, withToolObserver(m, "cog_register_session", m.toolRegisterSession))
@@ -189,25 +189,27 @@ func (m *MCPServer) toolRegisterSession(ctx context.Context, req *mcp.CallToolRe
 		ContextUsage: in.ContextUsage, Status: in.Status, CurrentTask: in.CurrentTask,
 		Extras: in.Extras, RegisteredAt: now, LastSeen: now,
 	}
-	stored, created, err := m.sessionRegistry.ApplyRegister(
-		state, time.Duration(defaultActiveWithinSeconds)*time.Second, now,
-	)
-	if err != nil {
-		return textResult(err.Error())
-	}
 	payload := map[string]interface{}{
 		"session_id": in.SessionID, "workspace": in.Workspace, "role": in.Role,
 		"task": in.Task, "model": in.Model, "hostname": in.Hostname,
 		"status": in.Status, "current_task": in.CurrentTask,
 		"context_usage": in.ContextUsage,
-		"registered_at": stored.RegisteredAt.Format(time.RFC3339Nano),
+		"registered_at": now.Format(time.RFC3339Nano),
 	}
 	for k, v := range in.Extras {
 		if _, exists := payload[k]; !exists {
 			payload[k] = v
 		}
 	}
-	evt, err := m.busSessions.AppendEvent(BusSessions, EvtSessionRegister, in.SessionID, payload)
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = m.busSessions.AppendEvent(BusSessions, EvtSessionRegister, in.SessionID, payload)
+		return err
+	}
+	stored, created, err := m.sessionRegistry.ApplyRegister(
+		state, time.Duration(defaultActiveWithinSeconds)*time.Second, now, appendFn,
+	)
 	if err != nil {
 		return fallbackResult(fmt.Sprintf("bus append failed: %v", err), "")
 	}
@@ -226,20 +228,29 @@ func (m *MCPServer) toolHeartbeatSession(ctx context.Context, req *mcp.CallToolR
 		return textResult(err.Error())
 	}
 	now := time.Now().UTC()
-	stored, ok := m.sessionRegistry.ApplyHeartbeat(in.SessionID, in.ContextUsage, in.Status, in.CurrentTask, now)
-	if !ok {
-		return textResult(fmt.Sprintf("session %q is not registered", in.SessionID))
-	}
-	if stored.Ended {
-		return textResult(fmt.Sprintf("session %q is already ended", in.SessionID))
-	}
 	payload := map[string]interface{}{
 		"session_id": in.SessionID, "status": in.Status,
 		"context_usage": in.ContextUsage, "current_task": in.CurrentTask,
 		"at": now.Format(time.RFC3339Nano),
 	}
-	evt, err := m.busSessions.AppendEvent(BusSessions, EvtSessionHeartbeat, in.SessionID, payload)
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = m.busSessions.AppendEvent(BusSessions, EvtSessionHeartbeat, in.SessionID, payload)
+		return err
+	}
+	stored, ok, err := m.sessionRegistry.ApplyHeartbeat(
+		in.SessionID, in.ContextUsage, in.Status, in.CurrentTask, now, appendFn,
+	)
+	if !ok {
+		return textResult(fmt.Sprintf("session %q is not registered", in.SessionID))
+	}
 	if err != nil {
+		// Ended-session rejection or append failure. Ended is recognised
+		// by the unchanged stored.Ended flag and evt==nil.
+		if stored != nil && stored.Ended && evt == nil {
+			return textResult(fmt.Sprintf("session %q is already ended", in.SessionID))
+		}
 		return fallbackResult(fmt.Sprintf("bus append failed: %v", err), "")
 	}
 	return marshalResult(map[string]any{
@@ -256,21 +267,26 @@ func (m *MCPServer) toolEndSession(ctx context.Context, req *mcp.CallToolRequest
 		return textResult(err.Error())
 	}
 	now := time.Now().UTC()
-	stored, known, err := m.sessionRegistry.ApplyEnd(in.SessionID, in.Reason, in.HandoffID, now)
-	if !known {
-		return textResult(fmt.Sprintf("session %q is not registered", in.SessionID))
-	}
-	if err != nil {
-		return textResult(err.Error())
-	}
 	payload := map[string]interface{}{
 		"session_id": in.SessionID, "reason": in.Reason,
 		"handoff_id": in.HandoffID,
 		"ended_at":   now.Format(time.RFC3339Nano),
 	}
-	evt, errEmit := m.busSessions.AppendEvent(BusSessions, EvtSessionEnd, in.SessionID, payload)
-	if errEmit != nil {
-		return fallbackResult(fmt.Sprintf("bus append failed: %v", errEmit), "")
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = m.busSessions.AppendEvent(BusSessions, EvtSessionEnd, in.SessionID, payload)
+		return err
+	}
+	stored, known, err := m.sessionRegistry.ApplyEnd(in.SessionID, in.Reason, in.HandoffID, now, appendFn)
+	if !known {
+		return textResult(fmt.Sprintf("session %q is not registered", in.SessionID))
+	}
+	if err != nil {
+		if evt == nil && stored != nil && stored.Ended {
+			return textResult(err.Error())
+		}
+		return fallbackResult(fmt.Sprintf("bus append failed: %v", err), "")
 	}
 	return marshalResult(map[string]any{
 		"ok": true, "session_id": in.SessionID,
@@ -331,6 +347,9 @@ func (m *MCPServer) toolOfferHandoff(ctx context.Context, req *mcp.CallToolReque
 	if steps, ok := in.Task["next_steps"].([]interface{}); !ok || len(steps) == 0 {
 		return textResult("task.next_steps must be a non-empty list")
 	}
+	if in.TTLSeconds < 0 {
+		return textResult("ttl_seconds must be >= 0")
+	}
 	if in.TTLSeconds == 0 {
 		in.TTLSeconds = 3600
 	}
@@ -356,9 +375,14 @@ func (m *MCPServer) toolOfferHandoff(ctx context.Context, req *mcp.CallToolReque
 		"memory_refs":      in.MemoryRefs,
 	}
 	state.OfferPayload = payload
-	stored := m.handoffRegistry.ApplyOffer(state, now)
 
-	evt, err := m.busSessions.AppendEvent(BusHandoffs, EvtHandoffOffer, in.FromSession, payload)
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = m.busSessions.AppendEvent(BusHandoffs, EvtHandoffOffer, in.FromSession, payload)
+		return err
+	}
+	stored, err := m.handoffRegistry.ApplyOffer(state, now, appendFn)
 	if err != nil {
 		return fallbackResult(fmt.Sprintf("bus append failed: %v", err), "")
 	}
@@ -406,29 +430,33 @@ func (m *MCPServer) toolClaimHandoff(ctx context.Context, req *mcp.CallToolReque
 		return textResult("claiming_session: " + err.Error())
 	}
 	now := time.Now().UTC()
-	result := m.handoffRegistry.ApplyClaim(in.HandoffID, in.ClaimingSession, now)
-	if result.Rejection != "" {
-		// Emit the claim_rejected event for observability (amendment #4).
-		payload := map[string]interface{}{
-			"handoff_id":         in.HandoffID,
-			"attempting_session": in.ClaimingSession,
-			"reason":             string(result.Rejection),
-			"rejected_at":        now.Format(time.RFC3339Nano),
-		}
-		if result.ConflictingSession != "" {
-			payload["conflicting_session"] = result.ConflictingSession
-		}
-		_, _ = m.busSessions.AppendEvent(BusHandoffs, EvtHandoffClaimRejected, in.ClaimingSession, payload)
-		return textResult(fmt.Sprintf("claim rejected: %s", result.Rejection))
-	}
 	claimPayload := map[string]interface{}{
 		"handoff_id":       in.HandoffID,
 		"claiming_session": in.ClaimingSession,
 		"claimed_at":       now.Format(time.RFC3339Nano),
 	}
-	evt, err := m.busSessions.AppendEvent(BusHandoffs, EvtHandoffClaim, in.ClaimingSession, claimPayload)
-	if err != nil {
-		return fallbackResult(fmt.Sprintf("bus append failed: %v", err), "")
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = m.busSessions.AppendEvent(BusHandoffs, EvtHandoffClaim, in.ClaimingSession, claimPayload)
+		return err
+	}
+	result, appendErr := m.handoffRegistry.ApplyClaim(in.HandoffID, in.ClaimingSession, now, appendFn)
+	if appendErr != nil {
+		return fallbackResult(fmt.Sprintf("bus append failed: %v", appendErr), "")
+	}
+	if result.Rejection != "" {
+		// Emit claim_rejected (amendment #4). Always include
+		// conflicting_session even when empty — stable schema for audit.
+		payload := map[string]interface{}{
+			"handoff_id":          in.HandoffID,
+			"attempting_session":  in.ClaimingSession,
+			"conflicting_session": result.ConflictingSession,
+			"reason":              string(result.Rejection),
+			"rejected_at":         now.Format(time.RFC3339Nano),
+		}
+		_, _ = m.busSessions.AppendEvent(BusHandoffs, EvtHandoffClaimRejected, in.ClaimingSession, payload)
+		return textResult(fmt.Sprintf("claim rejected: %s", result.Rejection))
 	}
 	return marshalResult(map[string]any{
 		"ok":         true,
@@ -454,15 +482,6 @@ func (m *MCPServer) toolCompleteHandoff(ctx context.Context, req *mcp.CallToolRe
 		return textResult("outcome is required")
 	}
 	now := time.Now().UTC()
-	stored, reason := m.handoffRegistry.ApplyComplete(
-		in.HandoffID, in.CompletingSession, in.Outcome, in.Notes, in.NextHandoffID, now,
-	)
-	if reason == ClaimRejectedOfferNotFound {
-		return textResult(fmt.Sprintf("handoff %q not found", in.HandoffID))
-	}
-	if reason == ClaimRejectedOutOfOrder {
-		return textResult(fmt.Sprintf("handoff %q cannot complete in state %q", in.HandoffID, stored.State))
-	}
 	payload := map[string]interface{}{
 		"handoff_id":         in.HandoffID,
 		"completing_session": in.CompletingSession,
@@ -471,9 +490,23 @@ func (m *MCPServer) toolCompleteHandoff(ctx context.Context, req *mcp.CallToolRe
 		"next_handoff_id":    in.NextHandoffID,
 		"completed_at":       now.Format(time.RFC3339Nano),
 	}
-	evt, err := m.busSessions.AppendEvent(BusHandoffs, EvtHandoffComplete, in.CompletingSession, payload)
-	if err != nil {
-		return fallbackResult(fmt.Sprintf("bus append failed: %v", err), "")
+	var evt *BusBlock
+	appendFn := func() error {
+		var err error
+		evt, err = m.busSessions.AppendEvent(BusHandoffs, EvtHandoffComplete, in.CompletingSession, payload)
+		return err
+	}
+	stored, reason, appendErr := m.handoffRegistry.ApplyComplete(
+		in.HandoffID, in.CompletingSession, in.Outcome, in.Notes, in.NextHandoffID, now, appendFn,
+	)
+	if appendErr != nil {
+		return fallbackResult(fmt.Sprintf("bus append failed: %v", appendErr), "")
+	}
+	if reason == ClaimRejectedOfferNotFound {
+		return textResult(fmt.Sprintf("handoff %q not found", in.HandoffID))
+	}
+	if reason == ClaimRejectedOutOfOrder {
+		return textResult(fmt.Sprintf("handoff %q cannot complete in state %q", in.HandoffID, stored.State))
 	}
 	return marshalResult(map[string]any{
 		"ok":         true,
