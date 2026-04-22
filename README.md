@@ -19,17 +19,26 @@ make build && ./cogos serve --workspace ~/my-project
 
 - **Multi-provider routing** -- OpenAI-compatible and Anthropic Messages-compatible HTTP API. Works with Ollama, LM Studio, Claude, and any OpenAI-compatible endpoint. Local models preferred by default.
 
-- **Content-addressed storage** -- CogBlock protocol for content-addressed, hash-chained records. Every routing decision, context assembly, and state transition is recorded in an append-only ledger (SHA-256, RFC 8785).
+- **Hash-chained ledger** -- CogBlock protocol for content-addressed, hash-chained records. Every routing decision, context assembly, state transition, turn completion, tool call, and config mutation is recorded in an append-only ledger (SHA-256, RFC 8785) with optional chain verification.
+
+- **Three observability lanes** -- The kernel exposes ledger (durable hash-chained events), traces (client metabolites + attention + proprioceptive state), and kernel slog (structured runtime logs) as non-overlapping surfaces. Each has a dedicated MCP tool, HTTP endpoint, and on-disk format.
+
+- **Live event bus** -- `AppendEvent` fans into an in-process broker with SSE streaming at `/v1/bus/:id/events/stream`. Subscribers see writes in real time; offline writers go straight to JSONL.
+
+- **Conversation persistence** -- `turn.completed` ledger events plus a per-session sidecar at `.cog/run/turns/<sessionID>.jsonl` preserve full prompt and response text (8KB / 16KB truncated previews in ledger, full body in sidecar).
+
+- **Config mutation API** -- `cog_read_config` / `cog_write_config` / `cog_rollback_config` MCP tools and matching REST surface. RFC 7396 merge-patch semantics with atomic writes and rotating backups.
 
 - **Library extraction** -- Seven importable Go packages in `pkg/` covering the core type system: content-addressed blocks, coordination primitives, BEP wire protocol, reconciliation framework, modality bus, field graph types, and URI parsing. All usable independently of the kernel.
 
-- **Native agent harness** -- A homeostatic agent loop that runs as a goroutine inside the kernel process. Calls Gemma E4B via Ollama's native `/api/chat` endpoint with six kernel-native tools. Adaptive interval (5m-30m) based on assessment urgency, with panic recovery.
+- **Native agent harness** -- A homeostatic agent loop that runs as a goroutine inside the kernel process. Calls Gemma E4B via Ollama's native `/api/chat` endpoint with six kernel-native tools. Adaptive interval (5m-30m) based on assessment urgency, with panic recovery. Loop triggers, state snapshots, and listings now reachable over MCP and REST.
 
-- **MCP Streamable HTTP** -- Full MCP transport at `POST /mcp` with JSON-RPC 2.0, session management, and 30-minute expiry. Exposes 8 tools: 4 kernel-native (memory search/read/write, coherence check) and 4 Mod3 voice tools bridged through the kernel.
+- **MCP Streamable HTTP** -- Full MCP transport at `POST /mcp` with JSON-RPC 2.0, session management, and 30-minute expiry. Always-on (no build tag). 22 tools spanning observability, agent control, config, memory, and voice.
 
 - **Anthropic Messages API proxy** -- Transparent proxy at `POST /v1/messages` that forwards to the real Anthropic API with streaming SSE passthrough. Enables `cog claude` to route Claude Code through the kernel via `ANTHROPIC_BASE_URL`.
 
 - **Foveated decomposition pipeline** -- `cog decompose` processes any input through E4B into four tiers: Tier 0 (one-sentence, ~15 tokens), Tier 1 (paragraph, ~100 tokens), Tier 2 (full CogDoc with sections and embeddings), Tier 3 (raw, gated). Includes an interactive workbench TUI (`--workbench`), embedding co-generation via nomic-embed-text, content-addressed CogDoc storage, and bus event emission for observability. This is the DECOMPOSE stage of the CogOS Hypercycle.
+
 ---
 
 ## Architecture
@@ -37,22 +46,24 @@ make build && ./cogos serve --workspace ~/my-project
 CogOS runs as a single Go binary daemon. The kernel has three layers:
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Membrane          HTTP API · MCP Server · Provider Router│
-├──────────────────────────────────────────────────────────┤
-│  Workspace          Context Engine · Memory · Ledger      │
-│                     Salience Scorer · Blob Store          │
-├──────────────────────────────────────────────────────────┤
-│  Nucleus            Process Loop · Identity · State FSM   │
-│                     Agent Harness · CogBus                │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Membrane          HTTP API · MCP Server · Provider Router   │
+│                    Event Broker (SSE) · Config API           │
+├──────────────────────────────────────────────────────────────┤
+│  Workspace         Context Engine · Memory · Ledger          │
+│                    Salience Scorer · Blob Store · Traces     │
+│                    Conversation Sidecars · Kernel Slog       │
+├──────────────────────────────────────────────────────────────┤
+│  Nucleus           Process Loop · Identity · State FSM       │
+│                    Agent Harness · CogBus · Tool-call Gate   │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-**Membrane** -- The API surface. Serves OpenAI and Anthropic-compatible chat endpoints, an MCP Streamable HTTP server, the Anthropic Messages API proxy, and foveated context assembly. Routes inference requests to local or cloud providers.
+**Membrane** -- The API surface. Serves OpenAI and Anthropic-compatible chat endpoints, the always-on MCP Streamable HTTP server, the Anthropic Messages API proxy, the event broker with SSE streaming, the config mutation API, and foveated context assembly. Routes inference requests to local or cloud providers. Binds to `127.0.0.1:6931` by default; `--bind` or `bind_addr` in YAML relaxes CORS when set to a non-loopback interface.
 
-**Workspace** -- Where state lives. The context engine scores documents and arranges them into stability zones optimized for KV cache reuse. The ledger is append-only and hash-chained. Memory persists across sessions.
+**Workspace** -- Where state lives. The context engine scores documents and arranges them into stability zones optimized for KV cache reuse. The ledger is append-only and hash-chained. Traces capture attention, proprioceptive state, and internal request metabolites. Conversation sidecars persist full turn text. Memory persists across sessions.
 
-**Nucleus** -- The process loop. Runs continuously through four states (Active, Receptive, Consolidating, Dormant). Manages identity, consolidation, workspace lifecycle, and the homeostatic agent harness.
+**Nucleus** -- The process loop. Runs continuously through four states (Active, Receptive, Consolidating, Dormant). Manages identity, consolidation, workspace lifecycle, the homeostatic agent harness, the tool-call hallucination gate, and emits to the kernel slog (stderr tee plus `.cog/run/kernel.log.jsonl`).
 
 ### How foveated context works
 
@@ -72,6 +83,20 @@ When you submit a prompt in Claude Code, the `UserPromptSubmit` hook fires and c
 4. Injects the assembled context into the prompt before it reaches the model
 
 The model sees a pre-focused window instead of everything-or-nothing.
+
+---
+
+## Exposure surfaces
+
+Three non-overlapping observability lanes, each with an MCP tool, HTTP endpoint, and on-disk artifact:
+
+| Lane | What it captures | MCP tool | HTTP | On-disk |
+|------|------------------|----------|------|---------|
+| **Ledger** | Durable hash-chained events (turns, config mutations, tool calls, state changes) | `cog_read_ledger` | `GET /v1/ledger` (optional `?verify_chain=true`) | Append-only CogBlock chain |
+| **Traces** | Client metabolites, attention, proprioceptive state, internal requests | `cog_search_traces` | `GET /v1/traces` (legacy `/v1/proprioceptive` preserved) | Trace files |
+| **Kernel slog** | Structured runtime logs via `teeHandler` | `cog_tail_kernel_log` | `GET /v1/kernel-log` | stderr + `.cog/run/kernel.log.jsonl` |
+
+The live event bus is a fourth surface for real-time subscribers: SSE at `/v1/bus/:id/events/stream`, plus `cog_tail_events` and `cog_query_events` MCP tools. All `AppendEvent` writes fan through the broker.
 
 ---
 
@@ -95,14 +120,14 @@ Seven importable Go packages extracted into a `go.work` multi-module workspace. 
 
 ## Agent harness
 
-The native Go agent harness (`agent_harness.go`, `agent_tools.go`, `agent_serve.go`) runs a homeostatic assessment loop inside the kernel process:
+The native Go agent harness runs a homeostatic assessment loop inside the kernel process:
 
 - Calls Gemma E4B via Ollama's native `/api/chat` (with `think: false`)
 - Adaptive interval: 5m idle, scales to 30m when assessment urgency is low
 - Panic recovery -- a crash in the agent goroutine doesn't take down the kernel
-- Observable via `GET /v1/agent/status` (cycle count, last assessment, urgency)
+- State and loop control over MCP (`cog_list_agents`, `cog_get_agent_state`, `cog_trigger_agent_loop`) and REST (`/v1/agents[/...]`). The singular `/v1/agent/{status,traces,trigger}` routes are preserved byte-for-byte for the embedded dashboard.
 
-Six kernel-native tools are available to the agent:
+Six kernel-native tools are available to the agent itself:
 
 | Tool | Description |
 |------|-------------|
@@ -113,40 +138,59 @@ Six kernel-native tools are available to the agent:
 | `bus_emit` | Emit an event to the CogBus |
 | `workspace_status` | Get workspace health and metrics |
 
-The agent tab in the embedded dashboard shows cycle history and an urgency sparkline.
-
 ---
 
-## API
+## HTTP API
 
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/chat/completions` | OpenAI-compatible chat (streaming + non-streaming) |
 | `POST /v1/messages` | Anthropic Messages API proxy (streaming SSE passthrough) |
 | `POST /v1/context/foveated` | Foveated context assembly |
+| `POST /v1/context/build` | Context engine without inference step |
 | `GET /v1/context` | Current attentional field |
-| `GET /v1/agent/status` | Agent harness status (cycle count, urgency, last assessment) |
+| `GET /v1/ledger` | Read hash-chained ledger; `?verify_chain=true` walks the chain |
+| `GET /v1/traces` | Client metabolites, attention, proprioceptive, internal requests |
+| `GET /v1/proprioceptive` | Legacy byte-compatible trace subset |
+| `GET /v1/kernel-log` | Structured kernel slog tail |
+| `GET /v1/conversation` | Turn history with full prompt/response text |
+| `GET /v1/tool-calls` | Tool-call records and correlation state |
+| `GET /v1/config` · `PATCH /v1/config` | Read or RFC 7396 merge-patch configuration |
+| `POST /v1/config/rollback` | Roll back to a previous atomic backup |
+| `GET /v1/agents` · `GET /v1/agents/:id/state` · `POST /v1/agents/:id/trigger` | Plural agent control surface |
+| `GET /v1/agent/status` · `GET /v1/agent/traces` · `POST /v1/agent/trigger` | Singular agent routes (preserved for dashboard byte-compat) |
+| `GET /v1/bus/:id/events/stream` | SSE stream of broker events |
 | `GET /health` | Liveness probe (identity, state, trust) |
 | `GET /dashboard` | Embedded web dashboard |
-| `POST /mcp` | MCP Streamable HTTP endpoint (JSON-RPC 2.0, session management) |
-| `DELETE /mcp` | MCP session termination |
+| `POST /mcp` · `DELETE /mcp` | MCP Streamable HTTP (JSON-RPC 2.0, session lifecycle) |
 
-All endpoints serve on port **6931** by default.
+All endpoints serve on port **6931** by default. `--bind <addr>` (or `bind_addr` in YAML) overrides; CORS is strict on loopback and relaxed on non-loopback binds.
 
-### MCP tools
+### MCP tools (22 total)
 
-The MCP server exposes 8 tools over Streamable HTTP:
+The always-on MCP server groups tools by surface. `mcpserver` build tag was removed in #9 -- MCP ships in every binary.
 
-| Tool | Source |
-|------|--------|
-| `cogos_memory_search` | Kernel native |
-| `cogos_memory_read` | Kernel native |
-| `cogos_memory_write` | Kernel native |
-| `cogos_coherence_check` | Kernel native |
-| `mod3_speak` | Bridged to Mod3 TTS |
-| `mod3_stop` | Bridged to Mod3 TTS |
-| `mod3_voices` | Bridged to Mod3 TTS |
-| `mod3_status` | Bridged to Mod3 TTS |
+| Category | Tool | Purpose |
+|----------|------|---------|
+| **Observability** | `cog_read_ledger` | Read hash-chained ledger events (optional chain verify) |
+| | `cog_search_traces` | Query client metabolites + attention + proprioceptive + internal-request traces |
+| | `cog_tail_kernel_log` | Stream the structured kernel slog |
+| | `cog_tail_events` | Tail the live event bus |
+| | `cog_query_events` | Filter event bus records by predicate |
+| **Conversation / tool calls** | `cog_read_conversation` | Read turn sidecars with full prompt/response text |
+| | `cog_read_tool_calls` | Read tool-call records + correlation state |
+| | `cog_tail_tool_calls` | Live stream of tool-call activity |
+| **Agent control** | `cog_list_agents` | Enumerate running agents |
+| | `cog_get_agent_state` | State snapshot for an agent |
+| | `cog_trigger_agent_loop` | Manually trigger an assessment cycle |
+| **Config** | `cog_read_config` | Read the live config |
+| | `cog_write_config` | RFC 7396 merge-patch (atomic write, rotating backups, `requires_restart=true` in v1) |
+| | `cog_rollback_config` | Restore a prior atomic backup |
+| **Memory** | `cogos_memory_search` | Search CogDocs |
+| | `cogos_memory_read` | Read a memory document |
+| | `cogos_memory_write` | Write or update a memory document |
+| | `cogos_coherence_check` | Drift detection across the workspace |
+| **Voice (Mod3 bridge)** | `mod3_speak` · `mod3_stop` · `mod3_voices` · `mod3_status` | TTS and voice channel control |
 
 Sessions are created on `initialize` and expire after 30 minutes of inactivity.
 
@@ -156,12 +200,29 @@ Ships with adapters for Anthropic, Ollama, Claude Code, and Codex. New providers
 
 ---
 
+## CLI
+
+`cog` wraps the daemon with subcommands for the common lifecycle plus the event bus:
+
+```sh
+cog serve               # Start the daemon (--bind <addr> to expose beyond loopback)
+cog claude              # Launch Claude Code with ANTHROPIC_BASE_URL set to the kernel
+cog decompose ...       # Run the 4-tier foveated decomposition pipeline
+cog emit ...            # Write an event through the engine (no more silent drops)
+cog bus watch|tail|list # Read the event bus
+cog bus send ...        # Write to the bus. Direct JSONL by default; --http for SSE broadcast
+```
+
+`cog emit` was migrated to the engine in #23 (Track 5 Phase 1): the root `cmdEmit` is retained for compat but the engine path fixes the silent-drop bug where hooks returned success without writing to the ledger.
+
+---
+
 ## Getting started
 
 ### Requirements
 
 - Go 1.24+
-- macOS or Linux
+- macOS, Linux, or Windows
 
 ### Build and run
 
@@ -180,12 +241,20 @@ make build
 curl -s http://localhost:6931/health | jq .
 ```
 
+### Cross-compile
+
+```sh
+make build-linux-amd64
+make build-linux-arm64    # Unblocked in #31 (syscall.Dup2 → unix.Dup2)
+make build-darwin-arm64
+make build-windows-amd64  # Added in #15; see docs for install steps
+```
+
 ### Route Claude Code through the kernel
 
 ```sh
-# Launch Claude Code with kernel-mediated API routing
 cog claude
-# This sets ANTHROPIC_BASE_URL to http://localhost:6931 and starts Claude Code
+# Sets ANTHROPIC_BASE_URL to http://localhost:6931 and starts Claude Code
 ```
 
 ### Developer setup
@@ -202,6 +271,8 @@ make run          # Run with workspace volume mount
 make e2e          # Build + run full cold-start test in a container
 ```
 
+A Docker Compose topology with `bridge-{primary,secondary}` and `tailscale-{primary,secondary}` siblings landed in #19.
+
 ---
 
 ## Testing
@@ -212,7 +283,7 @@ make e2e-local    # Full cold-start lifecycle test
 make e2e          # Containerized e2e (Docker)
 ```
 
-The kernel has 65 source files and 42 test files in `internal/engine/`, plus 190 tests across the `pkg/` library packages.
+Ledger and sync-watcher tests are stable under `-count>=2` (#30). Roughly 190 tests across the `pkg/` library packages plus the kernel suite in `internal/engine/`.
 
 ---
 
@@ -220,7 +291,7 @@ The kernel has 65 source files and 42 test files in `internal/engine/`, plus 190
 
 ```
 cmd/cogos/              Entry point (thin — delegates to internal/engine)
-internal/engine/        Kernel: 65 source files, 42 test files
+internal/engine/        Kernel sources and tests
 pkg/                    Importable library packages (go.work multi-module)
   cogblock/             Content-addressed blocks and ledger
   coordination/         Agent coordination primitives
@@ -232,16 +303,6 @@ pkg/                    Importable library packages (go.work multi-module)
 sdk/                    Go SDK for CogOS clients
 docs/                   Specs, architecture docs, provider guide
 scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
-agent_harness.go        Native agent loop (Ollama /api/chat)
-agent_tools.go          Kernel-native tool implementations
-agent_serve.go          Agent status HTTP endpoint
-decompose.go            Foveated decomposition engine (4-tier pipeline)
-decompose_store.go      Embedding generation and CogDoc storage
-decompose_tui.go        Interactive workbench TUI (Bubbletea)
-serve_messages.go       Anthropic Messages API proxy
-serve_dashboard.go      Embedded web dashboard
-mcp_http.go             MCP Streamable HTTP transport
-mcp_mod3.go             Mod3 voice tool bridge for MCP
 ```
 
 ---
@@ -254,21 +315,29 @@ mcp_mod3.go             Mod3 voice tool bridge for MCP
 
 - Continuous process daemon with four-state FSM
 - Foveated context assembly with Mamba TRM (0.878 mean NDCG@10)
-- Hash-chained append-only ledger
+- Hash-chained append-only ledger with optional chain verification
+- Three-lane observability: ledger, traces, kernel slog
+- Live event bus with in-process broker and SSE streaming
+- Conversation persistence (turn sidecars + ledger `turn.completed` events)
+- Tool-call observability with pending-call correlation cache (1024 / 10min)
+- Config mutation API (MCP + REST, merge-patch, atomic write, rollback)
+- Agent state and loop control over MCP and REST (singular routes preserved)
 - Multi-provider routing (Ollama, Anthropic, Claude Code, Codex)
-- MCP Streamable HTTP server (8 tools, JSON-RPC 2.0, sessions)
+- Always-on MCP Streamable HTTP server (22 tools, sessions, JSON-RPC 2.0)
 - Anthropic Messages API proxy with streaming SSE
 - Native Go agent harness with adaptive interval and 6 kernel tools
 - Embedded web dashboard with agent status, cycle history, and decomposition panel
 - Foveated decomposition pipeline (`cog decompose`) with 4-tier output, workbench TUI, embeddings, and bus events
-- Library extraction: 7 packages in pkg/ (69 files, ~10.2K LOC, 190 tests)
+- Library extraction: 7 packages in pkg/ (~10.2K LOC, 190 tests)
 - Content-addressed blob store
 - Git-derived salience scoring
-- Tool-call hallucination gate
+- Tool-call hallucination gate (activated by `NormalizeMCPRequest` path in #25)
 - Digestion pipeline (Claude Code + OpenClaw adapters)
 - Memory consolidation
 - OpenAI and Anthropic API compatibility
-- Workspace scaffolding and lifecycle management
+- `cog bus send` subcommand for write-side symmetry (direct JSONL or opt-in SSE)
+- `--bind` flag with non-loopback CORS relaxation
+- Windows cross-compile (`make build-windows-amd64`) and linux/arm64
 - End-to-end test suite
 - OpenTelemetry instrumentation
 - Port consolidation on 6931
@@ -278,7 +347,7 @@ mcp_mod3.go             Mod3 voice tool bridge for MCP
 - Wire digestion tailers into process loop
 - Constellation library integration (multi-node sync)
 - Multi-agent process management
-- `cog` CLI
+- Further agent state surface (beyond the v1 trigger/state/list)
 
 ---
 
