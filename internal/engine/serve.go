@@ -19,6 +19,15 @@
 //	GET  /v1/constellation/fovea           — current fovea state
 //	GET  /v1/constellation/adjacent?uri=… — adjacent nodes by attentional proximity
 //
+// Channel-session forwarder (ADR-082 Wave 2, see serve_sessions_channel.go):
+//
+//	POST /v1/channel-sessions/register             — kernel mints session_id
+//	                                                  and forwards to mod3;
+//	                                                  returns merged response
+//	POST /v1/channel-sessions/{id}/deregister      — proxy to mod3, drop record
+//	GET  /v1/channel-sessions                      — kernel view + mod3 list
+//	GET  /v1/channel-sessions/{id}                 — single-session detail
+//
 // The chat endpoint routes through the inference Router when one is set,
 // otherwise returns 501.
 package engine
@@ -52,8 +61,8 @@ type Server struct {
 	process         *Process
 	router          Router // nil until SetRouter is called
 	srv             *http.Server
-	debug           debugStore    // captures last request pipeline state
-	attentionLog    *attentionLog // per-server log (avoids global write race)
+	debug           debugStore      // captures last request pipeline state
+	attentionLog    *attentionLog   // per-server log (avoids global write race)
 	agentController AgentController // nil until SetAgentController is called
 	mcpServer       *MCPServer      // so SetAgentController can propagate to tools
 
@@ -71,6 +80,18 @@ type Server struct {
 	// these are derived views rebuilt from bus replay at startup.
 	sessionRegistry *SessionRegistry
 	handoffRegistry *HandoffRegistry
+
+	// ADR-082 Wave 2: kernel-owned identity registry for channel-participant
+	// sessions. The kernel mints session_id, mod3 stores per-channel state
+	// keyed on the kernel-issued ID. Distinct from sessionRegistry above,
+	// which enforces strict 3-component hyphen IDs for the agent/handoff
+	// protocol. See serve_sessions_channel.go for the full rationale.
+	channelSessionRegistry *ChannelSessionRegistry
+
+	// mod3Client is the HTTP client used to forward channel-session calls
+	// to mod3. Nil in production (falls back to the package-level
+	// mod3HTTPClient); tests set this to an httptest-backed client.
+	mod3Client *http.Client
 }
 
 // NewServer constructs a Server bound to the configured port.
@@ -93,6 +114,9 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// the warm cache is ready before any HTTP request lands.
 	s.sessionRegistry = NewSessionRegistry()
 	s.handoffRegistry = NewHandoffRegistry()
+
+	// ADR-082 Wave 2 kernel-owned channel-session identity.
+	s.channelSessionRegistry = NewChannelSessionRegistry()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", handleDashboard)
@@ -132,6 +156,13 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// the specific patterns (POST /v1/sessions/register, etc.) coexist
 	// cleanly with the pre-existing GET /v1/sessions[/{id}] surface.
 	s.registerSessionMgmtRoutes(mux)
+
+	// ADR-082 Wave 2: kernel-side channel-session forwarder. The four
+	// /v1/channel-sessions/* routes mint session_ids, record identity
+	// locally, and forward to mod3 at cfg.Mod3URL. Namespaced under
+	// /v1/channel-sessions/* to coexist with the agent-session surface
+	// above (incompatible session_id formats — see serve_sessions_channel.go).
+	s.registerChannelSessionRoutes(mux)
 
 	// Replay bus_sessions + bus_handoffs into the in-memory registries so
 	// the kernel starts with an accurate derived view. Bus is authoritative
