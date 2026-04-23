@@ -92,6 +92,12 @@ type Server struct {
 	// to mod3. Nil in production (falls back to the package-level
 	// mod3HTTPClient); tests set this to an httptest-backed client.
 	mod3Client *http.Client
+
+	// httpRoutes is the manifest-introspection registry. Every route added
+	// via s.route / s.routeH appends here; /v1/manifest serialises this
+	// slice. Populated at startup only — reads are lock-free because the
+	// slice is frozen by the time Start returns.
+	httpRoutes []routeMeta
 }
 
 // NewServer constructs a Server bound to the configured port.
@@ -119,24 +125,25 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.channelSessionRegistry = NewChannelSessionRegistry()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", handleDashboard)
-	mux.HandleFunc("GET /canvas", handleCanvas)
-	mux.HandleFunc("GET /health", s.handleHealth)
-	mux.HandleFunc("GET /v1/context", s.handleContext)
-	mux.HandleFunc("GET /v1/resolve", s.handleResolve)
-	mux.HandleFunc("GET /v1/cogdoc/read", s.handleCogDocRead)
-	mux.HandleFunc("GET /v1/debug/last", s.handleDebugLast)
-	mux.HandleFunc("GET /v1/debug/context", s.handleDebugContext)
-	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
-	mux.HandleFunc("POST /v1/messages", s.handleAnthropicMessages)
-	mux.HandleFunc("GET /v1/proprioceptive", s.handleProprioceptive)
-	mux.HandleFunc("GET /v1/ledger", s.handleLedger)
-	mux.HandleFunc("GET /v1/traces", s.handleTraces)
-	mux.HandleFunc("GET /v1/lightcone", s.handleLightCone)
-	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext)
-	mux.HandleFunc("GET /v1/kernel-log", s.handleKernelLog)
-	mux.HandleFunc("GET /v1/tool-calls", s.handleToolCalls)
-	mux.HandleFunc("GET /v1/conversation", s.handleConversation)
+	s.route(mux, "GET /", handleDashboard)
+	s.route(mux, "GET /canvas", handleCanvas)
+	s.route(mux, "GET /health", s.handleHealth)
+	s.route(mux, "GET /v1/context", s.handleContext)
+	s.route(mux, "GET /v1/resolve", s.handleResolve)
+	s.route(mux, "GET /v1/cogdoc/read", s.handleCogDocRead)
+	s.route(mux, "GET /v1/debug/last", s.handleDebugLast)
+	s.route(mux, "GET /v1/debug/context", s.handleDebugContext)
+	s.route(mux, "POST /v1/chat/completions", s.handleChat)
+	s.route(mux, "POST /v1/messages", s.handleAnthropicMessages)
+	s.route(mux, "GET /v1/proprioceptive", s.handleProprioceptive)
+	s.route(mux, "GET /v1/ledger", s.handleLedger)
+	s.route(mux, "GET /v1/traces", s.handleTraces)
+	s.route(mux, "GET /v1/lightcone", s.handleLightCone)
+	s.route(mux, "POST /v1/context/foveated", s.handleFoveatedContext)
+	s.route(mux, "GET /v1/kernel-log", s.handleKernelLog)
+	s.route(mux, "GET /v1/tool-calls", s.handleToolCalls)
+	s.route(mux, "GET /v1/conversation", s.handleConversation)
+	s.route(mux, "GET /v1/manifest", s.handleManifest)
 
 	// Constellation / attention endpoints (Phase 3)
 	s.registerAttentionRoutes(mux)

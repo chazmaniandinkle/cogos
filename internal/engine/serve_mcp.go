@@ -24,7 +24,7 @@ func (s *Server) registerMCPRoutes(mux *http.ServeMux) {
 	mcpSrv.SetChannelSessionBackend(s)
 	s.mcpServer = mcpSrv
 	h := mcpSrv.Handler()
-	mux.Handle("GET /mcp", h)
-	mux.Handle("POST /mcp", h)
-	mux.Handle("DELETE /mcp", h)
+	s.routeH(mux, "GET /mcp", h)
+	s.routeH(mux, "POST /mcp", h)
+	s.routeH(mux, "DELETE /mcp", h)
 }

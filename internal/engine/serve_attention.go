@@ -88,10 +88,10 @@ func (l *attentionLog) recentSignals(n int) []attentionSignal {
 func (s *Server) registerAttentionRoutes(mux *http.ServeMux) {
 	s.attentionLog = newAttentionLog(s.cfg.WorkspaceRoot)
 
-	mux.HandleFunc("POST /v1/attention", s.handleAttention)
-	mux.HandleFunc("GET /v1/constellation/adjacent", s.handleConstellationAdjacent)
-	mux.HandleFunc("GET /v1/constellation/fovea", s.handleConstellationFovea)
-	mux.HandleFunc("GET /v1/observer/state", s.handleObserverState)
+	s.route(mux, "POST /v1/attention", s.handleAttention)
+	s.route(mux, "GET /v1/constellation/adjacent", s.handleConstellationAdjacent)
+	s.route(mux, "GET /v1/constellation/fovea", s.handleConstellationFovea)
+	s.route(mux, "GET /v1/observer/state", s.handleObserverState)
 }
 
 // handleAttention stores an attention signal and applies a recency boost to the field.

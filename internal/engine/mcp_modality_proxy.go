@@ -118,7 +118,7 @@ func (m *MCPServer) getModalityProxy() *modalityProxy {
 // MCPServer.registerTools after the cog_* tools so the tool index stays
 // stable at the front.
 func (m *MCPServer) registerMod3Tools() {
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "mod3_speak",
 		Description: "Synthesize text to speech via mod3 and play the audio " +
 			"locally. Required: text. Optional: session_id, voice, speed, " +
@@ -126,33 +126,33 @@ func (m *MCPServer) registerMod3Tools() {
 			"metrics (job_id, duration_sec, rtf, voice) and a playback_status " +
 			"flag. Fallback: curl -X POST http://localhost:7860/v1/synthesize " +
 			"-d '{\"text\":\"...\"}' -o out.wav && afplay out.wav",
-	}, withToolObserver(m, "mod3_speak", m.toolMod3Speak))
+	}), withToolObserver(m, "mod3_speak", m.toolMod3Speak))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "mod3_stop",
 		Description: "Stop current mod3 speech and/or cancel queued jobs. " +
 			"Optional: session_id, job_id (cancel one specific job). Empty " +
 			"cancels current playback and clears the queue. Returns mod3's " +
 			"barge-in interruption context. Fallback: curl -X POST " +
 			"http://localhost:7860/v1/stop",
-	}, withToolObserver(m, "mod3_stop", m.toolMod3Stop))
+	}), withToolObserver(m, "mod3_stop", m.toolMod3Stop))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "mod3_voices",
 		Description: "List available mod3 voices, optionally scoped to a " +
 			"session. Optional: session_id. Returns the voice catalogue mod3 " +
 			"exposes (id, name, language, gender metadata per voice). " +
 			"Fallback: curl http://localhost:7860/v1/voices",
-	}, withToolObserver(m, "mod3_voices", m.toolMod3Voices))
+	}), withToolObserver(m, "mod3_voices", m.toolMod3Voices))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "mod3_status",
 		Description: "Probe mod3's /health endpoint. Returns the raw health " +
 			"payload (model_loaded, engine info, queue_depth, etc). 502 if " +
 			"mod3 is unreachable. Fallback: curl http://localhost:7860/health",
-	}, withToolObserver(m, "mod3_status", m.toolMod3Status))
+	}), withToolObserver(m, "mod3_status", m.toolMod3Status))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "mod3_register_session",
 		Description: "Register a channel-participant session. Routes through " +
 			"the kernel's /v1/channel-sessions/register endpoint so " +
@@ -165,24 +165,24 @@ func (m *MCPServer) registerMod3Tools() {
 			"mod3} block: kernel identity record + mod3's full " +
 			"SessionRegisterResponse (assigned_voice, voice_conflict, " +
 			"output_device, queue_depth).",
-	}, withToolObserver(m, "mod3_register_session", m.toolMod3RegisterSession))
+	}), withToolObserver(m, "mod3_register_session", m.toolMod3RegisterSession))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "mod3_deregister_session",
 		Description: "Deregister a channel-participant session. Routes " +
 			"through the kernel's /v1/channel-sessions/{id}/deregister " +
 			"endpoint so the kernel drops its identity record in sync with " +
 			"mod3. Required: session_id. Returns mod3's deregister " +
 			"acknowledgment (released_voice, dropped_jobs).",
-	}, withToolObserver(m, "mod3_deregister_session", m.toolMod3DeregisterSession))
+	}), withToolObserver(m, "mod3_deregister_session", m.toolMod3DeregisterSession))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "mod3_list_sessions",
 		Description: "List channel-participant sessions via the kernel's " +
 			"/v1/channel-sessions endpoint. Returns a merged {kernel, mod3} " +
 			"block: kernel identity records + mod3's live per-channel state " +
 			"(voice_pool, voice_holders, serializer policy).",
-	}, withToolObserver(m, "mod3_list_sessions", m.toolMod3ListSessions))
+	}), withToolObserver(m, "mod3_list_sessions", m.toolMod3ListSessions))
 }
 
 // ─── input / output types ────────────────────────────────────────────────────

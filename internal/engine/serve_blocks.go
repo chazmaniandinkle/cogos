@@ -29,10 +29,10 @@ import (
 
 // registerBlockRoutes wires the block sync endpoints into the mux.
 func (s *Server) registerBlockRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/blocks/manifest", s.handleBlocksManifest)
-	mux.HandleFunc("POST /v1/blocks/verify", s.handleBlocksVerify)
-	mux.HandleFunc("GET /v1/blocks/{hash}", s.handleBlockGet)
-	mux.HandleFunc("PUT /v1/blocks/{hash}", s.handleBlockPut)
+	s.route(mux, "GET /v1/blocks/manifest", s.handleBlocksManifest)
+	s.route(mux, "POST /v1/blocks/verify", s.handleBlocksVerify)
+	s.route(mux, "GET /v1/blocks/{hash}", s.handleBlockGet)
+	s.route(mux, "PUT /v1/blocks/{hash}", s.handleBlockPut)
 }
 
 // handleBlockGet returns blob content by hash.

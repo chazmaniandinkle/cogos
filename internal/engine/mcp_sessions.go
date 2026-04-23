@@ -42,69 +42,69 @@ func (m *MCPServer) sessionsBackendReady() bool {
 // its own method so mcp_server.go stays tidy; the registration site in
 // registerTools calls this last.
 func (m *MCPServer) registerSessionTools() {
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_register_session",
 		Description: "Register (or idempotently update) a session on " +
 			"bus_sessions. Validates the session_id format " +
 			"(lowercase, hyphen-separated, 3-component required). Required: " +
 			"session_id, workspace, role. Optional: task, model, hostname, " +
 			"status, current_task, context_usage.",
-	}, withToolObserver(m, "cog_register_session", m.toolRegisterSession))
+	}), withToolObserver(m, "cog_register_session", m.toolRegisterSession))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_heartbeat_session",
 		Description: "Emit a periodic keep-alive heartbeat for a session. " +
 			"Updates LastSeen and optional status/context fields. Rejects " +
 			"if the session is unregistered (404) or already ended (409).",
-	}, withToolObserver(m, "cog_heartbeat_session", m.toolHeartbeatSession))
+	}), withToolObserver(m, "cog_heartbeat_session", m.toolHeartbeatSession))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_end_session",
 		Description: "Mark a session as ended. Optional handoff_id " +
 			"references the outgoing handoff, if any. Rejects if the " +
 			"session is unknown (404) or already ended (409).",
-	}, withToolObserver(m, "cog_end_session", m.toolEndSession))
+	}), withToolObserver(m, "cog_end_session", m.toolEndSession))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_list_sessions",
 		Description: "List the roster of tracked sessions with an " +
 			"is-active flag computed from the freshness window " +
 			"(default 600s, override via active_within_seconds). Set " +
 			"include_ended=true to also see sessions that exited.",
-	}, withToolObserver(m, "cog_list_sessions", m.toolListSessions))
+	}), withToolObserver(m, "cog_list_sessions", m.toolListSessions))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_offer_handoff",
 		Description: "Post a handoff.offer to bus_handoffs. Mints a new " +
 			"handoff_id (ho-<ms>-<hex>). task.title, task.goal, and a " +
 			"non-empty task.next_steps list are required. TTL defaults to " +
 			"3600s; expired offers are 409 on claim. Returns the full " +
 			"offer payload so the caller can inspect what was written.",
-	}, withToolObserver(m, "cog_offer_handoff", m.toolOfferHandoff))
+	}), withToolObserver(m, "cog_offer_handoff", m.toolOfferHandoff))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_list_handoffs",
 		Description: "List tracked handoffs with optional filters: " +
 			"state (open|claimed|completed|expired) and for_session. The " +
 			"kernel maintains the derived view; the bus remains ground " +
 			"truth.",
-	}, withToolObserver(m, "cog_list_handoffs", m.toolListHandoffs))
+	}), withToolObserver(m, "cog_list_handoffs", m.toolListHandoffs))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_claim_handoff",
 		Description: "Atomically claim an open handoff offer. First-wins " +
 			"by kernel mutex: concurrent claims produce exactly one 200 " +
 			"and N-1 409 responses, each of which emits a " +
 			"handoff.claim_rejected event on bus_handoffs for audit. " +
 			"Returns the full offer payload on success.",
-	}, withToolObserver(m, "cog_claim_handoff", m.toolClaimHandoff))
+	}), withToolObserver(m, "cog_claim_handoff", m.toolClaimHandoff))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_complete_handoff",
 		Description: "Mark a claimed handoff as completed. Rejected with " +
 			"409 if the handoff has not been claimed yet or is already " +
 			"complete. Optional outcome, notes, and next_handoff_id.",
-	}, withToolObserver(m, "cog_complete_handoff", m.toolCompleteHandoff))
+	}), withToolObserver(m, "cog_complete_handoff", m.toolCompleteHandoff))
 }
 
 // ─── input/output types ──────────────────────────────────────────────────────

@@ -1,0 +1,259 @@
+// serve_manifest.go — self-describing kernel manifest endpoint.
+//
+//	GET /v1/manifest → JSON describing this kernel's full surface
+//
+// The manifest enumerates every HTTP route and MCP tool at runtime by walking
+// registries populated during startup — no hardcoded lists. If a future wave
+// adds a new route or tool, the manifest reflects it without touching this
+// file.
+//
+// Design:
+//   - HTTP routes are captured at mux-registration time via Server.route and
+//     Server.routeH, which forward to http.ServeMux and also append to
+//     s.httpRoutes.
+//   - MCP tools are captured via MCPServer.trackTool, which records the
+//     *mcp.Tool metadata into m.toolMeta and then returns the pointer so the
+//     caller threads it through to mcp.AddTool unchanged.
+//
+// Why not extend /v1/card? The existing /v1/card endpoint is an OpenClaw v2
+// compatibility stub with a specific contract (models list, capabilities
+// booleans, `endpoints` string map). Reshaping it would break that
+// contract. /v1/manifest lives alongside as the CogOS-native surface for
+// kernel introspection.
+package engine
+
+import (
+	"encoding/json"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// routeMeta records one HTTP route registration.
+type routeMeta struct {
+	Method string `json:"method"`
+	Path   string `json:"path"`
+	Family string `json:"family"`
+}
+
+// mcpToolMeta records one MCP tool registration.
+type mcpToolMeta struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Family      string `json:"family"`
+}
+
+// route registers a handler on mux and records the (method, path) tuple onto
+// s.httpRoutes. The pattern follows http.ServeMux's method-prefixed form,
+// e.g. "GET /v1/health" or "POST /v1/sessions/{id}/heartbeat".
+func (s *Server) route(mux *http.ServeMux, pattern string, handler http.HandlerFunc) {
+	mux.HandleFunc(pattern, handler)
+	s.recordRoute(pattern)
+}
+
+// routeH is like route but takes an http.Handler (used for /mcp which is
+// backed by the streamable HTTP handler from the MCP library).
+func (s *Server) routeH(mux *http.ServeMux, pattern string, handler http.Handler) {
+	mux.Handle(pattern, handler)
+	s.recordRoute(pattern)
+}
+
+// recordRoute parses "METHOD /path" and appends a routeMeta entry.
+func (s *Server) recordRoute(pattern string) {
+	method, path := splitRoutePattern(pattern)
+	s.httpRoutes = append(s.httpRoutes, routeMeta{
+		Method: method,
+		Path:   path,
+		Family: classifyHTTPFamily(path),
+	})
+}
+
+// splitRoutePattern parses "GET /foo" into ("GET", "/foo"). Patterns without
+// a method prefix ("/foo") degrade to method="" path="/foo" — the http.ServeMux
+// accepts that form too but the kernel uses method-prefixed form everywhere.
+func splitRoutePattern(pattern string) (method, path string) {
+	p := strings.TrimSpace(pattern)
+	if i := strings.IndexByte(p, ' '); i > 0 {
+		return p[:i], strings.TrimSpace(p[i+1:])
+	}
+	return "", p
+}
+
+// classifyHTTPFamily maps an HTTP path prefix to a family tag. The map is
+// kept compact; ordering matters because longer prefixes win. New routes that
+// don't match fall into "misc".
+func classifyHTTPFamily(path string) string {
+	// Prefix table, scanned in order. Longer prefixes first so /v1/bus beats
+	// any hypothetical /v1 fallback.
+	prefixes := []struct {
+		prefix, family string
+	}{
+		{"/mcp", "mcp"},
+		{"/v1/chat/completions", "openai"},
+		{"/v1/models", "openai"},
+		{"/v1/messages", "anthropic"},
+		{"/v1/bus", "bus"},
+		{"/v1/events", "bus"},
+		{"/v1/blocks", "bus"},
+		{"/v1/channel-sessions", "sessions"},
+		{"/v1/sessions", "sessions"},
+		{"/v1/handoffs", "sessions"},
+		{"/v1/cogdoc", "memory"},
+		{"/v1/context", "memory"},
+		{"/v1/resolve", "memory"},
+		{"/memory", "memory"},
+		{"/v1/ledger", "observability"},
+		{"/v1/traces", "observability"},
+		{"/v1/tool-calls", "observability"},
+		{"/v1/kernel-log", "observability"},
+		{"/v1/conversation", "observability"},
+		{"/v1/proprioceptive", "observability"},
+		{"/v1/debug", "observability"},
+		{"/v1/attention", "attention"},
+		{"/v1/constellation", "attention"},
+		{"/v1/observer", "attention"},
+		{"/v1/lightcone", "attention"},
+		{"/v1/card", "compat"},
+		{"/v1/providers", "compat"},
+		{"/v1/taa", "compat"},
+		{"/coherence", "kernel"},
+		{"/v1/config", "config"},
+		{"/v1/manifest", "kernel"},
+		{"/health", "kernel"},
+		{"/canvas", "kernel"},
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(path, p.prefix) {
+			return p.family
+		}
+	}
+	if path == "/" {
+		return "kernel"
+	}
+	return "misc"
+}
+
+// classifyMCPFamily takes the prefix before the first underscore as the
+// family. Tools without an underscore return "misc".
+func classifyMCPFamily(name string) string {
+	if i := strings.IndexByte(name, '_'); i > 0 {
+		return name[:i]
+	}
+	return "misc"
+}
+
+// trackTool records the tool metadata into m.toolMeta and returns the input
+// pointer unchanged. Typical usage:
+//
+//	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{Name: "cog_search_memory", ...}), handler)
+//
+// Returning the pointer means each existing registration changes by one
+// wrapping call — no separate metadata list, no risk of drift.
+func (m *MCPServer) trackTool(t *mcp.Tool) *mcp.Tool {
+	m.toolMeta = append(m.toolMeta, mcpToolMeta{
+		Name:        t.Name,
+		Description: t.Description,
+		Family:      classifyMCPFamily(t.Name),
+	})
+	return t
+}
+
+// handleManifest returns the kernel self-describing manifest as JSON. Read-
+// only, side-effect-free. Enumeration is cheap (a couple of slice copies plus
+// a sort) so we recompute per request rather than caching — this keeps the
+// endpoint honest if tools or routes are added dynamically after startup.
+//
+//	GET /v1/manifest
+//	200 → {service, version, build_time, node_id, transports, http_routes,
+//	       mcp_tools}
+func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
+	// Copy + sort HTTP routes for stable output. Sort key: family then path
+	// then method, which groups related endpoints visually in jq output.
+	routes := make([]routeMeta, len(s.httpRoutes))
+	copy(routes, s.httpRoutes)
+	sort.Slice(routes, func(i, j int) bool {
+		if routes[i].Family != routes[j].Family {
+			return routes[i].Family < routes[j].Family
+		}
+		if routes[i].Path != routes[j].Path {
+			return routes[i].Path < routes[j].Path
+		}
+		return routes[i].Method < routes[j].Method
+	})
+
+	// MCP tool metadata comes from the MCPServer instance wired up in
+	// registerMCPRoutes. Sorted by name for stable output.
+	var tools []mcpToolMeta
+	if s.mcpServer != nil {
+		tools = make([]mcpToolMeta, len(s.mcpServer.toolMeta))
+		copy(tools, s.mcpServer.toolMeta)
+		sort.Slice(tools, func(i, j int) bool {
+			return tools[i].Name < tools[j].Name
+		})
+	}
+
+	// Transports section — each protocol entry enumerates the routes that
+	// carry it, counted off s.httpRoutes so we don't repeat the source of
+	// truth. The MCP entry also reports tool_count.
+	openaiEndpoints := pathsForFamily(s.httpRoutes, "openai")
+	anthropicEndpoints := pathsForFamily(s.httpRoutes, "anthropic")
+	mcpEndpoints := pathsForFamily(s.httpRoutes, "mcp")
+
+	nodeID := ""
+	if s.process != nil {
+		nodeID = s.process.NodeID
+	}
+
+	resp := map[string]any{
+		"service":    "cogos-kernel",
+		"version":    Version,
+		"build_time": BuildTime,
+		"node_id":    nodeID,
+		"transports": map[string]any{
+			"mcp": map[string]any{
+				"protocol":        "mcp",
+				"version":         "2025-03-26", // Streamable HTTP spec version
+				"endpoints":       mcpEndpoints,
+				"streamable_http": true,
+				"tool_count":      len(tools),
+			},
+			"openai": map[string]any{
+				"protocol":  "openai-compat",
+				"endpoints": openaiEndpoints,
+			},
+			"anthropic": map[string]any{
+				"protocol":  "anthropic-compat",
+				"endpoints": anthropicEndpoints,
+			},
+		},
+		"http_routes": routes,
+		"mcp_tools":   tools,
+		"generated":   time.Now().UTC().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(resp)
+}
+
+// pathsForFamily returns a sorted, deduplicated list of paths for routes in
+// the given family. Used to populate the transports.{proto}.endpoints slices
+// in the manifest.
+func pathsForFamily(routes []routeMeta, family string) []string {
+	seen := map[string]struct{}{}
+	for _, r := range routes {
+		if r.Family == family {
+			seen[r.Path] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for p := range seen {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}

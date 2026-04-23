@@ -37,8 +37,8 @@ const (
 // stale stub registrations (the stubs have been deleted, but this keeps the
 // ordering future-proof against re-introductions).
 func (s *Server) registerEventBusRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/events", s.handleEvents)
-	mux.HandleFunc("GET /v1/events/stream", s.handleEventsStream)
+	s.route(mux, "GET /v1/events", s.handleEvents)
+	s.route(mux, "GET /v1/events/stream", s.handleEventsStream)
 }
 
 // handleEvents is the non-streaming historical query. Mirrors handleLedger

@@ -165,10 +165,10 @@ var mod3HTTPClient = &http.Client{Timeout: defaultMod3ForwardTimeout}
 // registerChannelSessionRoutes attaches the 4 channel-session routes onto mux.
 // Called from NewServer.
 func (s *Server) registerChannelSessionRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/channel-sessions/register", s.handleChannelSessionRegister)
-	mux.HandleFunc("POST /v1/channel-sessions/{id}/deregister", s.handleChannelSessionDeregister)
-	mux.HandleFunc("GET /v1/channel-sessions", s.handleChannelSessionList)
-	mux.HandleFunc("GET /v1/channel-sessions/{id}", s.handleChannelSessionGet)
+	s.route(mux, "POST /v1/channel-sessions/register", s.handleChannelSessionRegister)
+	s.route(mux, "POST /v1/channel-sessions/{id}/deregister", s.handleChannelSessionDeregister)
+	s.route(mux, "GET /v1/channel-sessions", s.handleChannelSessionList)
+	s.route(mux, "GET /v1/channel-sessions/{id}", s.handleChannelSessionGet)
 }
 
 // ─── wire types ──────────────────────────────────────────────────────────────

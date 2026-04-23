@@ -61,6 +61,12 @@ type MCPServer struct {
 	// place. Nil when the MCP server is built outside a live kernel —
 	// the tools return a clean "not configured" error in that case.
 	channelSessionBackend channelSessionBackend
+
+	// toolMeta is the manifest-introspection registry for MCP tools.
+	// Populated by trackTool at registration time (see serve_manifest.go);
+	// read by handleManifest. Frozen after registerTools returns, so
+	// lock-free reads are safe.
+	toolMeta []mcpToolMeta
 }
 
 // channelSessionBackend is the narrow surface the mod3 session-family MCP
@@ -140,134 +146,134 @@ func (m *MCPServer) Handler() http.Handler {
 // closes Agent F gap #6 and activates the gate.go:94 recognizer that has
 // been waiting for a producer.
 func (m *MCPServer) registerTools() {
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_search_memory",
 		Description: "Full-text and semantic search over the CogDoc memory corpus. Returns ranked results with salience scores. Fallback: ./scripts/cog memory search \"query\"",
-	}, withToolObserver(m, "cog_search_memory", m.toolSearchMemory))
+	}), withToolObserver(m, "cog_search_memory", m.toolSearchMemory))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_read_cogdoc",
 		Description: "Read a CogDoc by URI or path. Resolves cog: URIs automatically. Returns full content with parsed frontmatter and optional section extraction via #fragment. Fallback: ./scripts/cog memory read <path>",
-	}, withToolObserver(m, "cog_read_cogdoc", m.toolReadCogdoc))
+	}), withToolObserver(m, "cog_read_cogdoc", m.toolReadCogdoc))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_write_cogdoc",
 		Description: "Write or update a CogDoc at the specified memory path. Creates the file with proper frontmatter if it doesn't exist. Fallback: ./scripts/cog memory write <path> \"Title\"",
-	}, withToolObserver(m, "cog_write_cogdoc", m.toolWriteCogdoc))
+	}), withToolObserver(m, "cog_write_cogdoc", m.toolWriteCogdoc))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_patch_frontmatter",
 		Description: "Merge description, tags, or type patches into a CogDoc frontmatter block.",
-	}, withToolObserver(m, "cog_patch_frontmatter", m.toolPatchFrontmatter))
+	}), withToolObserver(m, "cog_patch_frontmatter", m.toolPatchFrontmatter))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_check_coherence",
 		Description: "Run coherence validation against the workspace. Checks URI resolution, frontmatter validity, and reference integrity. Fallback: ./scripts/cog coherence check",
-	}, withToolObserver(m, "cog_check_coherence", m.toolCheckCoherence))
+	}), withToolObserver(m, "cog_check_coherence", m.toolCheckCoherence))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_get_state",
 		Description: "Get kernel state: process status, uptime, trust, node health (sibling services), field size, and heartbeat info. Includes identity and coherence metadata. Fallback: curl http://localhost:6931/health",
-	}, withToolObserver(m, "cog_get_state", m.toolGetState))
+	}), withToolObserver(m, "cog_get_state", m.toolGetState))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_query_field",
 		Description: "Query the attentional field — the salience-scored map of all tracked CogDocs. Returns top-N items, optionally filtered by sector. Shows what the kernel considers most relevant right now.",
-	}, withToolObserver(m, "cog_query_field", m.toolQueryField))
+	}), withToolObserver(m, "cog_query_field", m.toolQueryField))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_assemble_context",
 		Description: "Build a context package for a given token budget with an explicit focus topic. Use this for intentional context assembly (subtasks, specific investigations). The automatic foveated-context hook handles ambient context on every prompt.",
-	}, withToolObserver(m, "cog_assemble_context", m.toolAssembleContext))
+	}), withToolObserver(m, "cog_assemble_context", m.toolAssembleContext))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_emit_event",
 		Description: "Emit a typed event to the workspace ledger. Events: attention.boost (uri + weight), session.marker (label), insight.captured (summary), decision.made (decision + rationale). Fallback: events are JSONL in .cog/ledger/",
-	}, withToolObserver(m, "cog_emit_event", m.toolEmitEvent))
+	}), withToolObserver(m, "cog_emit_event", m.toolEmitEvent))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_read_ledger",
 		Description: "Read the hash-chained event ledger. Filter by session_id, event_type (exact or 'prefix.*' wildcard), after_seq (requires session_id), since_timestamp (RFC3339), or limit (default 100, max 1000). Set verify_chain=true to recompute hashes and validate prior_hash links. Fallback: cat .cog/ledger/<session_id>/events.jsonl",
-	}, m.toolReadLedger)
+	}), m.toolReadLedger)
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_read_events",
 		Description: "Query recent kernel events for observability. Returns historical events from the ledger without chain verification (use cog_read_ledger for audit). Filters: session_id, event_type (exact or 'attention.*' wildcard), source ('kernel-v3' / 'mcp-client'), since/until (RFC3339 or duration shorthand like '5m'), limit (default 100, max 1000), order ('desc' newest-first default, 'asc' oldest-first). Fallback: ls .cog/ledger/ && cat .cog/ledger/*/events.jsonl",
-	}, m.toolReadEvents)
+	}), m.toolReadEvents)
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_tail_events",
 		Description: "Tail kernel events as they are appended to the ledger, like 'tail -f'. Blocks until max_events or max_duration reached. Same filters as cog_read_events plus since= for replay before going live. Bounded by max_events (default 100, max 1000) and max_duration (default 60s, max 10m). Fallback: curl -N http://localhost:6931/v1/events/stream",
-	}, m.toolTailEvents)
+	}), m.toolTailEvents)
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_ingest",
 		Description: "Ingest external material into CogOS knowledge. Deterministic decomposition — no LLM calls. Supports URLs, conversations, documents. Applies membrane policy (accept/quarantine/defer/discard).",
-	}, withToolObserver(m, "cog_ingest", m.toolIngest))
+	}), withToolObserver(m, "cog_ingest", m.toolIngest))
 
 	// Tool-call observability — reads the paired tool.call/tool.result events
 	// the wrapper above emits. Self-reflective: these two tools also go
 	// through withToolObserver and end up in their own query results.
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_read_tool_calls",
 		Description: "Query recent tool invocations and their outcomes. Returns call+result pairs from the ledger, filterable by tool_name, status (pending/success/error/rejected/timeout), source, ownership, call_id, or time window. Default limit 100, max 500. Arguments and output are opt-in via include_args/include_output. Fallback: grep '\"type\":\"tool\\.' .cog/ledger/<sid>/events.jsonl",
-	}, withToolObserver(m, "cog_read_tool_calls", m.toolReadToolCalls))
+	}), withToolObserver(m, "cog_read_tool_calls", m.toolReadToolCalls))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_tail_tool_calls",
 		Description: "Tail tool-call events live. Replays recent tool.call / tool.result events (up to max_events, default 50), applying the same filters as cog_read_tool_calls. When Agent N's event bus lands, this will stream new events live; until then it returns a snapshot of the latest matching rows. Fallback: tail -f .cog/ledger/<sid>/events.jsonl | grep '\"type\":\"tool\\.'",
-	}, withToolObserver(m, "cog_tail_tool_calls", m.toolTailToolCalls))
+	}), withToolObserver(m, "cog_tail_tool_calls", m.toolTailToolCalls))
 
 	// Agent state / loop control — closes Agent F gap #8 per Agent T's design.
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_list_agents",
 		Description: "Enumerate active agent harness instances inside the kernel. Each entry summarises identity, state, and recent activity. Today returns one element (\"primary\") reflecting the ServeAgent singleton; forward-compatible for future multi-agent deployment. Fallback: curl http://localhost:6931/v1/agents",
-	}, m.toolListAgents)
+	}), m.toolListAgents)
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_get_agent_state",
 		Description: "Full state snapshot of one agent instance — status summary, activity awareness, rolling cycle memory, pending proposals, inbox queue, and optionally the most recent cycle traces. Matches the shape of GET /v1/agents/{id}. Fallback: curl http://localhost:6931/v1/agents/primary",
-	}, m.toolGetAgentState)
+	}), m.toolGetAgentState)
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_trigger_agent_loop",
 		Description: "Manually invoke one homeostatic cycle of the specified agent, outside the regular ticker. Equivalent to POST /v1/agents/{id}/tick. Returns immediately with a trigger receipt; cycle runs async unless wait=true. Refuses if a cycle is already in flight (overlap guard). Fallback: curl -X POST http://localhost:6931/v1/agents/primary/tick",
-	}, m.toolTriggerAgentLoop)
+	}), m.toolTriggerAgentLoop)
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_tail_kernel_log",
 		Description: "Read recent entries from the kernel's own diagnostic log (slog JSON at .cog/run/kernel.log.jsonl). Returns newest-first, optionally filtered by level, substring, and time range. This is the OPERATOR/DEBUG surface — for hash-chained event history use cog_read_ledger (when available); for client metabolites (turn metrics, attention, proprioceptive) use cog_search_traces. Fallback: tail -n 100 .cog/run/kernel.log.jsonl | jq -c .",
-	}, m.toolTailKernelLog)
+	}), m.toolTailKernelLog)
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_read_conversation",
 		Description: "Read conversation turns (prompt + response pairs) from a session's chat history. " +
 			"Each turn is a complete user-to-assistant exchange; kernel tool calls are inlined when include_tools=true. " +
 			"Backed by the turn.completed ledger event + per-session sidecar (.cog/run/turns/<sid>.jsonl). " +
 			"Use after_turn / before_turn for pagination. Default: current process session, 20 turns, ascending. " +
 			"Fallback (kernel unavailable): jq -c . .cog/run/turns/<sid>.jsonl",
-	}, m.toolReadConversation)
+	}), m.toolReadConversation)
 
 	// Config mutation API (Agent O design — closes Agent F gaps #5 + #19).
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_read_config",
 		Description: "Read the kernel config (.cog/config/kernel.yaml). Returns the effective resolved config (defaults + file overrides). Optional include_raw_yaml returns the raw file bytes; include_defaults also returns the hardcoded defaults for diffing. kernel.yaml only — sibling configs (providers.yaml, secrets.yaml) are out of scope.",
-	}, m.toolReadConfig)
+	}), m.toolReadConfig)
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_write_config",
 		Description: "Merge a patch into the kernel config (.cog/config/kernel.yaml) using RFC 7396 JSON merge-patch semantics: fields omitted from the patch are left unchanged; explicit null removes a field and restores the default on next boot. Validated before persisting — returns violations without writing on failure. Atomic write + rotating .bak-<timestamp> backups (keeps 10). Takes effect on next daemon restart (requires_restart: true in response). Fallback: edit .cog/config/kernel.yaml and run `./scripts/cog restart`. No authentication — the kernel assumes a trusted local caller.",
-	}, m.toolWriteConfig)
+	}), m.toolWriteConfig)
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_rollback_config",
 		Description: "Restore kernel.yaml from a prior .bak-<timestamp> backup. Pass list_only=true to enumerate available backups without restoring. If backup is empty, the most recent backup is used. Atomic restore; response carries updated backup list.",
-	}, m.toolRollbackConfig)
+	}), m.toolRollbackConfig)
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_search_traces",
 		Description: "Search kernel trace JSONL streams in .cog/run/ (attention, proprioceptive, internal_requests). Filter by source, session_id, level, case-insensitive substring, and time range (since/until accept RFC3339 or duration like 5m/1h). Returns unified chronological results with per-source scan diagnostics. Fallback: ls .cog/run/*.jsonl && jq -c . .cog/run/<name>.jsonl | head",
-	}, m.toolSearchTraces)
+	}), m.toolSearchTraces)
 
 	// Kernel-native session/handoff tools (mcp_sessions.go). The 8 tools
 	// complement the 8 cogos_* bridge tools living in cog-sandbox-mcp:
