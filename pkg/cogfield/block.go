@@ -1,5 +1,25 @@
 package cogfield
 
+// ADR-084 dataref migration policy (Phase 1: schema-additive).
+//
+// The Block envelope below is the single source of truth for the two
+// mutually-compatible payload forms that coexist during the migration:
+//
+//   - Inline (pre-ADR-084): Payload map[string]interface{}
+//   - By-reference (ADR-084): Digest + MediaType + Size pointing into BlobStore
+//
+// Phase 1 emit paths continue to populate Payload. Phase 2 pilot sites
+// (gated by COGOS_DATAREF_EMIT=<site-name>) store bytes via BlobStore and
+// leave Payload empty. Consumers MUST tolerate both shapes and should:
+//
+//   1. Prefer Digest + BlobStore.Get(digest) if Digest != ""
+//   2. Fall back to inline Payload otherwise
+//
+// Full cut-over happens in Phase 2 (ADR-084 revision pending) once all
+// consumers have been updated to the byref-first resolution path.
+//
+// See: .cog/adr/084-bus-payloads-as-cogblocks.cog.md
+
 // Block is the canonical content atom for the CogOS bus protocol (ADR-059).
 // V1 blocks use PrevHash (string); V2 blocks use Prev ([]string) for DAG-style linking.
 // Both fields are written during the transition period for backward compatibility.
