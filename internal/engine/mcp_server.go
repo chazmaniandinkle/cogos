@@ -47,6 +47,11 @@ type MCPServer struct {
 	busSessions     *BusSessionManager
 	sessionRegistry *SessionRegistry
 	handoffRegistry *HandoffRegistry
+
+	// mod3Proxy backs the mod3_* MCP tools (Wave 3 of the mod3-kernel
+	// integration). Lazily initialised — tests can pre-seed it with a
+	// custom HTTP client + stub player to avoid real network + audio.
+	mod3Proxy *modalityProxy
 }
 
 // NewMCPServer creates and configures the MCP server with all stage-1 tools.
@@ -241,6 +246,12 @@ func (m *MCPServer) registerTools() {
 	// both surfaces coexist by design — same kernel truth, two MCP
 	// doorways (amendment #5 of the Agent P hybrid plan).
 	m.registerSessionTools()
+
+	// Wave 3: mod3 proxy tools (mcp_modality_proxy.go). The kernel becomes
+	// the MCP front door for mod3 — HTTP-forwards synthesis/stop/voices/
+	// status and plays the returned audio/wav locally. Supersedes the
+	// installed binary's OpenClaw gateway which silently drops audio bytes.
+	m.registerMod3Tools()
 }
 
 // registerResources registers MCP Resources — read-only addressable data.
