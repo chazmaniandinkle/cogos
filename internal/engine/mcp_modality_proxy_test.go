@@ -10,6 +10,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -868,4 +869,240 @@ sleep 5
 	case <-time.After(2 * time.Second):
 		t.Fatal("playAudio(blocking=false) did not return within 2s")
 	}
+}
+
+// ─── Wave 4.3 — subscriber-check / afplay skip ───────────────────────────────
+
+// TestMod3Speak_NoSessionAlwaysSpawnsPlayer — session_id="" bypasses the
+// subscriber check entirely so CLI invocations of mod3_speak still play
+// audio through afplay as they always did.
+func TestMod3Speak_NoSessionAlwaysSpawnsPlayer(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	stubPath, count := writeStubPlayer(t)
+	m.mod3Proxy = &modalityProxy{player: stubPath}
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:     "no session",
+		Blocking: true, // wait for stub to finish so the test can assert invocation count
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	if got, _ := out["playback_status"].(string); got != "played" {
+		t.Fatalf("expected playback_status=played, got %v", out["playback_status"])
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("expected stub player invoked once, got %d", got)
+	}
+}
+
+// TestMod3Speak_SessionWithSubscriberSkipsPlayer — when the injected
+// subscriber-check returns true, the kernel skips afplay entirely and
+// returns playback_status=routed_ws. The stub player must NOT be invoked.
+func TestMod3Speak_SessionWithSubscriberSkipsPlayer(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	stubPath, count := writeStubPlayer(t)
+	m.mod3Proxy = &modalityProxy{
+		player: stubPath,
+		subscriberCheck: func(ctx context.Context, sessionID string) (bool, error) {
+			if sessionID != "cs-with-sub" {
+				t.Errorf("unexpected session_id=%q", sessionID)
+			}
+			return true, nil
+		},
+	}
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:      "skip me",
+		SessionID: "cs-with-sub",
+		Blocking:  true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	if got, _ := out["playback_status"].(string); got != "routed_ws" {
+		t.Fatalf("expected playback_status=routed_ws, got %v", out["playback_status"])
+	}
+	// Give any stray goroutine a moment to trip the stub — proving non-invocation.
+	time.Sleep(100 * time.Millisecond)
+	if got := count(); got != 0 {
+		t.Fatalf("expected stub player NOT invoked, got %d", got)
+	}
+}
+
+// TestMod3Speak_SessionWithoutSubscriberSpawnsPlayer — subscriber-check
+// returns false: kernel falls back to the normal afplay path and the stub
+// player IS invoked.
+func TestMod3Speak_SessionWithoutSubscriberSpawnsPlayer(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	stubPath, count := writeStubPlayer(t)
+	m.mod3Proxy = &modalityProxy{
+		player: stubPath,
+		subscriberCheck: func(ctx context.Context, sessionID string) (bool, error) {
+			return false, nil
+		},
+	}
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:      "no subscriber",
+		SessionID: "cs-no-sub",
+		Blocking:  true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	if got, _ := out["playback_status"].(string); got != "played" {
+		t.Fatalf("expected playback_status=played, got %v", out["playback_status"])
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("expected stub player invoked once, got %d", got)
+	}
+}
+
+// TestMod3Speak_SubscriberCheckErrorFallsBackToPlayer — transient
+// check error (mod3 flaky, timeout, etc.) must not orphan the audio.
+// The kernel logs the error, records subscriber_check_error in the result,
+// and still spawns the player so the user hears the reply.
+func TestMod3Speak_SubscriberCheckErrorFallsBackToPlayer(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	stubPath, count := writeStubPlayer(t)
+	m.mod3Proxy = &modalityProxy{
+		player: stubPath,
+		subscriberCheck: func(ctx context.Context, sessionID string) (bool, error) {
+			return false, fmt.Errorf("mod3 probe timed out")
+		},
+	}
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:      "check failed",
+		SessionID: "cs-flaky",
+		Blocking:  true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success despite check error, got %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	if got, _ := out["playback_status"].(string); got != "played" {
+		t.Fatalf("expected playback_status=played, got %v", out["playback_status"])
+	}
+	if checkErr, _ := out["subscriber_check_error"].(string); !strings.Contains(checkErr, "probe timed out") {
+		t.Fatalf("expected subscriber_check_error to surface, got %v", out["subscriber_check_error"])
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("expected stub player invoked once on check error, got %d", got)
+	}
+}
+
+// TestCheckSessionSubscriber_DefaultImplementationHitsMod3 — wire up a
+// stand-alone fake HTTP server that answers the
+// /v1/sessions/{id}/subscribers probe and verify the default implementation
+// (no injected subscriberCheck) parses its response correctly.
+func TestCheckSessionSubscriber_DefaultImplementationHitsMod3(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/cs-yes/subscribers", func(w http.ResponseWriter, r *http.Request) {
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"session_id": "cs-yes", "subscribed": true, "count": 1,
+		})
+	})
+	mux.HandleFunc("GET /v1/sessions/cs-no/subscribers", func(w http.ResponseWriter, r *http.Request) {
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"session_id": "cs-no", "subscribed": false, "count": 0,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	m := &MCPServer{
+		cfg:       &Config{Mod3URL: srv.URL},
+		mod3Proxy: &modalityProxy{disablePlayback: true},
+	}
+
+	yes, err := m.checkSessionSubscriber(context.Background(), "cs-yes")
+	if err != nil {
+		t.Fatalf("cs-yes: %v", err)
+	}
+	if !yes {
+		t.Fatal("cs-yes: expected subscribed=true")
+	}
+
+	no, err := m.checkSessionSubscriber(context.Background(), "cs-no")
+	if err != nil {
+		t.Fatalf("cs-no: %v", err)
+	}
+	if no {
+		t.Fatal("cs-no: expected subscribed=false")
+	}
+}
+
+// TestCheckSessionSubscriber_Mod3UnreachableReturnsError — transport
+// error (connection refused, timeout) must surface as a non-nil error so
+// toolMod3Speak records subscriber_check_error and falls back to afplay.
+func TestCheckSessionSubscriber_Mod3UnreachableReturnsError(t *testing.T) {
+	// Bind a port, close it so dials get ECONNREFUSED.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+
+	m := &MCPServer{
+		cfg:       &Config{Mod3URL: "http://" + addr},
+		mod3Proxy: &modalityProxy{disablePlayback: true},
+	}
+	subscribed, err := m.checkSessionSubscriber(context.Background(), "cs-anything")
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	if subscribed {
+		t.Fatal("expected subscribed=false on error")
+	}
+}
+
+// writeStubPlayer builds a temp shell script that records each invocation
+// by appending to a log file. Returns the path of the executable AND a
+// getter that returns the current invocation count. The stub exits
+// immediately so blocking=true still works in tests.
+func writeStubPlayer(t *testing.T) (stubPath string, count func() int) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "invocations.log")
+	stubPath = filepath.Join(dir, "stub-player.sh")
+	stubBody := `#!/bin/sh
+echo "invoked" >> "` + logPath + `"
+`
+	if err := os.WriteFile(stubPath, []byte(stubBody), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	count = func() int {
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			return 0
+		}
+		return strings.Count(string(data), "invoked\n")
+	}
+	return stubPath, count
 }

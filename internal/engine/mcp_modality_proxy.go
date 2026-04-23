@@ -83,6 +83,14 @@ type modalityProxy struct {
 	// this when they want to assert "we got the bytes" without spawning a
 	// real player. Production code leaves it false.
 	disablePlayback bool
+
+	// subscriberCheck, when non-nil, is consulted before spawning the local
+	// player in mod3_speak. If it returns (true, nil) the kernel skips
+	// afplay — mod3's /ws/audio/{session_id} WebSocket is already pushing
+	// the WAV to a dashboard subscriber (Wave 4.3). Errors and false return
+	// values fall through to the normal playback path. Nil means "use the
+	// default HTTP implementation" (GET {Mod3URL}/v1/sessions/{id}/subscribers).
+	subscriberCheck func(ctx context.Context, sessionID string) (bool, error)
 }
 
 // defaultMod3ProxyTimeout is the per-request timeout for mod3 forwards. 30s
@@ -279,6 +287,25 @@ func (m *MCPServer) toolMod3Speak(ctx context.Context, req *mcp.CallToolRequest,
 		return marshalResult(result)
 	}
 
+	// Wave 4.3 — if the session has a live dashboard WebSocket subscriber,
+	// mod3 is already routing the WAV there. Skip the kernel's local player
+	// so we don't double-play. The check is scoped to sessions that were
+	// actually named on the speak call; session_id="" always falls through
+	// to the normal afplay path so CLI invocations keep working.
+	if in.SessionID != "" {
+		subscribed, checkErr := m.checkSessionSubscriber(ctx, in.SessionID)
+		if checkErr != nil {
+			// Log-worthy but not fatal — fall back to local playback.
+			slog.Debug("mod3 proxy: subscriber check failed",
+				"session_id", in.SessionID, "err", checkErr)
+			result["subscriber_check_error"] = checkErr.Error()
+		}
+		if subscribed {
+			result["playback_status"] = "routed_ws"
+			return marshalResult(result)
+		}
+	}
+
 	playErr := p.playAudio(audio, in.Blocking)
 	switch {
 	case playErr == nil && in.Blocking:
@@ -290,6 +317,43 @@ func (m *MCPServer) toolMod3Speak(ctx context.Context, req *mcp.CallToolRequest,
 		result["playback_error"] = playErr.Error()
 	}
 	return marshalResult(result)
+}
+
+// checkSessionSubscriber asks mod3 whether ``sessionID`` has at least one
+// active dashboard WebSocket subscriber for audio playback. Returns
+// ``(subscribed, nil)`` on success, ``(false, err)`` on transport failure.
+// ``(false, nil)`` — the default when the proxy has no check configured —
+// also suppresses the routing path, so legacy callers see the exact same
+// afplay behavior as before.
+//
+// Injectable via modalityProxy.subscriberCheck for tests. The default is a
+// GET against mod3's /v1/sessions/{id}/subscribers endpoint with a 1.5s
+// timeout inherited from defaultMod3ProxyTimeout.
+func (m *MCPServer) checkSessionSubscriber(ctx context.Context, sessionID string) (bool, error) {
+	p := m.getModalityProxy()
+	if p.subscriberCheck != nil {
+		return p.subscriberCheck(ctx, sessionID)
+	}
+	// Default implementation — HTTP GET. Scoped to 1.5s so a wedged mod3
+	// can't block a speak for more than that; falls back to afplay on timeout.
+	checkCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	raw, _, status, err := m.proxyMod3Bytes(checkCtx, http.MethodGet,
+		"/v1/sessions/"+url.PathEscape(sessionID)+"/subscribers", nil, "")
+	if err != nil {
+		return false, err
+	}
+	if status < 200 || status >= 300 {
+		return false, fmt.Errorf("mod3 returned %d: %s", status, truncate(string(raw), 200))
+	}
+	var body struct {
+		Subscribed bool `json:"subscribed"`
+		Count      int  `json:"count"`
+	}
+	if unmarshalErr := json.Unmarshal(raw, &body); unmarshalErr != nil {
+		return false, fmt.Errorf("decode subscribers response: %w", unmarshalErr)
+	}
+	return body.Subscribed, nil
 }
 
 func (m *MCPServer) toolMod3Stop(ctx context.Context, req *mcp.CallToolRequest, in mod3StopInput) (*mcp.CallToolResult, any, error) {
