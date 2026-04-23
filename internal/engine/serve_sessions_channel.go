@@ -68,6 +68,17 @@ type ChannelSessionRecord struct {
 	PreferredOutputDevice string `json:"preferred_output_device,omitempty"`
 	Priority              int    `json:"priority,omitempty"`
 
+	// Kinds mirrors the channel-provider RFC's `kinds` metadata field
+	// (e.g. ["audio"] for a mod3-provider registration). Mod3 ignores it
+	// today; kept on the kernel record for downstream consumers that want
+	// to filter by capability.
+	Kinds []string `json:"kinds,omitempty"`
+
+	// Metadata is an opaque pass-through map the RFC describes as
+	// "provider_id/kinds in the metadata" — preserved verbatim on the
+	// kernel record and forwarded to mod3 (which ignores unknown fields).
+	Metadata map[string]any `json:"metadata,omitempty"`
+
 	RegisteredAt time.Time `json:"registered_at"`
 	LastSeen     time.Time `json:"last_seen"`
 
@@ -165,13 +176,22 @@ func (s *Server) registerChannelSessionRoutes(mux *http.ServeMux) {
 // channelSessionRegisterRequest is the kernel-facing request body. Shape
 // mirrors mod3's SessionRegisterRequest (see mod3/http_api.py line ~278) plus
 // an optional session_id — when omitted, the kernel mints one.
+//
+// Wave 3.5 schema alignment with the channel-provider RFC's
+// `cogos_session_register` primitive: `kinds` (array of adapter kinds the
+// registrant participates in, e.g. ["audio"]) and `metadata` (opaque
+// pass-through blob — RFC calls for provider_id/kinds to live in metadata)
+// are both optional and flow through to mod3 unchanged (mod3 ignores
+// unknown fields).
 type channelSessionRegisterRequest struct {
-	SessionID             string `json:"session_id,omitempty"`
-	ParticipantID         string `json:"participant_id"`
-	ParticipantType       string `json:"participant_type,omitempty"`
-	PreferredVoice        string `json:"preferred_voice,omitempty"`
-	PreferredOutputDevice string `json:"preferred_output_device,omitempty"`
-	Priority              int    `json:"priority,omitempty"`
+	SessionID             string         `json:"session_id,omitempty"`
+	ParticipantID         string         `json:"participant_id"`
+	ParticipantType       string         `json:"participant_type,omitempty"`
+	PreferredVoice        string         `json:"preferred_voice,omitempty"`
+	PreferredOutputDevice string         `json:"preferred_output_device,omitempty"`
+	Priority              int            `json:"priority,omitempty"`
+	Kinds                 []string       `json:"kinds,omitempty"`
+	Metadata              map[string]any `json:"metadata,omitempty"`
 }
 
 // channelSessionResponse is the merged shape returned from the kernel. The
@@ -192,18 +212,52 @@ type channelSessionListResponse struct {
 	Mod3   json.RawMessage         `json:"mod3,omitempty"`
 }
 
-// ─── POST /v1/channel-sessions/register ──────────────────────────────────────
+// ─── shared register/deregister/list logic (Wave 3.5) ────────────────────────
+//
+// These methods are the single place session-ID minting, kernel registry
+// commits, and mod3 forwarding happen. Both the HTTP handlers below and the
+// mod3_register_session / mod3_deregister_session / mod3_list_sessions MCP
+// tools (see mcp_modality_proxy.go) call through here so session-ID
+// authority stays centralized — nobody reaches mod3's /v1/sessions/* surface
+// directly except this one codepath.
 
-func (s *Server) handleChannelSessionRegister(w http.ResponseWriter, r *http.Request) {
-	var req channelSessionRegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid_request", "body must be JSON")
-		return
-	}
+// channelSessionForwardError classifies a failure in RegisterChannelSession /
+// DeregisterChannelSession / ListChannelSessions so the caller (HTTP handler
+// or MCP tool) can surface the right status/message without re-parsing.
+type channelSessionForwardError struct {
+	// Kind: "invalid_request" | "mod3_unreachable" | "mod3_rejected"
+	Kind string
+	// HTTPStatus is the status the caller should emit (400 for
+	// invalid_request, 502 for mod3_unreachable, mod3's own status for
+	// mod3_rejected).
+	HTTPStatus int
+	// Message is a human-readable description, safe to surface to callers.
+	Message string
+	// Mod3Body carries the raw JSON body mod3 returned when Kind ==
+	// "mod3_rejected", so the HTTP handler can pass it through verbatim.
+	Mod3Body json.RawMessage
+}
+
+func (e *channelSessionForwardError) Error() string { return e.Message }
+
+// RegisterChannelSession is the Wave 2+3.5 shared entry point for channel-
+// session registration. It mints a session_id when absent, forwards to mod3,
+// and commits the kernel-side identity record on success.
+//
+// Callers:
+//   - HTTP:  POST /v1/channel-sessions/register  (handleChannelSessionRegister)
+//   - MCP:   mod3_register_session tool          (toolMod3RegisterSession)
+//
+// Returning a (resp, nil) pair means the caller should surface the merged
+// response with 200 OK. Returning a non-nil *channelSessionForwardError
+// tells the caller which status + body shape to surface.
+func (s *Server) RegisterChannelSession(ctx context.Context, req channelSessionRegisterRequest) (*channelSessionResponse, *channelSessionForwardError) {
 	if req.ParticipantID == "" {
-		writeJSONError(w, http.StatusBadRequest, "invalid_request",
-			"participant_id is required")
-		return
+		return nil, &channelSessionForwardError{
+			Kind:       "invalid_request",
+			HTTPStatus: http.StatusBadRequest,
+			Message:    "participant_id is required",
+		}
 	}
 
 	// Mint when absent — kernel is the session-ID authority (ADR-082).
@@ -227,6 +281,8 @@ func (s *Server) handleChannelSessionRegister(w http.ResponseWriter, r *http.Req
 		PreferredVoice:        req.PreferredVoice,
 		PreferredOutputDevice: req.PreferredOutputDevice,
 		Priority:              req.Priority,
+		Kinds:                 req.Kinds,
+		Metadata:              req.Metadata,
 		RegisteredAt:          now,
 		LastSeen:              now,
 		IDSource:              idSource,
@@ -234,7 +290,9 @@ func (s *Server) handleChannelSessionRegister(w http.ResponseWriter, r *http.Req
 
 	// Forward to mod3 with the kernel-issued session_id. Mod3's body is the
 	// same shape modulo the optional session_id field (mod3 requires it; we
-	// always supply one).
+	// always supply one). `kinds` and `metadata` are RFC-level fields mod3
+	// currently ignores; we still forward them so mod3 can start consuming
+	// them without a kernel change when it's ready.
 	forwardBody := map[string]any{
 		"session_id":              req.SessionID,
 		"participant_id":          req.ParticipantID,
@@ -243,27 +301,35 @@ func (s *Server) handleChannelSessionRegister(w http.ResponseWriter, r *http.Req
 		"preferred_output_device": req.PreferredOutputDevice,
 		"priority":                req.Priority,
 	}
+	if len(req.Kinds) > 0 {
+		forwardBody["kinds"] = req.Kinds
+	}
+	if len(req.Metadata) > 0 {
+		forwardBody["metadata"] = req.Metadata
+	}
 	body, _ := json.Marshal(forwardBody)
 
-	mod3Resp, status, err := s.forwardMod3(r.Context(), http.MethodPost,
+	mod3Resp, status, err := s.forwardMod3(ctx, http.MethodPost,
 		"/v1/sessions/register", bytes.NewReader(body))
 	if err != nil {
 		slog.Warn("channel-sessions: forward to mod3 failed",
 			"session_id", req.SessionID, "err", err)
-		writeJSONError(w, http.StatusBadGateway, "mod3_unreachable",
-			fmt.Sprintf("mod3 unreachable: %v", err))
-		return
+		return nil, &channelSessionForwardError{
+			Kind:       "mod3_unreachable",
+			HTTPStatus: http.StatusBadGateway,
+			Message:    fmt.Sprintf("mod3 unreachable: %v", err),
+		}
 	}
 
-	// Preserve non-success status bodies so the caller can surface mod3's
-	// diagnostic text. Any 4xx/5xx from mod3 becomes the response status
-	// with the raw body attached — the kernel does NOT write its identity
-	// record in that case (mod3 rejected the registration).
 	if status < 200 || status >= 300 {
 		slog.Warn("channel-sessions: mod3 returned non-2xx",
 			"session_id", req.SessionID, "status", status)
-		writeJSONPassThrough(w, status, mod3Resp)
-		return
+		return nil, &channelSessionForwardError{
+			Kind:       "mod3_rejected",
+			HTTPStatus: status,
+			Message:    fmt.Sprintf("mod3 returned %d", status),
+			Mod3Body:   mod3Resp,
+		}
 	}
 
 	// Mod3 accepted — commit the kernel-side identity record.
@@ -272,12 +338,101 @@ func (s *Server) handleChannelSessionRegister(w http.ResponseWriter, r *http.Req
 		"session_id", req.SessionID, "participant_id", req.ParticipantID,
 		"id_source", idSource)
 
-	// Return merged response. The `mod3` field is the raw body from mod3 so
-	// callers get the exact {assigned_voice, voice_conflict, output_device,
-	// queue_depth, ...} shape mod3 emits.
-	resp := channelSessionResponse{
-		Kernel: &record,
+	return &channelSessionResponse{Kernel: &record, Mod3: mod3Resp}, nil
+}
+
+// DeregisterChannelSession is the shared entry point for deregistration.
+// Forwards to mod3 and drops the kernel registry row on any non-5xx mod3
+// response (including 404 — "mod3 forgot" is equivalent to "kernel should
+// forget too"). On transport failure the kernel keeps the record so the
+// caller can retry.
+//
+// Returns the raw mod3 body + status on success. Callers should surface
+// both verbatim (writeJSONPassThrough on the HTTP side; the MCP tool
+// wraps it as a JSON result).
+func (s *Server) DeregisterChannelSession(ctx context.Context, sessionID string) (json.RawMessage, int, *channelSessionForwardError) {
+	if sessionID == "" {
+		return nil, 0, &channelSessionForwardError{
+			Kind:       "invalid_request",
+			HTTPStatus: http.StatusBadRequest,
+			Message:    "session_id is required",
+		}
+	}
+
+	mod3Resp, status, err := s.forwardMod3(ctx, http.MethodPost,
+		"/v1/sessions/"+sessionID+"/deregister", nil)
+	if err != nil {
+		slog.Warn("channel-sessions: deregister forward failed",
+			"session_id", sessionID, "err", err)
+		return nil, 0, &channelSessionForwardError{
+			Kind:       "mod3_unreachable",
+			HTTPStatus: http.StatusBadGateway,
+			Message:    fmt.Sprintf("mod3 unreachable: %v", err),
+		}
+	}
+
+	// Kernel drops its identity record whenever mod3 successfully
+	// acknowledges, including 404 ("never registered" is equivalent to
+	// "not tracked"; clean slate in kernel matches clean slate in mod3).
+	if status >= 200 && status < 500 {
+		s.channelSessionRegistry.Delete(sessionID)
+	}
+
+	return mod3Resp, status, nil
+}
+
+// ListChannelSessions is the shared entry point for the merged list query.
+// Returns the kernel snapshot plus mod3's raw `GET /v1/sessions` body.
+//
+// On mod3 transport failure: error (502). On mod3 non-2xx: returns the
+// raw mod3 body with its status attached so the caller can surface intact.
+func (s *Server) ListChannelSessions(ctx context.Context) (*channelSessionListResponse, int, *channelSessionForwardError) {
+	mod3Resp, status, err := s.forwardMod3(ctx, http.MethodGet,
+		"/v1/sessions", nil)
+	if err != nil {
+		slog.Warn("channel-sessions: list forward failed", "err", err)
+		return nil, 0, &channelSessionForwardError{
+			Kind:       "mod3_unreachable",
+			HTTPStatus: http.StatusBadGateway,
+			Message:    fmt.Sprintf("mod3 unreachable: %v", err),
+		}
+	}
+	if status < 200 || status >= 300 {
+		return nil, status, &channelSessionForwardError{
+			Kind:       "mod3_rejected",
+			HTTPStatus: status,
+			Message:    fmt.Sprintf("mod3 returned %d", status),
+			Mod3Body:   mod3Resp,
+		}
+	}
+	return &channelSessionListResponse{
+		Kernel: s.channelSessionRegistry.Snapshot(),
 		Mod3:   mod3Resp,
+	}, http.StatusOK, nil
+}
+
+// ─── POST /v1/channel-sessions/register ──────────────────────────────────────
+
+func (s *Server) handleChannelSessionRegister(w http.ResponseWriter, r *http.Request) {
+	var req channelSessionRegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "body must be JSON")
+		return
+	}
+
+	resp, ferr := s.RegisterChannelSession(r.Context(), req)
+	if ferr != nil {
+		switch ferr.Kind {
+		case "invalid_request":
+			writeJSONError(w, ferr.HTTPStatus, "invalid_request", ferr.Message)
+		case "mod3_unreachable":
+			writeJSONError(w, ferr.HTTPStatus, "mod3_unreachable", ferr.Message)
+		case "mod3_rejected":
+			writeJSONPassThrough(w, ferr.HTTPStatus, ferr.Mod3Body)
+		default:
+			writeJSONError(w, http.StatusInternalServerError, "internal", ferr.Message)
+		}
+		return
 	}
 	writeJSONResp(w, http.StatusOK, resp)
 }
@@ -292,46 +447,34 @@ func (s *Server) handleChannelSessionDeregister(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	mod3Resp, status, err := s.forwardMod3(r.Context(), http.MethodPost,
-		"/v1/sessions/"+id+"/deregister", nil)
-	if err != nil {
-		slog.Warn("channel-sessions: deregister forward failed",
-			"session_id", id, "err", err)
-		writeJSONError(w, http.StatusBadGateway, "mod3_unreachable",
-			fmt.Sprintf("mod3 unreachable: %v", err))
+	mod3Resp, status, ferr := s.DeregisterChannelSession(r.Context(), id)
+	if ferr != nil {
+		if ferr.Kind == "mod3_unreachable" {
+			writeJSONError(w, ferr.HTTPStatus, "mod3_unreachable", ferr.Message)
+			return
+		}
+		writeJSONError(w, ferr.HTTPStatus, ferr.Kind, ferr.Message)
 		return
 	}
-
-	// Kernel drops its identity record whenever mod3 successfully
-	// acknowledges, including 404 ("never registered" is equivalent to
-	// "not tracked"; clean slate in kernel matches clean slate in mod3).
-	if status >= 200 && status < 500 {
-		s.channelSessionRegistry.Delete(id)
-	}
-
 	writeJSONPassThrough(w, status, mod3Resp)
 }
 
 // ─── GET /v1/channel-sessions ────────────────────────────────────────────────
 
 func (s *Server) handleChannelSessionList(w http.ResponseWriter, r *http.Request) {
-	mod3Resp, status, err := s.forwardMod3(r.Context(), http.MethodGet,
-		"/v1/sessions", nil)
-	if err != nil {
-		slog.Warn("channel-sessions: list forward failed", "err", err)
-		writeJSONError(w, http.StatusBadGateway, "mod3_unreachable",
-			fmt.Sprintf("mod3 unreachable: %v", err))
+	resp, status, ferr := s.ListChannelSessions(r.Context())
+	if ferr != nil {
+		switch ferr.Kind {
+		case "mod3_unreachable":
+			writeJSONError(w, ferr.HTTPStatus, "mod3_unreachable", ferr.Message)
+		case "mod3_rejected":
+			writeJSONPassThrough(w, ferr.HTTPStatus, ferr.Mod3Body)
+		default:
+			writeJSONError(w, http.StatusInternalServerError, "internal", ferr.Message)
+		}
 		return
 	}
-	if status < 200 || status >= 300 {
-		writeJSONPassThrough(w, status, mod3Resp)
-		return
-	}
-	resp := channelSessionListResponse{
-		Kernel: s.channelSessionRegistry.Snapshot(),
-		Mod3:   mod3Resp,
-	}
-	writeJSONResp(w, http.StatusOK, resp)
+	writeJSONResp(w, status, resp)
 }
 
 // ─── GET /v1/channel-sessions/{id} ───────────────────────────────────────────

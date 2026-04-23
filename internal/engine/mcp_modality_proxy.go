@@ -1,6 +1,7 @@
 // mcp_modality_proxy.go — kernel-side MCP proxy for mod3 voice tools.
 //
-// Wave 3 of the mod3-kernel integration (ADR-082 + channel-provider RFC).
+// Wave 3 of the mod3-kernel integration (ADR-082 + channel-provider RFC),
+// consolidated in Wave 3.5 with Wave 2's session-ID authority.
 // The kernel becomes the MCP front door for mod3; the previous OpenClaw
 // gateway pattern in the installed binary read metrics but discarded audio
 // bytes. This proxy fixes that: it forwards HTTP calls to mod3, captures the
@@ -9,14 +10,16 @@
 //
 // Design locks:
 //
-//  1. MCP transport = HTTP proxy. Every tool handler here POSTs/GETs against
-//     cfg.Mod3URL + "/v1/*". Mod3 is NOT an MCP server to the kernel. The
-//     installed binary's OpenClaw gateway is a separate concern — we are the
-//     next kernel build and will supersede it when deployed.
-//  2. Session authority = kernel-owned. session_id is threaded through every
-//     proxied call. Callers pass it as an optional field; absent → proxy
-//     omits it and mod3 routes to its default session. Present → proxy
-//     includes it in the request body (synthesize) or query string (stop).
+//  1. MCP transport = HTTP proxy. Synthesis/control tool handlers here
+//     POST/GET against cfg.Mod3URL + "/v1/*". Mod3 is NOT an MCP server to
+//     the kernel. The installed binary's OpenClaw gateway is a separate
+//     concern — we are the next kernel build and will supersede it when
+//     deployed.
+//  2. Session authority = kernel-owned (Wave 3.5). The session-family tools
+//     (register/deregister/list) do NOT call mod3 directly — they call the
+//     kernel's RegisterChannelSession / DeregisterChannelSession /
+//     ListChannelSessions methods on the Server, which mint the session_id
+//     and forward to mod3. Session ID minting happens in exactly one place.
 //  3. Playback strategy = Option (A), server-side. Kernel receives audio/wav,
 //     writes to a tempfile, execs `afplay` (macOS) or `aplay` (Linux),
 //     fire-and-forget. Callers can opt in to blocking with blocking=true.
@@ -26,18 +29,13 @@
 //
 // Tools registered (prefix `mod3_` to namespace against cog_* kernel tools):
 //
-//   - mod3_speak                — synthesize + (optionally) play
-//   - mod3_stop                 — cancel current/queued speech
-//   - mod3_voices               — list available voices
-//   - mod3_status               — mod3 /health probe + build info
-//   - mod3_register_session     — proxy to mod3 session register (future)
-//   - mod3_deregister_session   — proxy to mod3 session deregister
-//   - mod3_list_sessions        — proxy to mod3 session list
-//
-// Note: the session-registry family forwards to mod3's /v1/sessions/* routes
-// which are not yet live on every mod3 instance (see openapi.json). They
-// return a clean 502 "mod3_unreachable" in that case; once mod3 implements
-// the routes (ADR-082 Wave 2 target), these tools become useful.
+//   - mod3_speak                — synthesize + (optionally) play      (direct to mod3)
+//   - mod3_stop                 — cancel current/queued speech        (direct to mod3)
+//   - mod3_voices               — list available voices               (direct to mod3)
+//   - mod3_status               — mod3 /health probe + build info     (direct to mod3)
+//   - mod3_register_session     — kernel-minted session registration  (via kernel)
+//   - mod3_deregister_session   — session deregister                  (via kernel)
+//   - mod3_list_sessions        — merged kernel+mod3 session roster   (via kernel)
 package engine
 
 import (
@@ -148,27 +146,34 @@ func (m *MCPServer) registerMod3Tools() {
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name: "mod3_register_session",
-		Description: "Proxy to mod3's POST /v1/sessions/register. Required: " +
-			"participant_id. Optional: session_id (caller-supplied; kernel " +
-			"does NOT mint here — use /v1/channel-sessions/register for that), " +
-			"participant_type, preferred_voice, preferred_output_device, " +
-			"priority. Returns mod3's full SessionRegisterResponse (assigned_" +
-			"voice, voice_conflict, output_device, queue_depth).",
+		Description: "Register a channel-participant session. Routes through " +
+			"the kernel's /v1/channel-sessions/register endpoint so " +
+			"session_id minting stays centralized (ADR-082 Wave 3.5). " +
+			"Required: participant_id. Optional: session_id (kernel mints " +
+			"a cs-* short UUID when absent), participant_type " +
+			"(agent|user|provider), preferred_voice, preferred_output_device, " +
+			"priority, kinds (e.g. [\"audio\"] per channel-provider RFC), " +
+			"metadata (opaque pass-through). Returns the merged {kernel, " +
+			"mod3} block: kernel identity record + mod3's full " +
+			"SessionRegisterResponse (assigned_voice, voice_conflict, " +
+			"output_device, queue_depth).",
 	}, withToolObserver(m, "mod3_register_session", m.toolMod3RegisterSession))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name: "mod3_deregister_session",
-		Description: "Proxy to mod3's POST /v1/sessions/{session_id}/deregister. " +
-			"Required: session_id. Returns mod3's deregister acknowledgment " +
-			"(released_voice, dropped_jobs).",
+		Description: "Deregister a channel-participant session. Routes " +
+			"through the kernel's /v1/channel-sessions/{id}/deregister " +
+			"endpoint so the kernel drops its identity record in sync with " +
+			"mod3. Required: session_id. Returns mod3's deregister " +
+			"acknowledgment (released_voice, dropped_jobs).",
 	}, withToolObserver(m, "mod3_deregister_session", m.toolMod3DeregisterSession))
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name: "mod3_list_sessions",
-		Description: "Proxy to mod3's GET /v1/sessions. Returns the live " +
-			"mod3 session roster (sessions, voice_pool, voice_holders, " +
-			"serializer policy). No kernel-side filtering — mod3 is source " +
-			"of truth for per-channel state.",
+		Description: "List channel-participant sessions via the kernel's " +
+			"/v1/channel-sessions endpoint. Returns a merged {kernel, mod3} " +
+			"block: kernel identity records + mod3's live per-channel state " +
+			"(voice_pool, voice_holders, serializer policy).",
 	}, withToolObserver(m, "mod3_list_sessions", m.toolMod3ListSessions))
 }
 
@@ -208,6 +213,10 @@ type mod3RegisterSessionInput struct {
 	PreferredVoice        string `json:"preferred_voice,omitempty"`
 	PreferredOutputDevice string `json:"preferred_output_device,omitempty"`
 	Priority              int    `json:"priority,omitempty"`
+	// Kinds / Metadata are the channel-provider RFC fields that flow
+	// through to mod3 unchanged. See cogos_session_register primitive.
+	Kinds    []string       `json:"kinds,omitempty"`
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 type mod3DeregisterSessionInput struct {
@@ -310,42 +319,90 @@ func (m *MCPServer) toolMod3Status(ctx context.Context, req *mcp.CallToolRequest
 	return m.proxyMod3JSONAsMCP(ctx, http.MethodGet, "/health", nil)
 }
 
+// toolMod3RegisterSession routes through the kernel's shared
+// RegisterChannelSession so session_id minting happens in exactly one place
+// (ADR-082 Wave 3.5). The previous Wave 3 implementation called mod3's
+// /v1/sessions/register directly, which bypassed Wave 2's kernel-owned
+// minting authority; that path is now gone.
 func (m *MCPServer) toolMod3RegisterSession(ctx context.Context, req *mcp.CallToolRequest, in mod3RegisterSessionInput) (*mcp.CallToolResult, any, error) {
 	if in.ParticipantID == "" {
 		return textResult("participant_id is required")
 	}
-	body := map[string]any{
-		"participant_id": in.ParticipantID,
+	if m.channelSessionBackend == nil {
+		return mod3ErrorResult("channel-session backend not configured")
 	}
-	if in.SessionID != "" {
-		body["session_id"] = in.SessionID
+	resp, ferr := m.channelSessionBackend.RegisterChannelSession(ctx, channelSessionRegisterRequest{
+		SessionID:             in.SessionID,
+		ParticipantID:         in.ParticipantID,
+		ParticipantType:       in.ParticipantType,
+		PreferredVoice:        in.PreferredVoice,
+		PreferredOutputDevice: in.PreferredOutputDevice,
+		Priority:              in.Priority,
+		Kinds:                 in.Kinds,
+		Metadata:              in.Metadata,
+	})
+	if ferr != nil {
+		return mod3ErrorResult(channelSessionForwardErrorText(ferr))
 	}
-	if in.ParticipantType != "" {
-		body["participant_type"] = in.ParticipantType
-	}
-	if in.PreferredVoice != "" {
-		body["preferred_voice"] = in.PreferredVoice
-	}
-	if in.PreferredOutputDevice != "" {
-		body["preferred_output_device"] = in.PreferredOutputDevice
-	}
-	if in.Priority != 0 {
-		body["priority"] = in.Priority
-	}
-	raw, _ := json.Marshal(body)
-	return m.proxyMod3JSONAsMCP(ctx, http.MethodPost, "/v1/sessions/register", bytes.NewReader(raw))
+	return marshalResult(resp)
 }
 
 func (m *MCPServer) toolMod3DeregisterSession(ctx context.Context, req *mcp.CallToolRequest, in mod3DeregisterSessionInput) (*mcp.CallToolResult, any, error) {
 	if in.SessionID == "" {
 		return textResult("session_id is required")
 	}
-	return m.proxyMod3JSONAsMCP(ctx, http.MethodPost,
-		"/v1/sessions/"+url.PathEscape(in.SessionID)+"/deregister", nil)
+	if m.channelSessionBackend == nil {
+		return mod3ErrorResult("channel-session backend not configured")
+	}
+	mod3Resp, status, ferr := m.channelSessionBackend.DeregisterChannelSession(ctx, in.SessionID)
+	if ferr != nil {
+		return mod3ErrorResult(channelSessionForwardErrorText(ferr))
+	}
+	// Parse mod3's JSON body; surface mod3's non-2xx bodies intact as
+	// tool errors. The HTTP handler passes these through verbatim; the
+	// MCP tool wraps them so the caller sees the mod3 body text.
+	var parsed any
+	if len(mod3Resp) > 0 {
+		if jsonErr := json.Unmarshal(mod3Resp, &parsed); jsonErr != nil {
+			parsed = map[string]any{"raw": string(mod3Resp)}
+		}
+	}
+	if status < 200 || status >= 300 {
+		return mod3ErrorResult(fmt.Sprintf("mod3 returned %d: %v", status, parsed))
+	}
+	return marshalResult(parsed)
 }
 
 func (m *MCPServer) toolMod3ListSessions(ctx context.Context, req *mcp.CallToolRequest, in mod3ListSessionsInput) (*mcp.CallToolResult, any, error) {
-	return m.proxyMod3JSONAsMCP(ctx, http.MethodGet, "/v1/sessions", nil)
+	if m.channelSessionBackend == nil {
+		return mod3ErrorResult("channel-session backend not configured")
+	}
+	resp, _, ferr := m.channelSessionBackend.ListChannelSessions(ctx)
+	if ferr != nil {
+		return mod3ErrorResult(channelSessionForwardErrorText(ferr))
+	}
+	return marshalResult(resp)
+}
+
+// channelSessionForwardErrorText renders a *channelSessionForwardError into
+// the "mod3 unreachable" / "mod3 returned N: body" shape the legacy MCP
+// tool paths used, keeping error surfaces stable for callers that previously
+// matched on those strings.
+func channelSessionForwardErrorText(ferr *channelSessionForwardError) string {
+	switch ferr.Kind {
+	case "mod3_unreachable":
+		return ferr.Message
+	case "mod3_rejected":
+		var parsed any
+		if len(ferr.Mod3Body) > 0 {
+			if jsonErr := json.Unmarshal(ferr.Mod3Body, &parsed); jsonErr != nil {
+				parsed = map[string]any{"raw": string(ferr.Mod3Body)}
+			}
+		}
+		return fmt.Sprintf("mod3 returned %d: %v", ferr.HTTPStatus, parsed)
+	default:
+		return ferr.Message
+	}
 }
 
 // ─── HTTP forwarder primitives ───────────────────────────────────────────────

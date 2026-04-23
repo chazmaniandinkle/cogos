@@ -185,14 +185,41 @@ func (fm *fakeMod3Proxy) last() capturedProxyRequest {
 }
 
 // newProxyMCP builds a minimal MCPServer whose proxy points at fm, with
-// playback fully disabled so tests don't touch the audio stack.
+// playback fully disabled so tests don't touch the audio stack. A live
+// Server is wired in as the channel-session backend so the session-family
+// MCP tools (register/deregister/list) flow through the kernel's shared
+// minting logic — matching production (ADR-082 Wave 3.5). Synthesis /
+// control tools continue calling mod3 directly via the proxy.
 func newProxyMCP(t *testing.T, fm *fakeMod3Proxy) *MCPServer {
 	t.Helper()
+	cfg := &Config{Mod3URL: fm.srv.URL}
+	srv := &Server{
+		cfg:                    cfg,
+		channelSessionRegistry: NewChannelSessionRegistry(),
+	}
 	m := &MCPServer{
-		cfg:       &Config{Mod3URL: fm.srv.URL},
-		mod3Proxy: &modalityProxy{disablePlayback: true},
+		cfg:                   cfg,
+		mod3Proxy:             &modalityProxy{disablePlayback: true},
+		channelSessionBackend: srv,
 	}
 	return m
+}
+
+// newProxyMCPWithServer is like newProxyMCP but returns the wired-in Server
+// so tests that want to assert on the kernel-side registry state can do so.
+func newProxyMCPWithServer(t *testing.T, fm *fakeMod3Proxy) (*MCPServer, *Server) {
+	t.Helper()
+	cfg := &Config{Mod3URL: fm.srv.URL}
+	srv := &Server{
+		cfg:                    cfg,
+		channelSessionRegistry: NewChannelSessionRegistry(),
+	}
+	m := &MCPServer{
+		cfg:                   cfg,
+		mod3Proxy:             &modalityProxy{disablePlayback: true},
+		channelSessionBackend: srv,
+	}
+	return m, srv
 }
 
 // decodeToolText parses the JSON text content of a CallToolResult.
@@ -487,9 +514,13 @@ func TestMod3Status_Mod3DownClean(t *testing.T) {
 	}
 }
 
-func TestMod3RegisterSession_ForwardsBody(t *testing.T) {
+// TestMod3RegisterSession_RoutesThroughKernel verifies that the MCP tool
+// goes through the kernel's shared RegisterChannelSession backend — not
+// directly to mod3 — and that the response is the merged {kernel, mod3}
+// block produced by that shared code path (ADR-082 Wave 3.5).
+func TestMod3RegisterSession_RoutesThroughKernel(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
-	m := newProxyMCP(t, fm)
+	m, srv := newProxyMCPWithServer(t, fm)
 
 	res, _, err := m.toolMod3RegisterSession(context.Background(), nil, mod3RegisterSessionInput{
 		SessionID:             "cs-regtest",
@@ -503,7 +534,110 @@ func TestMod3RegisterSession_ForwardsBody(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if res.IsError {
-		t.Fatal("expected success")
+		t.Fatalf("expected success, got IsError: %v", res.Content)
+	}
+
+	// The forward to mod3 must have happened via the kernel's shared
+	// method — verify the request body mod3 saw carries the caller-
+	// supplied session_id and participant_id unchanged.
+	cap := fm.last()
+	if cap.Path != "/v1/sessions/register" {
+		t.Fatalf("expected mod3 /v1/sessions/register, got %q", cap.Path)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(cap.Body, &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["session_id"] != "cs-regtest" {
+		t.Fatalf("bad session_id forwarded: %v", body["session_id"])
+	}
+	if body["participant_id"] != "cog" {
+		t.Fatalf("bad participant_id forwarded: %v", body["participant_id"])
+	}
+	if body["preferred_voice"] != "bm_lewis" {
+		t.Fatalf("bad preferred_voice forwarded: %v", body["preferred_voice"])
+	}
+
+	// The merged {kernel, mod3} shape must land — verify the kernel's
+	// identity record is present in the response.
+	out := decodeToolText(t, res)
+	kernel, ok := out["kernel"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected kernel block in response, got %v", out)
+	}
+	if kernel["session_id"] != "cs-regtest" {
+		t.Fatalf("expected kernel.session_id=cs-regtest, got %v", kernel["session_id"])
+	}
+	if kernel["id_source"] != "caller" {
+		t.Fatalf("expected id_source=caller, got %v", kernel["id_source"])
+	}
+
+	// Kernel registry must hold the committed record — proves we went
+	// through the shared backend and not straight to mod3.
+	if _, held := srv.channelSessionRegistry.Get("cs-regtest"); !held {
+		t.Fatal("expected kernel registry to hold record after register")
+	}
+}
+
+// TestMod3RegisterSession_KernelMintsWhenAbsent exercises the minting
+// path — caller omits session_id, kernel mints one, mod3 receives it.
+func TestMod3RegisterSession_KernelMintsWhenAbsent(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m, srv := newProxyMCPWithServer(t, fm)
+
+	res, _, err := m.toolMod3RegisterSession(context.Background(), nil, mod3RegisterSessionInput{
+		ParticipantID: "cog",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got IsError: %v", res.Content)
+	}
+
+	out := decodeToolText(t, res)
+	kernel, _ := out["kernel"].(map[string]any)
+	sid, _ := kernel["session_id"].(string)
+	if !strings.HasPrefix(sid, "cs-") {
+		t.Fatalf("expected minted cs-* session_id, got %q", sid)
+	}
+	if kernel["id_source"] != "minted" {
+		t.Fatalf("expected id_source=minted, got %v", kernel["id_source"])
+	}
+
+	// Mod3 must have seen the kernel-minted ID verbatim.
+	cap := fm.last()
+	var body map[string]any
+	_ = json.Unmarshal(cap.Body, &body)
+	if body["session_id"] != sid {
+		t.Fatalf("mod3 got session_id=%v, expected %q", body["session_id"], sid)
+	}
+
+	if _, held := srv.channelSessionRegistry.Get(sid); !held {
+		t.Fatalf("expected kernel registry to hold minted record %q", sid)
+	}
+}
+
+// TestMod3RegisterSession_ForwardsKindsAndMetadata verifies the Wave 3.5
+// schema alignment with the channel-provider RFC — `kinds` and `metadata`
+// flow through the kernel's register endpoint and land in mod3's request
+// body unchanged.
+func TestMod3RegisterSession_ForwardsKindsAndMetadata(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m, _ := newProxyMCPWithServer(t, fm)
+
+	_, _, err := m.toolMod3RegisterSession(context.Background(), nil, mod3RegisterSessionInput{
+		SessionID:       "cs-kinds",
+		ParticipantID:   "mod3-provider",
+		ParticipantType: "provider",
+		Kinds:           []string{"audio"},
+		Metadata: map[string]any{
+			"provider_id": "mod3-local",
+			"build":       "0.5.0",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	cap := fm.last()
@@ -511,14 +645,19 @@ func TestMod3RegisterSession_ForwardsBody(t *testing.T) {
 	if err := json.Unmarshal(cap.Body, &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body["session_id"] != "cs-regtest" {
-		t.Fatalf("bad session_id: %v", body["session_id"])
+	kinds, ok := body["kinds"].([]any)
+	if !ok || len(kinds) != 1 || kinds[0] != "audio" {
+		t.Fatalf("expected kinds=[\"audio\"] forwarded, got %v", body["kinds"])
 	}
-	if body["participant_id"] != "cog" {
-		t.Fatalf("bad participant_id: %v", body["participant_id"])
+	md, ok := body["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected metadata object forwarded, got %v (%T)", body["metadata"], body["metadata"])
 	}
-	if body["preferred_voice"] != "bm_lewis" {
-		t.Fatalf("bad preferred_voice: %v", body["preferred_voice"])
+	if md["provider_id"] != "mod3-local" {
+		t.Fatalf("expected metadata.provider_id=mod3-local, got %v", md["provider_id"])
+	}
+	if body["participant_type"] != "provider" {
+		t.Fatalf("expected participant_type=provider, got %v", body["participant_type"])
 	}
 }
 
@@ -536,9 +675,38 @@ func TestMod3RegisterSession_RejectsWithoutParticipant(t *testing.T) {
 	}
 }
 
-func TestMod3DeregisterSession_PathEscape(t *testing.T) {
+func TestMod3RegisterSession_NoBackendReturnsCleanError(t *testing.T) {
+	// An MCPServer with no channel-session backend wired in must surface
+	// a clean "not configured" error rather than a nil deref — important
+	// because NewMCPServer (used by tests that only care about memory
+	// tools) doesn't wire the backend.
+	m := &MCPServer{cfg: &Config{Mod3URL: "http://unused"}}
+	res, _, err := m.toolMod3RegisterSession(context.Background(), nil, mod3RegisterSessionInput{
+		ParticipantID: "cog",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected IsError=true when backend is nil")
+	}
+	tc := res.Content[0].(*mcp.TextContent)
+	if !strings.Contains(tc.Text, "backend not configured") {
+		t.Fatalf("expected backend-not-configured message, got %q", tc.Text)
+	}
+}
+
+// TestMod3DeregisterSession_RoutesThroughKernel verifies the deregister
+// tool forwards via the kernel's shared path and the kernel drops its
+// identity record on success.
+func TestMod3DeregisterSession_RoutesThroughKernel(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
-	m := newProxyMCP(t, fm)
+	m, srv := newProxyMCPWithServer(t, fm)
+
+	// Seed the kernel registry so we can see it get dropped.
+	srv.channelSessionRegistry.Put(ChannelSessionRecord{
+		SessionID: "cs-drop", ParticipantID: "cog",
+	})
 
 	res, _, err := m.toolMod3DeregisterSession(context.Background(), nil, mod3DeregisterSessionInput{
 		SessionID: "cs-drop",
@@ -547,11 +715,14 @@ func TestMod3DeregisterSession_PathEscape(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if res.IsError {
-		t.Fatal("expected success")
+		t.Fatalf("expected success, got IsError: %v", res.Content)
 	}
 	cap := fm.last()
 	if cap.Path != "/v1/sessions/cs-drop/deregister" {
-		t.Fatalf("expected /v1/sessions/cs-drop/deregister, got %q", cap.Path)
+		t.Fatalf("expected /v1/sessions/cs-drop/deregister at mod3, got %q", cap.Path)
+	}
+	if _, held := srv.channelSessionRegistry.Get("cs-drop"); held {
+		t.Fatal("expected kernel registry to drop record after successful deregister")
 	}
 }
 
@@ -567,21 +738,35 @@ func TestMod3DeregisterSession_RequiresID(t *testing.T) {
 	}
 }
 
-func TestMod3ListSessions_ReturnsRaw(t *testing.T) {
+// TestMod3ListSessions_RoutesThroughKernel verifies list merges the
+// kernel snapshot with mod3's per-channel state (the new Wave 3.5
+// merged shape, not mod3's raw payload).
+func TestMod3ListSessions_RoutesThroughKernel(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
-	m := newProxyMCP(t, fm)
+	m, srv := newProxyMCPWithServer(t, fm)
+
+	srv.channelSessionRegistry.Put(ChannelSessionRecord{
+		SessionID: "cs-seed", ParticipantID: "cog",
+	})
 
 	res, _, err := m.toolMod3ListSessions(context.Background(), nil, mod3ListSessionsInput{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if res.IsError {
-		t.Fatal("expected success")
+		t.Fatalf("expected success, got IsError: %v", res.Content)
 	}
 	out := decodeToolText(t, res)
-	vp, _ := out["voice_pool"].([]any)
-	if len(vp) != 2 {
-		t.Fatalf("expected 2 voices in pool, got %d", len(vp))
+	kernel, ok := out["kernel"].([]any)
+	if !ok {
+		t.Fatalf("expected kernel array in merged response, got %v", out)
+	}
+	if len(kernel) != 1 {
+		t.Fatalf("expected 1 kernel record, got %d", len(kernel))
+	}
+	// Mod3 block must be present (from the fake list handler).
+	if _, present := out["mod3"]; !present {
+		t.Fatal("expected mod3 block in merged response")
 	}
 }
 

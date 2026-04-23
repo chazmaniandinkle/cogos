@@ -361,6 +361,67 @@ func TestChannelSessionRegister_PropagatesMod3Error(t *testing.T) {
 	}
 }
 
+// TestChannelSessionRegister_ForwardsKindsAndMetadata verifies the Wave 3.5
+// schema alignment: the optional `kinds` array and `metadata` object from
+// the channel-provider RFC's cogos_session_register primitive flow through
+// Wave 2's register endpoint and land in mod3's request body unchanged.
+func TestChannelSessionRegister_ForwardsKindsAndMetadata(t *testing.T) {
+	fm := newFakeMod3(t)
+	s, front := newChannelServer(t, fm)
+
+	body, _ := json.Marshal(map[string]any{
+		"session_id":       "cs-kinds-http",
+		"participant_id":   "mod3-provider",
+		"participant_type": "provider",
+		"kinds":            []string{"audio"},
+		"metadata": map[string]any{
+			"provider_id": "mod3-local",
+			"build":       "0.5.0",
+		},
+	})
+	resp, err := http.Post(front.URL+"/v1/channel-sessions/register",
+		"application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST register: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d; body: %s", resp.StatusCode, raw)
+	}
+
+	cap := fm.lastCaptured()
+	var forwarded map[string]any
+	if err := json.Unmarshal(cap.Body, &forwarded); err != nil {
+		t.Fatalf("decode forwarded body: %v", err)
+	}
+	kinds, ok := forwarded["kinds"].([]any)
+	if !ok || len(kinds) != 1 || kinds[0] != "audio" {
+		t.Fatalf("expected mod3 to receive kinds=[\"audio\"], got %v", forwarded["kinds"])
+	}
+	md, ok := forwarded["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected mod3 to receive metadata object, got %v (%T)",
+			forwarded["metadata"], forwarded["metadata"])
+	}
+	if md["provider_id"] != "mod3-local" {
+		t.Fatalf("expected metadata.provider_id=mod3-local forwarded, got %v", md["provider_id"])
+	}
+
+	// Kernel record must retain the RFC fields so downstream consumers
+	// can filter by capability even when mod3 ignores them.
+	rec, ok := s.channelSessionRegistry.Get("cs-kinds-http")
+	if !ok {
+		t.Fatal("expected kernel registry to hold record")
+	}
+	if len(rec.Kinds) != 1 || rec.Kinds[0] != "audio" {
+		t.Fatalf("expected record.Kinds=[audio], got %v", rec.Kinds)
+	}
+	if rec.Metadata["provider_id"] != "mod3-local" {
+		t.Fatalf("expected record.Metadata.provider_id=mod3-local, got %v", rec.Metadata)
+	}
+}
+
 func TestChannelSessionRegister_RequiresParticipantID(t *testing.T) {
 	fm := newFakeMod3(t)
 	_, front := newChannelServer(t, fm)

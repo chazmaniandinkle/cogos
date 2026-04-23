@@ -52,6 +52,25 @@ type MCPServer struct {
 	// integration). Lazily initialised — tests can pre-seed it with a
 	// custom HTTP client + stub player to avoid real network + audio.
 	mod3Proxy *modalityProxy
+
+	// channelSessionBackend is the kernel Server whose
+	// RegisterChannelSession / DeregisterChannelSession /
+	// ListChannelSessions methods own session-ID authority (ADR-082
+	// Wave 2). Wave 3.5 routes the three mod3 session-family MCP tools
+	// through these shared methods so minting happens in exactly one
+	// place. Nil when the MCP server is built outside a live kernel —
+	// the tools return a clean "not configured" error in that case.
+	channelSessionBackend channelSessionBackend
+}
+
+// channelSessionBackend is the narrow surface the mod3 session-family MCP
+// tools need to forward through the kernel's shared minting/forwarding
+// logic. Interface rather than concrete *Server so tests can inject a fake
+// without building a whole Server.
+type channelSessionBackend interface {
+	RegisterChannelSession(ctx context.Context, req channelSessionRegisterRequest) (*channelSessionResponse, *channelSessionForwardError)
+	DeregisterChannelSession(ctx context.Context, sessionID string) (json.RawMessage, int, *channelSessionForwardError)
+	ListChannelSessions(ctx context.Context) (*channelSessionListResponse, int, *channelSessionForwardError)
 }
 
 // NewMCPServer creates and configures the MCP server with all stage-1 tools.
@@ -96,6 +115,15 @@ func NewMCPServerWithAgentController(cfg *Config, nucleus *Nucleus, process *Pro
 // unchanged because the tools resolve the current controller on each call.
 func (m *MCPServer) SetAgentController(ctrl AgentController) {
 	m.agentController = ctrl
+}
+
+// SetChannelSessionBackend wires the kernel-owned channel-session minting
+// logic into the MCP server so the mod3_register_session / _deregister /
+// _list tools call through the same shared methods the HTTP surface uses
+// (ADR-082 Wave 3.5). Safe to pass nil; the tools surface a clean "not
+// configured" error in that case.
+func (m *MCPServer) SetChannelSessionBackend(b channelSessionBackend) {
+	m.channelSessionBackend = b
 }
 
 // Handler returns the http.Handler for mounting at /mcp.
