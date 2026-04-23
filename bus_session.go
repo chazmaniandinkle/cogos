@@ -13,6 +13,26 @@ import (
 	"time"
 )
 
+// ADR-084 dataref migration policy (Phase 1: schema-additive).
+//
+// This file implements the two CogBlock emit entry points that coexist on
+// every bus during the migration window:
+//
+//   - appendBusEvent(..., payload) — legacy inline path. Populates
+//     CogBlock.Payload directly; Digest/MediaType are empty.
+//   - appendBusEventRef(..., digest, mediaType, size) — ADR-084 by-reference
+//     path. Caller has already stored bytes in the shared BlobStore; the
+//     envelope carries only the content-addressed digest and Payload is nil.
+//
+// Both call sites share prev-chain, seq assignment, registry update, and
+// handler dispatch, so downstream consumers see a single unified stream with
+// mixed envelope shapes. Consumers MUST tolerate either form and should
+// resolve byref-first: check Digest, fetch via BlobStore / GET /v1/blobs/:digest,
+// and only fall back to inline Payload if Digest is empty.
+//
+// Phase 2 (ADR-084 revision pending) will retire the inline path once all
+// consumers have migrated. See: .cog/adr/084-bus-payloads-as-cogblocks.cog.md
+
 // computeBlockHash computes the V2 content-addressed hash for a CogBlock.
 // It hashes the full canonical form: all fields except hash and sig.
 // The canonical form is a JSON object with fields in a deterministic order.
