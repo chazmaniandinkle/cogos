@@ -5,8 +5,10 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -330,5 +332,278 @@ func TestExpressionFor_NilSpec(t *testing.T) {
 	var spec *IdentityCRDSpec
 	if got := spec.ExpressionFor("anything"); got != nil {
 		t.Errorf("nil spec should return nil, got %+v", got)
+	}
+}
+
+// ─── KeyRef validation (spec.private_key) ───────────────────────────────────────
+
+func TestLoadIdentityCRD_PrivateKeyRef_ValidFileScheme(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "cog.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: cog
+spec:
+  iss: cogos-dev
+  sub: cog
+  type: agent
+  public_key: |-
+    -----BEGIN PUBLIC KEY-----
+    MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEstub...
+    -----END PUBLIC KEY-----
+  private_key:
+    ref: "file:///Users/slowbro/.cogos/keys/cog-priv.pem"
+    integrity_hash: "sha256:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+  expressions:
+    - aud: "*"
+      display_name: Cog
+`)
+	crd, err := LoadIdentityCRD(dir, "cog")
+	if err != nil {
+		t.Fatalf("LoadIdentityCRD: %v", err)
+	}
+	if crd.Spec.PrivateKey == nil {
+		t.Fatal("PrivateKey is nil; expected populated")
+	}
+	if crd.Spec.PrivateKey.Ref != "file:///Users/slowbro/.cogos/keys/cog-priv.pem" {
+		t.Errorf("Ref = %q", crd.Spec.PrivateKey.Ref)
+	}
+	if !strings.HasPrefix(crd.Spec.PrivateKey.IntegrityHash, "sha256:") {
+		t.Errorf("IntegrityHash = %q", crd.Spec.PrivateKey.IntegrityHash)
+	}
+}
+
+func TestLoadIdentityCRD_PrivateKeyRef_AllSchemes(t *testing.T) {
+	// Every scheme in allowedKeyRefSchemes should parse successfully.
+	for scheme := range allowedKeyRefSchemes {
+		t.Run(scheme, func(t *testing.T) {
+			dir := t.TempDir()
+			idDir := filepath.Join(dir, ".cog", "config", "identities")
+			_ = os.MkdirAll(idDir, 0o755)
+			ref := scheme + "://some/path"
+			writeTempCRD(t, idDir, "x.yaml", fmt.Sprintf(`
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: x
+spec:
+  iss: cogos-dev
+  sub: x
+  type: agent
+  private_key:
+    ref: %q
+    integrity_hash: "sha256:deadbeef"
+  expressions:
+    - aud: "*"
+`, ref))
+			if _, err := LoadIdentityCRD(dir, "x"); err != nil {
+				t.Fatalf("scheme %q: %v", scheme, err)
+			}
+		})
+	}
+}
+
+func TestLoadIdentityCRD_PrivateKeyRef_RejectsUnknownScheme(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "x.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: x
+spec:
+  iss: cogos-dev
+  sub: x
+  type: agent
+  private_key:
+    ref: "ftp://legacy.example.com/key.pem"
+    integrity_hash: "sha256:deadbeef"
+  expressions:
+    - aud: "*"
+`)
+	if _, err := LoadIdentityCRD(dir, "x"); err == nil {
+		t.Fatal("expected error for unknown scheme, got nil")
+	}
+}
+
+func TestLoadIdentityCRD_PrivateKeyRef_RejectsMalformedURI(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "x.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: x
+spec:
+  iss: cogos-dev
+  sub: x
+  type: agent
+  private_key:
+    ref: "not-a-uri"
+    integrity_hash: "sha256:deadbeef"
+  expressions:
+    - aud: "*"
+`)
+	if _, err := LoadIdentityCRD(dir, "x"); err == nil {
+		t.Fatal("expected error for malformed ref, got nil")
+	}
+}
+
+func TestLoadIdentityCRD_PrivateKeyRef_RejectsMissingHash(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "x.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: x
+spec:
+  iss: cogos-dev
+  sub: x
+  type: agent
+  private_key:
+    ref: "file:///tmp/k.pem"
+  expressions:
+    - aud: "*"
+`)
+	if _, err := LoadIdentityCRD(dir, "x"); err == nil {
+		t.Fatal("expected error for missing integrity_hash, got nil")
+	}
+}
+
+func TestLoadIdentityCRD_PrivateKeyRef_RejectsUnknownHashAlgo(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "x.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: x
+spec:
+  iss: cogos-dev
+  sub: x
+  type: agent
+  private_key:
+    ref: "file:///tmp/k.pem"
+    integrity_hash: "md5:deadbeef"
+  expressions:
+    - aud: "*"
+`)
+	if _, err := LoadIdentityCRD(dir, "x"); err == nil {
+		t.Fatal("expected error for md5 hash algo, got nil")
+	}
+}
+
+func TestLoadIdentityCRD_PrivateKeyOptional(t *testing.T) {
+	// No private_key field at all — should still load successfully.
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "x.yaml", minimalValidIdentityYAML)
+	crd, err := LoadIdentityCRD(dir, "x")
+	if err != nil {
+		t.Fatalf("LoadIdentityCRD: %v", err)
+	}
+	if crd.Spec.PrivateKey != nil {
+		t.Errorf("PrivateKey = %+v, want nil when unset", crd.Spec.PrivateKey)
+	}
+}
+
+// ─── AuthFactors validation ─────────────────────────────────────────────────────
+
+func TestLoadIdentityCRD_AuthFactors_ValidAnyOfGroup(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "x.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: x
+spec:
+  iss: cogos-dev
+  sub: x
+  type: agent
+  auth_factors:
+    - kind: any-of
+      factors:
+        - type: totp
+          ref: "vault://secret/cogos/x/totp"
+        - type: webauthn
+          ref: "keychain://cogos/x-yubikey"
+    - kind: required
+      factors:
+        - type: node-signed-challenge
+  expressions:
+    - aud: "*"
+`)
+	crd, err := LoadIdentityCRD(dir, "x")
+	if err != nil {
+		t.Fatalf("LoadIdentityCRD: %v", err)
+	}
+	if len(crd.Spec.AuthFactors) != 2 {
+		t.Fatalf("AuthFactors len = %d, want 2", len(crd.Spec.AuthFactors))
+	}
+	if crd.Spec.AuthFactors[0].Kind != "any-of" {
+		t.Errorf("first kind = %q", crd.Spec.AuthFactors[0].Kind)
+	}
+	if len(crd.Spec.AuthFactors[0].Factors) != 2 {
+		t.Errorf("first factors len = %d, want 2", len(crd.Spec.AuthFactors[0].Factors))
+	}
+}
+
+func TestLoadIdentityCRD_AuthFactors_RejectsBadKind(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "x.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: x
+spec:
+  iss: cogos-dev
+  sub: x
+  type: agent
+  auth_factors:
+    - kind: one-of-many
+      factors:
+        - type: totp
+  expressions:
+    - aud: "*"
+`)
+	if _, err := LoadIdentityCRD(dir, "x"); err == nil {
+		t.Fatal("expected error for unknown factor kind, got nil")
+	}
+}
+
+func TestLoadIdentityCRD_AuthFactors_RejectsEmptyFactors(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "x.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: x
+spec:
+  iss: cogos-dev
+  sub: x
+  type: agent
+  auth_factors:
+    - kind: required
+      factors: []
+  expressions:
+    - aud: "*"
+`)
+	if _, err := LoadIdentityCRD(dir, "x"); err == nil {
+		t.Fatal("expected error for empty factors list, got nil")
 	}
 }

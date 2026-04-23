@@ -44,18 +44,34 @@ type IdentityCRDMeta struct {
 
 // IdentityCRDSpec holds the OIDC-shaped identity body.
 //
-//	Issuer   — OIDC `iss`; who minted this identity (e.g., "cogos-dev",
-//	           "https://accounts.google.com", "node:<hostname>", or a
-//	           federation URL). Required.
-//	Subject  — OIDC `sub`; globally stable identifier for the principal.
-//	           Required. Conventionally matches metadata.name for
-//	           self-minted identities, but may differ for federated ones.
-//	Type     — agent | human | service. Governs downstream semantics
-//	           (e.g., humans don't need presence expectation heartbeats).
-//	PublicKey — optional PEM-encoded public key. When present, the
-//	            reconciler records it for signature-verified attestations.
-//	            Layer-1 node keys live separately in the constellation
-//	            repo — this is Layer-2 principal identity.
+//	Issuer     — OIDC `iss`; who minted this identity (e.g., "cogos-dev",
+//	             "https://accounts.google.com", "node:<hostname>", or a
+//	             federation URL). Required.
+//	Subject    — OIDC `sub`; globally stable identifier for the principal.
+//	             Required. Conventionally matches metadata.name for
+//	             self-minted identities, but may differ for federated ones.
+//	Type       — agent | human | service. Governs downstream semantics
+//	             (e.g., humans don't need presence expectation heartbeats).
+//	PublicKey  — optional PEM-encoded public key. Inlined because the public
+//	             half is not secret; committing it to the manifest is the
+//	             point. When present, the reconciler records it for
+//	             signature-verified attestations. Layer-1 node keys live
+//	             separately in the constellation repo — this is Layer-2
+//	             principal identity.
+//	PrivateKey — optional reference to the private-key material. The ref
+//	             URI is location-independent (file://, vault://, s3://,
+//	             keychain://, env://, etc.) and is paired with an integrity
+//	             hash. Moving the key between storage media keeps the
+//	             identity stable as long as the hash matches — the
+//	             cryptographic material itself is the identity, its
+//	             location is ephemeral.
+//	AuthFactors — optional multi-factor requirements for operations that
+//	              modify this identity (apply, deregister). The reconciler
+//	              is the enforcement point because it is the source of
+//	              truth; everything downstream trusts its output. Evaluated
+//	              at ApplyPlan, not at read-time. (Wiring this to real
+//	              MFA providers is a later wave — the field is declared
+//	              now so the schema is stable.)
 //	Expressions — how this identity is projected into audiences. The
 //	              reconciler's "collapse operation" picks the entry whose
 //	              aud matches the current context.
@@ -64,7 +80,66 @@ type IdentityCRDSpec struct {
 	Subject     string               `yaml:"sub"`
 	Type        string               `yaml:"type"`
 	PublicKey   string               `yaml:"public_key,omitempty"`
+	PrivateKey  *KeyRef              `yaml:"private_key,omitempty"`
+	AuthFactors []AuthFactor         `yaml:"auth_factors,omitempty"`
 	Expressions []IdentityExpression `yaml:"expressions"`
+}
+
+// KeyRef points at key material stored outside the manifest. The ref is
+// resolved at ApplyPlan time through a pluggable KeyResolver (see
+// identity_provider.go); IntegrityHash is verified after resolution. If
+// the bytes at `ref` ever hash to a different value, the reconciler
+// refuses to apply and surfaces the mismatch in Health.
+//
+// Supported ref URI schemes (extensible — each registered with the
+// provider's KeyResolver):
+//
+//	file://<absolute-path>           — plain-PEM file on disk
+//	vault://<path>                   — HashiCorp Vault secret path
+//	s3://<bucket>/<key>              — S3 object
+//	keychain://<service>/<account>   — macOS keychain entry
+//	env://<VAR_NAME>                 — environment variable (dev only)
+//	kms://<provider>/<arn>           — cloud KMS reference
+//	inline://pem                     — base64 bytes inline (testing; avoid)
+//
+// IntegrityHash is `<algo>:<hex>` (e.g., "sha256:a1b2..."). The reconciler
+// enforces algo ∈ {sha256, sha512}.
+type KeyRef struct {
+	Ref           string `yaml:"ref"`
+	IntegrityHash string `yaml:"integrity_hash"`
+}
+
+// AuthFactor declares a multi-factor requirement. At least one factor per
+// entry must be satisfied (OR semantics within an entry); each entry in
+// the AuthFactors slice adds an AND requirement (entry1 AND entry2 AND …).
+// Example: require either TOTP or a hardware key, AND also require a
+// signed challenge from the Layer-1 node:
+//
+//	auth_factors:
+//	  - kind: any-of
+//	    factors:
+//	      - type: totp
+//	        ref: vault://secret/cogos/identities/cog/totp-seed
+//	      - type: webauthn
+//	        ref: keychain://cogos/cog-yubikey
+//	  - kind: required
+//	    factors:
+//	      - type: node-signed-challenge
+//	        ref: ""  # uses the current node's Layer-1 key
+//
+// The schema is declared now so manifests are stable; enforcement
+// (prompting/verifying the factor) is a follow-up wave.
+type AuthFactor struct {
+	Kind    string            `yaml:"kind"` // "required" | "any-of"
+	Factors []AuthFactorEntry `yaml:"factors"`
+}
+
+// AuthFactorEntry is one factor within an AuthFactor group.
+type AuthFactorEntry struct {
+	Type string `yaml:"type"` // totp | webauthn | node-signed-challenge | oidc-step-up | ...
+	Ref  string `yaml:"ref,omitempty"`
+	// Claims carries factor-specific config (e.g., TOTP period, WebAuthn RP ID).
+	Claims map[string]any `yaml:"claims,omitempty"`
 }
 
 // IdentityExpression is one projection of an identity into a specific audience.
@@ -217,7 +292,128 @@ func validateIdentityCRD(crd *IdentityCRD) error {
 		}
 		seenAud[exp.Audience] = struct{}{}
 	}
+	if err := validateKeyRef(crd.Spec.PrivateKey, "spec.private_key"); err != nil {
+		return err
+	}
+	for i, factor := range crd.Spec.AuthFactors {
+		if err := validateAuthFactor(&factor, fmt.Sprintf("spec.auth_factors[%d]", i)); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// validateKeyRef enforces the structural invariants on a key reference.
+// Nil is valid (optional field). When present, both ref and integrity_hash
+// are required, the ref must have a recognized scheme, and the hash must
+// be a known algorithm.
+func validateKeyRef(k *KeyRef, path string) error {
+	if k == nil {
+		return nil
+	}
+	if strings.TrimSpace(k.Ref) == "" {
+		return fmt.Errorf("%s.ref is required when private_key is set", path)
+	}
+	scheme, ok := parseKeyRefScheme(k.Ref)
+	if !ok {
+		return fmt.Errorf("%s.ref = %q: expected scheme://... (one of: %s)",
+			path, k.Ref, strings.Join(knownKeyRefSchemes(), ", "))
+	}
+	if _, allowed := allowedKeyRefSchemes[scheme]; !allowed {
+		return fmt.Errorf("%s.ref scheme %q is not recognized; allowed: %s",
+			path, scheme, strings.Join(knownKeyRefSchemes(), ", "))
+	}
+	if strings.TrimSpace(k.IntegrityHash) == "" {
+		return fmt.Errorf("%s.integrity_hash is required when private_key is set", path)
+	}
+	algo, _, ok := strings.Cut(k.IntegrityHash, ":")
+	if !ok {
+		return fmt.Errorf("%s.integrity_hash = %q: expected \"<algo>:<hex>\"", path, k.IntegrityHash)
+	}
+	if _, allowed := allowedHashAlgos[algo]; !allowed {
+		return fmt.Errorf("%s.integrity_hash algo %q not allowed; allowed: sha256, sha512", path, algo)
+	}
+	return nil
+}
+
+// validateAuthFactor enforces the structural invariants on an auth-factor
+// group. Each group must have a kind and at least one factor entry.
+func validateAuthFactor(f *AuthFactor, path string) error {
+	if f == nil {
+		return nil
+	}
+	if _, ok := validAuthFactorKinds[f.Kind]; !ok {
+		return fmt.Errorf("%s.kind = %q, want one of {required, any-of}", path, f.Kind)
+	}
+	if len(f.Factors) == 0 {
+		return fmt.Errorf("%s.factors must contain at least one entry", path)
+	}
+	for i, entry := range f.Factors {
+		if strings.TrimSpace(entry.Type) == "" {
+			return fmt.Errorf("%s.factors[%d].type is required", path, i)
+		}
+	}
+	return nil
+}
+
+// parseKeyRefScheme extracts the scheme from a ref URI. Returns (scheme, true)
+// on success. Does not validate that the scheme is allowed — that's a
+// separate check so the error message can distinguish "malformed URI" from
+// "scheme not recognized."
+func parseKeyRefScheme(ref string) (string, bool) {
+	idx := strings.Index(ref, "://")
+	if idx <= 0 {
+		return "", false
+	}
+	return ref[:idx], true
+}
+
+// knownKeyRefSchemes returns a sorted slice of allowed schemes for error
+// messages. The allow-list is declared so downstream provider code can
+// implement resolvers with predictable coverage.
+func knownKeyRefSchemes() []string {
+	out := make([]string, 0, len(allowedKeyRefSchemes))
+	for s := range allowedKeyRefSchemes {
+		out = append(out, s)
+	}
+	// Sort for deterministic error messages.
+	sortStrings(out)
+	return out
+}
+
+// Known schemes for KeyRef.Ref. New schemes are added here as resolvers
+// are implemented in identity_provider.go.
+var allowedKeyRefSchemes = map[string]struct{}{
+	"file":     {},
+	"vault":    {},
+	"s3":       {},
+	"keychain": {},
+	"env":      {},
+	"kms":      {},
+	"inline":   {},
+}
+
+// Allowed integrity-hash algorithms.
+var allowedHashAlgos = map[string]struct{}{
+	"sha256": {},
+	"sha512": {},
+}
+
+// Allowed AuthFactor.Kind values.
+var validAuthFactorKinds = map[string]struct{}{
+	"required": {},
+	"any-of":   {},
+}
+
+// sortStrings is a tiny stable-sort helper so identity_crd.go does not
+// have to import "sort" just for the error-message path. Insertion sort
+// is fine at len ≤ ~10.
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
 }
 
 // ─── Collapse Operation ─────────────────────────────────────────────────────────
