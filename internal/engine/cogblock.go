@@ -43,6 +43,35 @@ type CogBlock struct {
 
 	// Artifacts produced from processing this block.
 	Artifacts []BlockArtifact `json:"artifacts,omitempty"`
+
+	// Sections carries the sub-block index for section-level content
+	// addressing (ADR-059 Phase 2). Each entry describes one addressable
+	// sub-unit of this block's payload by title, anchor, content hash,
+	// and byte size. Empty for blocks without sub-blocks.
+	Sections []Section `json:"sections,omitempty"`
+
+	// Prev carries the V2 DAG predecessor hashes (ADR-059).
+	//
+	// V1 chain semantics use a single string predecessor (historically
+	// PrevHash on sibling wire formats such as BusEvent/UCPMessage).
+	// V2 DAG semantics use Prev []string: one or more predecessors.
+	// Linear chain → len(Prev)==1; merge block → len(Prev)>1; genesis
+	// → empty. ADR-059 Phase 1: both shapes accepted on the wire; hash
+	// computation omits Prev (and any V1 PrevHash sibling field) from
+	// the canonical form to keep the hash stable across chain topology
+	// changes.
+	Prev []string `json:"prev,omitempty"`
+}
+
+// Section describes an addressable sub-block of a CogBlock's payload,
+// used for section-level content addressing and delta sync (ADR-059).
+// The Hash field contains "sha256:<hex>" of the canonicalized section
+// content; Size is the byte length of that content.
+type Section struct {
+	Title  string `json:"title,omitempty"`
+	Anchor string `json:"anchor,omitempty"` // fragment identifier (e.g. "#section-1")
+	Hash   string `json:"hash,omitempty"`   // sha256:<hex> of canonicalized section content
+	Size   int    `json:"size,omitempty"`   // byte length of section content
 }
 
 // Re-export shared types from pkg/cogblock.
