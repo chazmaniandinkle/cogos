@@ -184,9 +184,15 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	if bindAddr == "" {
 		bindAddr = "127.0.0.1"
 	}
+	// Wrap the mux with CORS middleware so browser origins (e.g. the mod3
+	// dashboard at http://localhost:7860) can POST to /v1/* without the
+	// preflight failing. See serve_cors.go for the policy rationale —
+	// loopback origins are echoed, everything else gets "*".
+	handler := corsMiddleware(mux)
+
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", bindAddr, cfg.Port),
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 300 * time.Second, // 5 min — streaming responses can be long
 		IdleTimeout:  120 * time.Second,
