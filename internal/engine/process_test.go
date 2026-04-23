@@ -51,6 +51,47 @@ func TestNewProcessInitialState(t *testing.T) {
 	}
 }
 
+// ── BlobStore wiring ──────────────────────────────────────────────────────
+
+// TestNewProcessInitializesBlobStore verifies that process construction
+// creates the content-addressed blob store, creates the `.cog/blobs/`
+// directory on disk, and exposes the store via the BlobStore() accessor so
+// emit paths (ADR-084) can write digest-ref payloads immediately.
+func TestNewProcessInitializesBlobStore(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	cfg := makeConfig(t, root)
+	p := NewProcess(cfg, makeNucleus("T", "r"))
+
+	bs := p.BlobStore()
+	if bs == nil {
+		t.Fatal("BlobStore() returned nil after NewProcess")
+	}
+
+	blobsDir := filepath.Join(root, ".cog", "blobs")
+	info, err := os.Stat(blobsDir)
+	if err != nil {
+		t.Fatalf("blobs dir not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s exists but is not a directory", blobsDir)
+	}
+
+	// A round-trip through the live store confirms Init() ran far enough
+	// that Store/Get succeed without any further bootstrap.
+	hash, err := bs.Store([]byte("g10 wiring probe"), "text/plain")
+	if err != nil {
+		t.Fatalf("Store on post-init BlobStore failed: %v", err)
+	}
+	got, err := bs.Get(hash)
+	if err != nil {
+		t.Fatalf("Get on post-init BlobStore failed: %v", err)
+	}
+	if string(got) != "g10 wiring probe" {
+		t.Fatalf("round-trip mismatch: got %q", got)
+	}
+}
+
 // ── Send ──────────────────────────────────────────────────────────────────
 
 func TestProcessSendAccepted(t *testing.T) {
