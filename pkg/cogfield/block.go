@@ -3,22 +3,32 @@ package cogfield
 // Block is the canonical content atom for the CogOS bus protocol (ADR-059).
 // V1 blocks use PrevHash (string); V2 blocks use Prev ([]string) for DAG-style linking.
 // Both fields are written during the transition period for backward compatibility.
+//
+// ADR-084 v1 — by-reference payload. When Digest and MediaType are set, the
+// envelope carries a content-addressed reference to the payload bytes stored
+// in BlobStore; Payload may be empty, and the actual bytes are fetched via
+// GET /v1/blobs/:digest. The inline Payload field is preserved for backward
+// compatibility during the Phase 1 schema-additive migration — producers may
+// emit either shape, and consumers MUST tolerate both. Size is shared by
+// both forms and indicates the payload size in bytes.
 type Block struct {
-	V        int                    `json:"v"`
-	ID       string                 `json:"id,omitempty"`
-	BusID    string                 `json:"bus_id,omitempty"`
-	Seq      int                    `json:"seq,omitempty"`
-	Ts       string                 `json:"ts"`
-	From     string                 `json:"from"`
-	To       string                 `json:"to,omitempty"`
-	Type     string                 `json:"type"`
-	Payload  map[string]interface{} `json:"payload"`
-	Prev     []string               `json:"prev,omitempty"`
-	PrevHash string                 `json:"prev_hash,omitempty"` // V1 compat
-	Hash     string                 `json:"hash"`
-	Merkle   string                 `json:"merkle,omitempty"`
-	Sig      string                 `json:"sig,omitempty"`
-	Size     int                    `json:"size,omitempty"`
+	V         int                    `json:"v"`
+	ID        string                 `json:"id,omitempty"`
+	BusID     string                 `json:"bus_id,omitempty"`
+	Seq       int                    `json:"seq,omitempty"`
+	Ts        string                 `json:"ts"`
+	From      string                 `json:"from"`
+	To        string                 `json:"to,omitempty"`
+	Type      string                 `json:"type"`
+	Payload   map[string]interface{} `json:"payload,omitempty"`
+	Digest    string                 `json:"digest,omitempty"`     // ADR-084: "sha256:<hex>" content hash of by-reference payload
+	MediaType string                 `json:"media_type,omitempty"` // ADR-084: OCI media type of the payload (e.g. application/vnd.cogos.trace.assessment.v1+json)
+	Prev      []string               `json:"prev,omitempty"`
+	PrevHash  string                 `json:"prev_hash,omitempty"` // V1 compat
+	Hash      string                 `json:"hash"`
+	Merkle    string                 `json:"merkle,omitempty"`
+	Sig       string                 `json:"sig,omitempty"`
+	Size      int                    `json:"size,omitempty"`
 }
 
 // GraphBlock is the intermediate representation for CogField graph rendering.
