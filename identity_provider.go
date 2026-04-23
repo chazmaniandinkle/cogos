@@ -518,6 +518,27 @@ func (p *IdentityProvider) ApplyPlan(ctx context.Context, plan *ReconcilePlan) (
 				results = append(results, res)
 				continue
 			}
+
+			// Idempotency short-circuit (Wave 6a-4): if an existing projection
+			// already matches this action's spec_hash AND the cogdoc file is on
+			// disk, skip the whole apply — no DB write, no file write, no event.
+			// Keeps scheduler-driven re-ticks (kernel-interior reconciler cadence)
+			// from churning files, participant rows, and the bus on every tick
+			// when nothing has changed. See project_cogos_reconciler_is_agent.md:
+			// ApplyPlan must be provably idempotent for the kernel-interior
+			// harness to call reconcilers on a schedule safely.
+			if specHash := stringDetail(action.Details, "spec_hash"); specHash != "" {
+				if existing, gerr := p.db.GetProjection(ctx, action.Name); gerr == nil && existing != nil && existing.SpecHash == specHash {
+					absProjection := filepath.Join(root, existing.ContentPath)
+					if _, serr := os.Stat(absProjection); serr == nil {
+						res.Status = ApplySkipped
+						res.CreatedID = existing.Sub
+						results = append(results, res)
+						continue
+					}
+				}
+			}
+
 			applied, err := p.applyUpsert(ctx, root, crd, action)
 			if err != nil {
 				res.Status = ApplyFailed

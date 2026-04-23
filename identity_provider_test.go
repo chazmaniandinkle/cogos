@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -470,6 +471,231 @@ func TestIdentityProvider_ApplyPlan_KeyHashMismatch_RefusesApply_EmitsMismatchEv
 	if _, ok := fx.db.projections["cog"]; ok {
 		t.Errorf("projection in DB despite mismatch")
 	}
+}
+
+// ─── Wave 6a-4 idempotency tests ────────────────────────────────────────────────
+//
+// These cover the ApplyPlan idempotency contract required by the scheduler-
+// driven interior harness: calling ApplyPlan twice with the same plan must
+// produce zero new events, zero DB writes, and leave the cogdoc file
+// byte-identical on the second call. See project_cogos_reconciler_is_agent.md
+// for the framing: the reconciler tick IS the agent's cognitive loop, and an
+// agent that can't re-tick without churning its own substrate is broken.
+
+// TestIdentityProvider_ApplyPlan_DoubleApply_IsIdempotent is the core
+// idempotency contract: same plan applied twice → first creates, second
+// skips entirely (no writes, no events, file unchanged).
+func TestIdentityProvider_ApplyPlan_DoubleApply_IsIdempotent(t *testing.T) {
+	fx := setupProvider(t)
+	writeIdentityCRD(t, fx.root, "cog", "cogos-dev", "Cog", "")
+
+	cfg, _ := fx.prov.LoadConfig(fx.root)
+	live, _ := fx.prov.FetchLive(context.Background(), cfg)
+	plan, _ := fx.prov.ComputePlan(cfg, live, nil)
+
+	// First apply: creates.
+	results1, err := fx.prov.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("first ApplyPlan: %v", err)
+	}
+	if len(results1) != 1 || results1[0].Status != ApplySucceeded {
+		t.Fatalf("first apply = %+v, want 1 succeeded", results1)
+	}
+
+	// Snapshot state.
+	fx.evMu.Lock()
+	eventsBefore := len(*fx.events)
+	fx.evMu.Unlock()
+
+	projBefore, _ := fx.db.GetProjection(context.Background(), "cog")
+	partBefore := fx.db.participants["agent:cog"]
+
+	cogdocPath := filepath.Join(fx.root, ".cog", "id", "cog.cog.md")
+	contentBefore, err := os.ReadFile(cogdocPath)
+	if err != nil {
+		t.Fatalf("read cogdoc: %v", err)
+	}
+
+	// Second apply of identical plan.
+	results2, err := fx.prov.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("second ApplyPlan: %v", err)
+	}
+	if len(results2) != 1 || results2[0].Status != ApplySkipped {
+		t.Fatalf("second apply = %+v, want 1 skipped", results2)
+	}
+
+	// Zero new events.
+	fx.evMu.Lock()
+	eventsAfter := len(*fx.events)
+	fx.evMu.Unlock()
+	if eventsAfter != eventsBefore {
+		t.Errorf("second apply emitted %d new events, want 0", eventsAfter-eventsBefore)
+	}
+
+	// Projection row unchanged (including timestamp — signature of no upsert).
+	projAfter, _ := fx.db.GetProjection(context.Background(), "cog")
+	if projBefore == nil || projAfter == nil {
+		t.Fatalf("projection missing: before=%v after=%v", projBefore, projAfter)
+	}
+	if !projBefore.ProjectedAt.Equal(projAfter.ProjectedAt) {
+		t.Errorf("ProjectedAt mutated on re-apply: %v → %v", projBefore.ProjectedAt, projAfter.ProjectedAt)
+	}
+	if projBefore.SpecHash != projAfter.SpecHash {
+		t.Errorf("SpecHash mutated: %q → %q", projBefore.SpecHash, projAfter.SpecHash)
+	}
+
+	// Participant row unchanged (timestamps stable).
+	partAfter := fx.db.participants["agent:cog"]
+	if !partBefore.LastSeen.Equal(partAfter.LastSeen) {
+		t.Errorf("participant LastSeen mutated: %v → %v", partBefore.LastSeen, partAfter.LastSeen)
+	}
+	if !partBefore.RegisteredAt.Equal(partAfter.RegisteredAt) {
+		t.Errorf("participant RegisteredAt mutated: %v → %v", partBefore.RegisteredAt, partAfter.RegisteredAt)
+	}
+
+	// Cogdoc file byte-identical (the applied_at churn fix).
+	contentAfter, err := os.ReadFile(cogdocPath)
+	if err != nil {
+		t.Fatalf("read cogdoc after: %v", err)
+	}
+	if !bytes.Equal(contentBefore, contentAfter) {
+		t.Errorf("cogdoc rewritten on re-apply\nbefore:\n%s\nafter:\n%s", string(contentBefore), string(contentAfter))
+	}
+}
+
+// TestIdentityProvider_ApplyPlan_ReapplyAfterFileDelete_RewritesFile ensures
+// the idempotency short-circuit respects disk state — if the cogdoc file is
+// manually deleted between applies, the re-apply must rewrite it, not blindly
+// skip based on DB row alone. This is what keeps the reconciler actually
+// reconciling rather than silently drifting off disk.
+func TestIdentityProvider_ApplyPlan_ReapplyAfterFileDelete_RewritesFile(t *testing.T) {
+	fx := setupProvider(t)
+	writeIdentityCRD(t, fx.root, "cog", "cogos-dev", "Cog", "")
+
+	cfg, _ := fx.prov.LoadConfig(fx.root)
+	live, _ := fx.prov.FetchLive(context.Background(), cfg)
+	plan, _ := fx.prov.ComputePlan(cfg, live, nil)
+
+	if _, err := fx.prov.ApplyPlan(context.Background(), plan); err != nil {
+		t.Fatalf("first ApplyPlan: %v", err)
+	}
+
+	// Simulate drift: remove the cogdoc file out from under the reconciler.
+	cogdocPath := filepath.Join(fx.root, ".cog", "id", "cog.cog.md")
+	if err := os.Remove(cogdocPath); err != nil {
+		t.Fatalf("remove cogdoc: %v", err)
+	}
+
+	// Re-apply — should detect missing file and rewrite, NOT skip.
+	results, err := fx.prov.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("second ApplyPlan: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("second apply: got %d results, want 1", len(results))
+	}
+	if results[0].Status != ApplySucceeded {
+		t.Errorf("re-apply after file delete: Status = %v, want ApplySucceeded (should rewrite, not skip)", results[0].Status)
+	}
+	if _, err := os.Stat(cogdocPath); err != nil {
+		t.Errorf("cogdoc not rewritten after delete: %v", err)
+	}
+}
+
+// TestIdentityProvider_ApplyPlan_FullReconcileCycle_DoubleApply_IsIdempotent
+// runs the full reconcile cycle twice (LoadConfig → FetchLive → ComputePlan →
+// ApplyPlan) and asserts the second cycle produces no new events. This matches
+// the scheduler-driven pattern: every tick re-runs the full cycle from disk
+// state, so the full cycle must be idempotent end-to-end.
+func TestIdentityProvider_ApplyPlan_FullReconcileCycle_DoubleApply_IsIdempotent(t *testing.T) {
+	fx := setupProvider(t)
+	writeIdentityCRD(t, fx.root, "alice", "cogos-dev", "Alice", "")
+	writeIdentityCRD(t, fx.root, "bob", "cogos-dev", "Bob", "")
+
+	// Cycle 1 — both creates.
+	cfg1, _ := fx.prov.LoadConfig(fx.root)
+	live1, _ := fx.prov.FetchLive(context.Background(), cfg1)
+	plan1, _ := fx.prov.ComputePlan(cfg1, live1, nil)
+	results1, _ := fx.prov.ApplyPlan(context.Background(), plan1)
+	if len(results1) != 2 {
+		t.Fatalf("cycle 1: got %d results, want 2", len(results1))
+	}
+	for _, r := range results1 {
+		if r.Status != ApplySucceeded {
+			t.Fatalf("cycle 1 result %+v, want succeeded", r)
+		}
+	}
+
+	fx.evMu.Lock()
+	cycle1Events := len(*fx.events)
+	fx.evMu.Unlock()
+
+	// Cycle 2 — fresh full reload. ComputePlan should return all-skip.
+	cfg2, _ := fx.prov.LoadConfig(fx.root)
+	live2, _ := fx.prov.FetchLive(context.Background(), cfg2)
+	plan2, _ := fx.prov.ComputePlan(cfg2, live2, nil)
+
+	if plan2.Summary.HasChanges() {
+		t.Errorf("cycle 2 plan has changes: %+v, want all-skip", plan2.Summary)
+	}
+	if plan2.Summary.Skipped != 2 {
+		t.Errorf("cycle 2 Skipped = %d, want 2", plan2.Summary.Skipped)
+	}
+
+	// Apply the all-skip plan — all actions have ActionSkip, which ApplyPlan
+	// filters with `continue` at the top of the loop, so results should be empty.
+	results2, _ := fx.prov.ApplyPlan(context.Background(), plan2)
+	if len(results2) != 0 {
+		t.Errorf("cycle 2 apply produced %d results, want 0 (all actions skip)", len(results2))
+	}
+
+	// Zero new events across the entire second cycle.
+	fx.evMu.Lock()
+	cycle2Events := len(*fx.events)
+	fx.evMu.Unlock()
+	if cycle2Events != cycle1Events {
+		t.Errorf("cycle 2 emitted %d new events, want 0", cycle2Events-cycle1Events)
+	}
+}
+
+// TestIdentityProvider_ApplyPlan_RepeatedSamePlan_AllSkippedAfterFirst is the
+// strictest form of the contract: applying the same plan object N times in a
+// row produces exactly one effective apply. Every subsequent call returns
+// ApplySkipped, and exactly one identity.projected event is emitted total.
+func TestIdentityProvider_ApplyPlan_RepeatedSamePlan_AllSkippedAfterFirst(t *testing.T) {
+	fx := setupProvider(t)
+	writeIdentityCRD(t, fx.root, "cog", "cogos-dev", "Cog", "")
+
+	cfg, _ := fx.prov.LoadConfig(fx.root)
+	live, _ := fx.prov.FetchLive(context.Background(), cfg)
+	plan, _ := fx.prov.ComputePlan(cfg, live, nil)
+
+	// First apply — creates.
+	r0, err := fx.prov.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("apply 0: %v", err)
+	}
+	if len(r0) != 1 || r0[0].Status != ApplySucceeded {
+		t.Fatalf("apply 0 = %+v, want 1 succeeded", r0)
+	}
+
+	// Five more applies — every one should be skipped.
+	for i := 1; i <= 5; i++ {
+		ri, err := fx.prov.ApplyPlan(context.Background(), plan)
+		if err != nil {
+			t.Fatalf("apply %d: %v", i, err)
+		}
+		if len(ri) != 1 {
+			t.Fatalf("apply %d: got %d results, want 1", i, len(ri))
+		}
+		if ri[0].Status != ApplySkipped {
+			t.Errorf("apply %d: Status = %v, want ApplySkipped", i, ri[0].Status)
+		}
+	}
+
+	// Exactly one identity.projected event across all six applies.
+	assertEmitted(t, fx, EventIdentityProjected, 1)
 }
 
 func TestIdentityProvider_KeyResolvers_FileScheme(t *testing.T) {
