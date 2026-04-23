@@ -287,6 +287,77 @@ func (m *busSessionManager) appendBusEvent(busID, eventType, from string, payloa
 	return &evt, nil
 }
 
+// appendBusEventRef is the ADR-084 dataref variant of appendBusEvent. Callers
+// that have already stored their payload in the shared content-addressed blob
+// store pass the digest, media type, and size; this method writes an envelope
+// with those fields populated and Payload left nil. Consumers resolve the
+// bytes via GET /v1/blobs/:digest.
+//
+// All other envelope semantics (V2 block, prev-chain, registry update, handler
+// dispatch) match appendBusEvent so both shapes coexist on the same bus during
+// the Phase 1 migration (G3 pilot, ADR-084 Phase 2).
+//
+// `digest` is expected in the canonical "sha256:<hex>" form. `size` is the
+// original payload byte length.
+func (m *busSessionManager) appendBusEventRef(busID, eventType, from, digest, mediaType string, size int) (*CogBlock, error) {
+	m.mu.Lock()
+
+	lastSeq, lastHash := m.getLastEvent(busID)
+	newSeq := lastSeq + 1
+
+	var prev []string
+	if lastHash != "" {
+		prev = []string{lastHash}
+	}
+
+	evt := CogBlock{
+		V:         2,
+		BusID:     busID,
+		Seq:       newSeq,
+		Ts:        time.Now().UTC().Format(time.RFC3339Nano),
+		From:      from,
+		Type:      eventType,
+		Payload:   nil, // ADR-084: by-reference — bytes live in BlobStore
+		Digest:    digest,
+		MediaType: mediaType,
+		Size:      size,
+		Prev:      prev,
+		PrevHash:  lastHash,
+	}
+	evt.Hash = computeBlockHash(&evt)
+
+	line, err := json.Marshal(evt)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("marshal event: %w", err)
+	}
+
+	eventsFile := m.eventsPath(busID)
+	f, err := os.OpenFile(eventsFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("open events file: %w", err)
+	}
+	if _, err := f.WriteString(string(line) + "\n"); err != nil {
+		f.Close()
+		m.mu.Unlock()
+		return nil, fmt.Errorf("write event: %w", err)
+	}
+	f.Close()
+
+	m.updateRegistrySeq(busID, newSeq, evt.Ts)
+
+	handlers := make([]busEventHandler, len(m.eventHandlers))
+	copy(handlers, m.eventHandlers)
+	m.mu.Unlock()
+
+	for _, h := range handlers {
+		h.handler(busID, &evt)
+	}
+
+	return &evt, nil
+}
+
 // getLastEvent reads the last event from a bus to get seq and hash for chaining.
 func (m *busSessionManager) getLastEvent(busID string) (int, string) {
 	eventsFile := m.eventsPath(busID)
