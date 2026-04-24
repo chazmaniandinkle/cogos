@@ -33,6 +33,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +54,40 @@ const (
 	ToolOwnershipKernel = "kernel"
 	ToolOwnershipClient = "client"
 )
+
+// internalToolNames is the closed set of tool names the CogOS kernel knows
+// how to execute itself — mostly Claude CLI built-ins routed via Claude
+// CLI's `--allowed-tools`. Everything else is assumed to belong to the
+// calling client (BrowserOS-style passthrough). Keep this in lockstep with
+// harness/tools.go:internalToolCLINames; the two packages live in separate
+// Go modules so we can't share the map directly.
+var internalToolNames = map[string]struct{}{
+	"exec":        {},
+	"bash":        {},
+	"shell":       {},
+	"read":        {},
+	"file_read":   {},
+	"write":       {},
+	"file_write":  {},
+	"edit":        {},
+	"apply-patch": {},
+	"apply_patch": {},
+	"search":      {},
+	"grep":        {},
+	"glob":        {},
+	"find":        {},
+}
+
+// classifyToolOwnership returns the ownership label for a given tool name.
+// Case-insensitive match against the internal-tool set; anything not in the
+// set is ToolOwnershipClient so tool definitions from BrowserOS, custom
+// agents, etc. survive the pipeline.
+func classifyToolOwnership(name string) string {
+	if _, ok := internalToolNames[strings.ToLower(name)]; ok {
+		return ToolOwnershipKernel
+	}
+	return ToolOwnershipClient
+}
 
 // Tool-result status taxonomy — the outcome of an invocation.
 const (
