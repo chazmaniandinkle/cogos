@@ -181,7 +181,21 @@ type Process struct {
 	// initialized on first registerPendingToolCall; swept by
 	// RunPendingToolCallSweeper. See tool_observer.go.
 	pendingToolCalls *pendingToolCallRegistry
+
+	// sessionActivityPublisher fans tailer blocks out to session-scoped bus
+	// channels (channel.<sid>.activity) in addition to the global ledger —
+	// Phase 1A of the 4E cognitive-observer loop closure. Set by the main
+	// serve wire-up (see cli.go) to *BusSessionManager.AppendEvent. Nil when
+	// the process is constructed without a bus (e.g. benchmarks, some tests);
+	// handleTailerBlock degrades gracefully in that case.
+	sessionActivityPublisher SessionActivityPublisher
 }
+
+// SessionActivityPublisher is the bus-append signature used by
+// handleTailerBlock to fan tailer blocks onto per-session activity channels.
+// It matches *BusSessionManager.AppendEvent so main can wire the method
+// value directly without an adapter.
+type SessionActivityPublisher func(busID, eventType, from string, payload map[string]interface{}) (*BusBlock, error)
 
 // NewProcess constructs and initialises the process.
 func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
@@ -355,6 +369,22 @@ func (p *Process) SetTRM(trm *MambaTRM, idx *EmbeddingIndex) {
 	p.trm = trm
 	p.embeddingIndex = idx
 	p.lightCones = NewLightConeManager(trm)
+}
+
+// SetSessionActivityPublisher installs the bus-append hook used by
+// handleTailerBlock to publish normalized tailer blocks onto per-session
+// activity channels (Phase 1A of the 4E cognitive-observer loop). The
+// expected value in production is (*BusSessionManager).AppendEvent wired
+// in at serve startup; tests inject a fake to observe publishes.
+// Passing nil disables the channel-publish side-effect while leaving the
+// ledger write intact.
+func (p *Process) SetSessionActivityPublisher(pub SessionActivityPublisher) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sessionActivityPublisher = pub
 }
 
 // Send delivers an external event to the process loop (non-blocking).
@@ -531,8 +561,76 @@ func (p *Process) handleTailerBlock(block CogBlock) {
 		b.Timestamp = time.Now().UTC()
 	}
 
+	// Capture the originating session id BEFORE RecordBlock — RecordBlock
+	// substitutes the kernel's own sessionID when the block is missing one,
+	// and for the activity channel we only care about externally-sourced
+	// session identifiers. For Claude Code blocks this is the per-
+	// conversation UUID carried on every JSONL line (see
+	// normalizeClaudeCodeLine — CogBlock.SessionID and
+	// BlockProvenance.OriginSession are both populated from entry.sessionId).
+	// OpenClaw and other tailers that don't stamp a session id fall through
+	// to the graceful-skip branch below.
+	sid := strings.TrimSpace(b.SessionID)
+	if sid == "" {
+		sid = strings.TrimSpace(b.Provenance.OriginSession)
+	}
+
 	ref := p.RecordBlock(&b)
 	slog.Info("process: tailer block ingested", "source_channel", b.SourceChannel, "kind", b.Kind, "ledger_ref", ref)
+
+	p.publishSessionActivity(sid, &b, ref)
+}
+
+// publishSessionActivity fans a tailer block onto the session-scoped bus
+// channel channel.<sid>.activity (ADR-084 dot-separated lowercase event
+// naming). Phase 1A of the 4E cognitive-observer loop — downstream
+// UserPromptSubmit hooks query this channel to render peer-awareness
+// packets (Phase 1B). The payload is a minimal summary rather than the
+// full block content: the ledger remains authoritative for payload, the
+// channel is only for downstream query-driven notifications.
+//
+// Skips with a debug log when the originating session id is missing
+// (e.g. OpenClaw blocks, or Claude Code lines lacking the sessionId
+// field) or when no publisher has been wired — tailer ingestion never
+// fails on a missing side-channel.
+func (p *Process) publishSessionActivity(sid string, b *CogBlock, ref string) {
+	if b == nil {
+		return
+	}
+	if sid == "" {
+		slog.Debug("process: session activity publish skipped — no session id on block",
+			"source_channel", b.SourceChannel, "kind", b.Kind)
+		return
+	}
+
+	p.mu.RLock()
+	pub := p.sessionActivityPublisher
+	p.mu.RUnlock()
+	if pub == nil {
+		slog.Debug("process: session activity publish skipped — no publisher wired",
+			"sid", sid, "source_channel", b.SourceChannel)
+		return
+	}
+
+	busID := "channel." + sid + ".activity"
+	payload := map[string]interface{}{
+		"kind":           string(b.Kind),
+		"source_channel": b.SourceChannel,
+		"timestamp":      b.Timestamp.UTC().Format(time.RFC3339Nano),
+		"ref":            ref,
+	}
+	from := b.SourceChannel
+	if from == "" {
+		from = "kernel:tailer"
+	}
+
+	if _, err := pub(busID, "tailer.block", from, payload); err != nil {
+		slog.Warn("process: session activity publish failed",
+			"bus_id", busID, "source_channel", b.SourceChannel, "err", err)
+		return
+	}
+	slog.Debug("process: session activity published",
+		"bus_id", busID, "source_channel", b.SourceChannel, "kind", b.Kind)
 }
 
 // handleExternal processes an external perturbation.
