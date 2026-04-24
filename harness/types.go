@@ -106,7 +106,21 @@ type InferenceRequest struct {
 	ContextState *ContextState // Four-tier context for context-aware invocation
 
 	// Tool definitions
+	//
+	// Tools is the full set of OpenAI-format tool definitions from the
+	// client. The harness classifies each tool as internal or external via
+	// ClassifyTool/PartitionTools; internal tools are executed by Claude
+	// CLI or the CogOS kernel, external tools are forwarded to the client
+	// as `tool_calls` on the response.
+	//
+	// ExternalTools, when non-nil, is a pre-partitioned list of
+	// client-owned tools (equivalent to the `external` return of
+	// PartitionTools(Tools)). Callers that have already partitioned can
+	// populate this directly; otherwise the harness partitions Tools on
+	// its own. This is the plumbing BrowserOS uses to register
+	// `browser_*` tools it will execute itself.
 	Tools           []json.RawMessage // OpenAI-format tool definitions from client
+	ExternalTools   []json.RawMessage // Client-owned tool definitions (subset of Tools)
 	AllowedTools    []string          // Claude CLI --allowed-tools patterns (e.g. "Bash", "Bash(git:*)")
 	SkipPermissions bool              // Pass --dangerously-skip-permissions to Claude CLI
 
@@ -156,6 +170,14 @@ type InferenceResponse struct {
 	// this and pass it back as ClaudeSessionID on the next request to
 	// enable --resume continuity.
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
+
+	// ToolCalls lists client-owned tool invocations the model asked for
+	// but the harness did not execute. The caller (typically an HTTP
+	// handler) is expected to surface these as `tool_calls` on the
+	// assistant message so a BrowserOS-style client can execute them and
+	// send back the result on the next turn. FinishReason is set to
+	// "tool_calls" when this slice is non-empty.
+	ToolCalls []ToolCallData `json:"tool_calls,omitempty"`
 }
 
 // ChatMessage represents a message in the chat format.

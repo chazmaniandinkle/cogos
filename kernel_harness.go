@@ -200,6 +200,7 @@ func toHarnessRequest(req *InferenceRequest) *harness.InferenceRequest {
 		Context:         req.Context,
 		ContextState:    toHarnessContextState(req.ContextState),
 		Tools:           req.Tools,
+		ExternalTools:   req.ExternalTools,
 		AllowedTools:    req.AllowedTools,
 		SkipPermissions: req.SkipPermissions,
 		WorkspaceRoot:   req.WorkspaceRoot,
@@ -231,6 +232,16 @@ func fromHarnessResponse(resp *harness.InferenceResponse) *InferenceResponse {
 		ErrorMessage:      resp.ErrorMessage,
 		ErrorType:         ErrorType(resp.ErrorType),
 		ClaudeSessionID:   resp.ClaudeSessionID,
+	}
+	if len(resp.ToolCalls) > 0 {
+		kr.ToolCalls = make([]ToolCallData, len(resp.ToolCalls))
+		for i, tc := range resp.ToolCalls {
+			kr.ToolCalls[i] = ToolCallData{
+				ID:        tc.ID,
+				Name:      tc.Name,
+				Arguments: tc.Arguments,
+			}
+		}
 	}
 	if resp.ContextMetrics != nil {
 		kr.ContextMetrics = &ContextMetrics{
@@ -282,6 +293,16 @@ func fromHarnessStreamChunk(chunk harness.StreamChunkInference) StreamChunkInfer
 			Model:           chunk.SessionInfo.Model,
 			Tools:           chunk.SessionInfo.Tools,
 			ClaudeSessionID: chunk.SessionInfo.ClaudeSessionID,
+		}
+	}
+	if len(chunk.ExternalToolCalls) > 0 {
+		sc.ExternalToolCalls = make([]ToolCallData, len(chunk.ExternalToolCalls))
+		for i, tc := range chunk.ExternalToolCalls {
+			sc.ExternalToolCalls[i] = ToolCallData{
+				ID:        tc.ID,
+				Name:      tc.Name,
+				Arguments: tc.Arguments,
+			}
 		}
 	}
 	return sc
