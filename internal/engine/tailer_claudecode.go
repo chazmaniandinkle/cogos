@@ -63,6 +63,12 @@ type claudeCodeLogLine struct {
 	ToolUse    json.RawMessage `json:"tool_use"`
 	ToolResult json.RawMessage `json:"tool_result"`
 	Type       string          `json:"type"`
+	// SessionID is Claude Code's per-conversation UUID. Every JSONL line
+	// carries it as the top-level `sessionId` field and it matches the
+	// filename stem of the JSONL log. We propagate it onto the normalized
+	// CogBlock so handleTailerBlock can publish to channel.<sid>.activity
+	// (Phase 1A of the 4E cognitive-observer loop).
+	SessionID string `json:"sessionId"`
 }
 
 func normalizeClaudeCodeLine(line []byte) (CogBlock, error) {
@@ -80,9 +86,12 @@ func normalizeClaudeCodeLine(line []byte) (CogBlock, error) {
 	content := parseClaudeCodeContent(entry.Content)
 	role := strings.TrimSpace(entry.Role)
 
+	sessionID := strings.TrimSpace(entry.SessionID)
+
 	block := CogBlock{
 		ID:              uuid.New().String(),
 		Timestamp:       blockTime,
+		SessionID:       sessionID,
 		SourceChannel:   claudeCodeSourceChannel,
 		SourceTransport: "jsonl",
 		SourceIdentity:  role,
@@ -93,6 +102,7 @@ func normalizeClaudeCodeLine(line []byte) (CogBlock, error) {
 			Content: content,
 		}},
 		Provenance: BlockProvenance{
+			OriginSession: sessionID,
 			OriginChannel: claudeCodeSourceChannel,
 			IngestedAt:    now,
 			NormalizedBy:  claudeCodeNormalizedBy,
