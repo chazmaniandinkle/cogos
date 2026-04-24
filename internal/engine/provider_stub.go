@@ -18,6 +18,15 @@ type StubProvider struct {
 	available    bool
 	capabilities ProviderCapabilities
 	chunks       []string // if set, Stream sends these chunks instead of response
+	// toolCalls, when non-empty, is returned on Complete() so tests can
+	// exercise the tool-calls-as-response-content path used by BrowserOS
+	// passthrough. Stream() attaches them to the Done chunk via the
+	// StreamChunk.ToolCallDelta channel (sent eagerly before Done).
+	toolCalls []ToolCall
+	// lastRequest captures the most recent CompletionRequest so tests can
+	// assert on what the handler actually passed down to the provider
+	// (e.g. that ExternalTools was partitioned correctly).
+	lastRequest *CompletionRequest
 }
 
 // NewStubProvider creates a StubProvider that returns the given response.
@@ -46,16 +55,22 @@ func (s *StubProvider) Ping(_ context.Context) (time.Duration, error) {
 	return s.latency, nil
 }
 
-func (s *StubProvider) Complete(_ context.Context, _ *CompletionRequest) (*CompletionResponse, error) {
+func (s *StubProvider) Complete(_ context.Context, req *CompletionRequest) (*CompletionResponse, error) {
+	s.lastRequest = req
 	if s.err != nil {
 		return nil, s.err
 	}
 	if s.latency > 0 {
 		time.Sleep(s.latency)
 	}
+	stop := "end_turn"
+	if len(s.toolCalls) > 0 {
+		stop = "tool_use"
+	}
 	return &CompletionResponse{
 		Content:    s.response,
-		StopReason: "end_turn",
+		ToolCalls:  s.toolCalls,
+		StopReason: stop,
 		ProviderMeta: ProviderMeta{
 			Provider: s.name,
 			Model:    "stub",
@@ -63,7 +78,8 @@ func (s *StubProvider) Complete(_ context.Context, _ *CompletionRequest) (*Compl
 	}, nil
 }
 
-func (s *StubProvider) Stream(_ context.Context, _ *CompletionRequest) (<-chan StreamChunk, error) {
+func (s *StubProvider) Stream(_ context.Context, req *CompletionRequest) (<-chan StreamChunk, error) {
+	s.lastRequest = req
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -71,12 +87,35 @@ func (s *StubProvider) Stream(_ context.Context, _ *CompletionRequest) (<-chan S
 	if len(chunks) == 0 {
 		chunks = []string{s.response}
 	}
-	ch := make(chan StreamChunk, len(chunks)+1)
+	extra := 1
+	if len(s.toolCalls) > 0 {
+		extra += len(s.toolCalls)
+	}
+	ch := make(chan StreamChunk, len(chunks)+extra)
 	for _, c := range chunks {
 		ch <- StreamChunk{Delta: c}
 	}
+	// Emit any stub-configured tool calls as ToolCallDelta events. Each
+	// call is emitted as a single delta carrying the full ID/Name/args
+	// — StreamChunk doesn't distinguish multi-part deltas from atomic
+	// ones; serve.go's tool_call forwarder is tolerant of both.
+	for i, tc := range s.toolCalls {
+		ch <- StreamChunk{
+			ToolCallDelta: &ToolCallDelta{
+				Index:     i,
+				ID:        tc.ID,
+				Name:      tc.Name,
+				ArgsDelta: tc.Arguments,
+			},
+		}
+	}
+	stop := ""
+	if len(s.toolCalls) > 0 {
+		stop = "tool_use"
+	}
 	ch <- StreamChunk{
-		Done: true,
+		Done:         true,
+		StopReason:   stop,
 		ProviderMeta: &ProviderMeta{Provider: s.name, Model: "stub"},
 	}
 	close(ch)

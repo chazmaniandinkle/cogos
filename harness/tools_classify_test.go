@@ -117,3 +117,51 @@ func TestMapToolsToCLINames_ExternalToolsDropped(t *testing.T) {
 		}
 	}
 }
+
+func TestExternalToolNameSet_FromPartition(t *testing.T) {
+	req := &InferenceRequest{
+		Tools: []json.RawMessage{
+			json.RawMessage(`{"type":"function","function":{"name":"bash"}}`),
+			json.RawMessage(`{"type":"function","function":{"name":"browser_navigate"}}`),
+		},
+	}
+	names := externalToolNameSet(req)
+	if len(names) != 1 {
+		t.Errorf("external name set size = %d; want 1", len(names))
+	}
+	if !names["browser_navigate"] {
+		t.Errorf("expected browser_navigate in external set, got %v", names)
+	}
+}
+
+func TestExternalToolNameSet_PrefersPrePartitioned(t *testing.T) {
+	// When ExternalTools is populated the harness should trust it and skip
+	// re-classification — this is the contract serve.go relies on.
+	req := &InferenceRequest{
+		Tools: []json.RawMessage{
+			json.RawMessage(`{"type":"function","function":{"name":"bash"}}`),
+			json.RawMessage(`{"type":"function","function":{"name":"some_client_tool"}}`),
+		},
+		ExternalTools: []json.RawMessage{
+			// Deliberately different so we can detect which source was used.
+			json.RawMessage(`{"type":"function","function":{"name":"explicitly_external"}}`),
+		},
+	}
+	names := externalToolNameSet(req)
+	if !names["explicitly_external"] {
+		t.Errorf("expected pre-partitioned list to win, got %v", names)
+	}
+	if names["some_client_tool"] {
+		t.Errorf("re-partitioned a request that already had ExternalTools set")
+	}
+}
+
+func TestExternalToolNameSet_NilSafe(t *testing.T) {
+	if got := externalToolNameSet(nil); got != nil {
+		t.Errorf("nil request produced non-nil map: %v", got)
+	}
+	empty := &InferenceRequest{}
+	if got := externalToolNameSet(empty); got != nil {
+		t.Errorf("empty request produced non-nil map: %v", got)
+	}
+}

@@ -215,6 +215,36 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// externalToolNameSet returns the normalised set of external (client-owned)
+// tool names for a request. Callers use it to decide whether a tool_use
+// event from the model should be executed server-side or buffered for the
+// client to execute. The set is empty when the request has no external
+// tools, making lookups cheap on the common path.
+//
+// Precedence:
+//   - If req.ExternalTools is populated, use it as the authoritative list.
+//     This lets the HTTP layer pre-partition and skip re-classification.
+//   - Otherwise fall back to partitioning req.Tools on the fly.
+func externalToolNameSet(req *InferenceRequest) map[string]bool {
+	if req == nil {
+		return nil
+	}
+	source := req.ExternalTools
+	if source == nil && len(req.Tools) > 0 {
+		_, source = PartitionTools(req.Tools)
+	}
+	if len(source) == 0 {
+		return nil
+	}
+	names := make(map[string]bool, len(source))
+	for _, raw := range source {
+		if n := ExtractToolName(raw); n != "" {
+			names[n] = true
+		}
+	}
+	return names
+}
+
 // RunInference executes a non-streaming inference request and blocks until complete.
 //
 // Routing is determined by the Model field in the request:
@@ -354,6 +384,13 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 		}
 	}
 
+	// Classify external tool names so we can capture (not execute) any
+	// tool_use events the model emits for client-owned tools. This is the
+	// plumbing BrowserOS relies on — without it, browser_* tool calls
+	// either fall through silently or fail because Claude CLI doesn't
+	// know how to run them.
+	externalToolNames := externalToolNameSet(req)
+
 	// Build Claude CLI arguments
 	args := BuildClaudeArgs(req)
 
@@ -389,6 +426,10 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 	var costUSD float64
 	var finishReason string
 	var claudeSessionID string
+	// externalCalls buffers tool_use events the model emits for
+	// client-owned tools. We return these on the response as ToolCalls
+	// rather than executing them; finish_reason becomes "tool_calls".
+	var externalCalls []ToolCallData
 
 	// Debug: capture raw stream if COG_DEBUG_INFERENCE is set
 	debugFile := os.Getenv("COG_DEBUG_INFERENCE")
@@ -443,6 +484,14 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 					case "tool_use":
 						if c.Name == "StructuredOutput" && len(c.Input) > 0 {
 							content.Write(c.Input)
+						} else if externalToolNames[c.Name] {
+							// Client-owned tool — buffer the call rather
+							// than letting Claude CLI try to execute it.
+							externalCalls = append(externalCalls, ToolCallData{
+								ID:        c.ID,
+								Name:      c.Name,
+								Arguments: c.Input,
+							})
 						}
 					}
 				}
@@ -518,6 +567,13 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 		return nil, fmt.Errorf("request cancelled")
 	}
 
+	// If the model emitted any tool_use events for client-owned tools,
+	// surface them as ToolCalls and flip finish_reason so the caller
+	// knows to propagate them to the upstream OpenAI response.
+	if len(externalCalls) > 0 {
+		finishReason = "tool_calls"
+	}
+
 	response := &InferenceResponse{
 		ID:                req.ID,
 		Content:           content.String(),
@@ -529,6 +585,7 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 		FinishReason:      finishReason,
 		ContextMetrics:    BuildContextMetrics(req.ContextState),
 		ClaudeSessionID:   claudeSessionID,
+		ToolCalls:         externalCalls,
 	}
 
 	if waitErr != nil {
@@ -780,6 +837,10 @@ func (h *Harness) RunInferenceStream(req *InferenceRequest) (<-chan StreamChunkI
 		}
 	}
 
+	// Classify client-owned tools so the stream loop can capture (not
+	// execute) any tool_use events the model emits for them.
+	externalToolNames := externalToolNameSet(req)
+
 	args := BuildClaudeArgs(req)
 
 	_, cliSpan := tracer.Start(ctx, "claude.cli.exec",
@@ -850,6 +911,11 @@ func (h *Harness) RunInferenceStream(req *InferenceRequest) (<-chan StreamChunkI
 		var fullContent strings.Builder
 
 		activeToolCalls := make(map[int]*ToolCallData)
+		// externalCalls accumulates tool_use invocations the model emits
+		// for client-owned tools. We keep them internally and flush them
+		// in the final chunk (see safeSend near the bottom) so the HTTP
+		// layer can emit a single `tool_calls` delta event.
+		var externalCalls []ToolCallData
 		var sessionID, sessionModel string
 		var sessionTools []string
 
@@ -989,7 +1055,14 @@ func (h *Harness) RunInferenceStream(req *InferenceRequest) (<-chan StreamChunkI
 
 				case "content_block_stop":
 					if tc, ok := activeToolCalls[eventData.Index]; ok {
-						if !safeSend(StreamChunkInference{
+						// Buffer client-owned tool calls so we can emit
+						// them on the final chunk as `tool_calls`.
+						// Internal tools still pass through as regular
+						// tool_use stream events for the MCP bridge or
+						// CLI to execute.
+						if externalToolNames[tc.Name] {
+							externalCalls = append(externalCalls, *tc)
+						} else if !safeSend(StreamChunkInference{
 							ID:        req.ID,
 							EventType: "tool_use",
 							ToolCall:  tc,
@@ -1122,7 +1195,13 @@ func (h *Harness) RunInferenceStream(req *InferenceRequest) (<-chan StreamChunkI
 								cliSpan.AddEvent("tool_use", trace.WithAttributes(
 									attribute.String("tool.name", c.Name),
 								))
-								if !safeSend(StreamChunkInference{
+								if externalToolNames[c.Name] {
+									externalCalls = append(externalCalls, ToolCallData{
+										ID:        c.ID,
+										Name:      c.Name,
+										Arguments: c.Input,
+									})
+								} else if !safeSend(StreamChunkInference{
 									ID:        req.ID,
 									EventType: "tool_use",
 									ToolCall: &ToolCallData{
@@ -1272,20 +1351,28 @@ func (h *Harness) RunInferenceStream(req *InferenceRequest) (<-chan StreamChunkI
 				Error: waitErr,
 			})
 		} else {
+			// External tool calls flip finish_reason to "tool_calls" per
+			// the OpenAI contract so a BrowserOS-style client knows the
+			// turn ended because the model wants it to execute a tool.
+			if len(externalCalls) > 0 {
+				finishReason = "tool_calls"
+			}
 			resp := &InferenceResponse{
 				ID:               req.ID,
 				Content:          fullContent.String(),
 				PromptTokens:     promptTokens,
 				CompletionTokens: completionTokens,
 				FinishReason:     finishReason,
+				ToolCalls:        externalCalls,
 			}
 			h.emitInferenceComplete(req, resp, startTime)
 			h.clearInferenceActiveSignal()
 
 			safeSend(StreamChunkInference{
-				ID:           req.ID,
-				Done:         true,
-				FinishReason: finishReason,
+				ID:                req.ID,
+				Done:              true,
+				FinishReason:      finishReason,
+				ExternalToolCalls: externalCalls,
 				Usage: &UsageData{
 					InputTokens:       promptTokens,
 					OutputTokens:      completionTokens,
