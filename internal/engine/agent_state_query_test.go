@@ -95,10 +95,6 @@ func (f *fakeAgentController) TriggerAgent(ctx context.Context, id string, reaso
 	}, nil
 }
 
-func (f *fakeAgentController) DispatchToHarness(_ context.Context, _ DispatchRequest) (*DispatchBatchResult, error) {
-	return &DispatchBatchResult{Results: []DispatchResult{{Index: 0, Success: true, Content: "ok"}}}, nil
-}
-
 // --- Validation helpers ------------------------------------------------------
 
 func TestValidateAgentID_AcceptsDefault(t *testing.T) {

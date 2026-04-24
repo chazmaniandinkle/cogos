@@ -450,7 +450,7 @@ func TestOllamaCompleteToolCalls(t *testing.T) {
 						Type: "function",
 						Function: ollamaToolCallDetail{
 							Name:      "search",
-							Arguments: `{"query":"hi"}`,
+							Arguments: json.RawMessage(`{"query":"hi"}`),
 						},
 					},
 				},

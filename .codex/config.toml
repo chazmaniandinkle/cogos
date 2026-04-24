@@ -1,5 +1,5 @@
-source_type = "local"
-source = "/Users/slowbro/.codex/.tmp/bundled-marketplaces/openai-bundled"
+source_type = "bundled"
+source = "openai"
 
 [mcp_servers.cogos]
 

@@ -190,8 +190,8 @@ type ollamaToolCall struct {
 }
 
 type ollamaToolCallDetail struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
 }
 
 type ollamaChatRequest struct {
@@ -228,12 +228,16 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 		}
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
 			for _, tc := range m.ToolCalls {
+				rawArgs := json.RawMessage(tc.Arguments)
+				if len(rawArgs) == 0 || !json.Valid(rawArgs) {
+					rawArgs = json.RawMessage("{}")
+				}
 				msg.ToolCalls = append(msg.ToolCalls, ollamaToolCall{
 					ID:   tc.ID,
 					Type: "function",
 					Function: ollamaToolCallDetail{
 						Name:      tc.Name,
-						Arguments: tc.Arguments,
+						Arguments: rawArgs,
 					},
 				})
 			}
@@ -338,10 +342,14 @@ func (p *OllamaProvider) Complete(ctx context.Context, req *CompletionRequest) (
 	if len(or.Message.ToolCalls) > 0 {
 		out.StopReason = "tool_use"
 		for _, tc := range or.Message.ToolCalls {
+			args := string(tc.Function.Arguments)
+			if args == "" || args == "null" {
+				args = "{}"
+			}
 			out.ToolCalls = append(out.ToolCalls, ToolCall{
 				ID:        tc.ID,
 				Name:      tc.Function.Name,
-				Arguments: tc.Function.Arguments,
+				Arguments: args,
 			})
 		}
 	} else {
