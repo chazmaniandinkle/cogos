@@ -353,7 +353,14 @@ type InferenceRequest struct {
 	ContextState *ContextState // Four-tier context for context-aware invocation
 
 	// Tool definitions
+	//
+	// Tools is the raw OpenAI-format tool list from the client. The
+	// harness classifies each entry into internal (CogOS executes via
+	// Claude CLI / MCP) or external (client executes) via
+	// harness.PartitionTools. Callers that already have the partition
+	// can set ExternalTools directly to skip re-classification.
 	Tools           []json.RawMessage // OpenAI-format tool definitions from client
+	ExternalTools   []json.RawMessage // Pre-partitioned client-owned tools (optional)
 	AllowedTools    []string          // Claude CLI --allowed-tools patterns (e.g. "Bash", "Bash(git:*)")
 	SkipPermissions bool              // Pass --dangerously-skip-permissions to Claude CLI
 

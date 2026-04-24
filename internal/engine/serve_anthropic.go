@@ -174,7 +174,23 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		WithManifestMode(true),
 	); err != nil {
 		slog.Warn("anthropic: context assembly failed", "err", err)
-		creq.Messages = clientMsgs
+		// Fallback: preserve role=system messages as the provider SystemPrompt
+		// so an explicit user/BrowserOS prompt isn't silently dropped. The
+		// Anthropic upstream API rejects role=system inside messages, so we
+		// MUST extract them on this path.
+		var clientSysParts []string
+		var nonSysMsgs []ProviderMessage
+		for _, m := range clientMsgs {
+			if m.Role == "system" {
+				if strings.TrimSpace(m.Content) != "" {
+					clientSysParts = append(clientSysParts, m.Content)
+				}
+				continue
+			}
+			nonSysMsgs = append(nonSysMsgs, m)
+		}
+		creq.Messages = nonSysMsgs
+		creq.SystemPrompt = mergeSystemPrompts(s.nucleusCard(), clientSysParts)
 	} else {
 		systemPrompt, managedMsgs := pkg.FormatForProvider()
 		creq.SystemPrompt = systemPrompt

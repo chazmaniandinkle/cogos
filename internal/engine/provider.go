@@ -69,8 +69,18 @@ type CompletionRequest struct {
 	// Stop sequences that terminate generation.
 	Stop []string `json:"stop,omitempty"`
 
-	// Tools defines MCP tool definitions the model can invoke.
+	// Tools defines MCP tool definitions the model can invoke. For OpenAI /
+	// Anthropic HTTP providers these are forwarded to the upstream API so
+	// the model can emit tool_use events. The full list includes both
+	// CogOS-owned tools (internal) and client-owned tools (external).
 	Tools []ToolDefinition `json:"tools,omitempty"`
+
+	// ExternalTools is the subset of Tools whose execution belongs to the
+	// calling client (e.g. BrowserOS's `browser_*`). Providers may use this
+	// to decide which tool_use events to pass back as `tool_calls` on the
+	// response instead of executing server-side. Empty when every tool is
+	// kernel-owned. Names are expected to match entries in Tools.
+	ExternalTools []ToolDefinition `json:"external_tools,omitempty"`
 
 	// ToolChoice constrains tool use: "auto", "none", "required", or a name.
 	ToolChoice string `json:"tool_choice,omitempty"`

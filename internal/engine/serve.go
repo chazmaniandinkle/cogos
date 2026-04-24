@@ -238,6 +238,40 @@ func (s *Server) Handler() http.Handler {
 	return s.srv.Handler
 }
 
+// nucleusCard returns the current nucleus identity card, or empty if unset.
+// Used by context-assembly fallback paths to retain nucleus identity when the
+// full AssembleContext pipeline isn't available.
+func (s *Server) nucleusCard() string {
+	if s.nucleus == nil {
+		return ""
+	}
+	s.nucleus.mu.RLock()
+	defer s.nucleus.mu.RUnlock()
+	return s.nucleus.Card
+}
+
+// mergeSystemPrompts combines the nucleus identity card with any
+// client-supplied system-prompt parts in a stable order
+// (nucleus → client[0] → client[1] → ...), separated by "---" dividers.
+// Empty parts are skipped. If every input is empty, returns "".
+//
+// This is used on the fallback path when ContextPackage.FormatForProvider()
+// isn't available (e.g. AssembleContext failed or was skipped) so we still
+// honour any client-provided system prompt — the thing BrowserOS relies on
+// when it injects its browser_* tool definitions and companion system text.
+func mergeSystemPrompts(nucleus string, clientParts []string) string {
+	var parts []string
+	if strings.TrimSpace(nucleus) != "" {
+		parts = append(parts, strings.TrimRight(nucleus, "\n"))
+	}
+	for _, p := range clientParts {
+		if strings.TrimSpace(p) != "" {
+			parts = append(parts, strings.TrimRight(p, "\n"))
+		}
+	}
+	return strings.Join(parts, "\n\n---\n\n")
+}
+
 // handleHealth is the liveness/readiness probe.
 //
 //	200 → healthy
@@ -632,18 +666,27 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// Convert OpenAI-format tool definitions to internal ToolDefinition.
+	// Convert OpenAI-format tool definitions to internal ToolDefinition and
+	// partition by ownership. Internal tools (Bash/Read/Write/...) are
+	// executed server-side via Claude CLI or the MCP bridge; external
+	// tools (browser_*, etc.) are forwarded to the model as tool
+	// definitions but their tool_use events come back to the client as
+	// OpenAI `tool_calls` for client-side execution.
 	if len(req.Tools) > 0 {
 		creq.Tools = make([]ToolDefinition, 0, len(req.Tools))
 		for _, t := range req.Tools {
 			if t.Type != "function" {
 				continue
 			}
-			creq.Tools = append(creq.Tools, ToolDefinition{
+			td := ToolDefinition{
 				Name:        t.Function.Name,
 				Description: t.Function.Description,
 				InputSchema: t.Function.Parameters,
-			})
+			}
+			creq.Tools = append(creq.Tools, td)
+			if classifyToolOwnership(t.Function.Name) == ToolOwnershipClient {
+				creq.ExternalTools = append(creq.ExternalTools, td)
+			}
 		}
 	}
 
@@ -695,7 +738,24 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		WithManifestMode(true),
 	); err != nil {
 		slog.Warn("chat: context assembly failed", "err", err)
-		creq.Messages = clientMsgs
+		// Fallback: preserve any client-supplied role=system messages as the
+		// provider SystemPrompt, stripping them from the Messages slice so
+		// Anthropic's API (which rejects role=system inside messages) still
+		// works. Without this, BrowserOS-style clients that include a system
+		// prompt see it silently dropped on the fallback path.
+		var clientSysParts []string
+		var nonSysMsgs []ProviderMessage
+		for _, m := range clientMsgs {
+			if m.Role == "system" {
+				if strings.TrimSpace(m.Content) != "" {
+					clientSysParts = append(clientSysParts, m.Content)
+				}
+				continue
+			}
+			nonSysMsgs = append(nonSysMsgs, m)
+		}
+		creq.Messages = nonSysMsgs
+		creq.SystemPrompt = mergeSystemPrompts(s.nucleusCard(), clientSysParts)
 	} else {
 		pkg = p
 		systemPrompt, managedMsgs := pkg.FormatForProvider()

@@ -25,6 +25,14 @@ type StreamChunkInference struct {
 	ToolResult  *ToolResultData `json:"tool_result,omitempty"`  // Tool result information
 	Usage       *UsageData      `json:"usage,omitempty"`        // Token usage data
 	SessionInfo *SessionInfo    `json:"session_info,omitempty"` // Session metadata
+
+	// ExternalToolCalls carries client-owned tool invocations the harness
+	// captured from the model's stream but did NOT execute. Populated on
+	// the final chunk (Done=true) when the stream contained external tool
+	// uses — e.g. BrowserOS's `browser_*` tools. The HTTP layer should
+	// emit these as OpenAI-format `tool_calls` delta events and set
+	// finish_reason="tool_calls" before terminating the stream.
+	ExternalToolCalls []ToolCallData `json:"external_tool_calls,omitempty"`
 }
 
 // ToolCallData represents a tool call in streaming
