@@ -169,6 +169,13 @@ type Process struct {
 	// by NewProcess, so call sites don't need to thread this pointer.
 	broker *EventBroker
 
+	// blobStore is the content-addressed blob store rooted at
+	// WorkspaceRoot/.cog/blobs/. Initialized at process startup so that
+	// ADR-084 digest-ref emit paths have a store ready to write into and
+	// serve_blocks handlers can reuse this shared handle instead of
+	// constructing new ones per request.
+	blobStore *BlobStore
+
 	// pendingToolCalls correlates client-ownership tool.call emissions with
 	// the role=tool response that arrives on a later HTTP turn. Lazily
 	// initialized on first registerPendingToolCall; swept by
@@ -187,6 +194,17 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 	// functionally identical to SetCurrentBroker; in tests it lets
 	// multiple parallel processes coexist without racing a single slot.
 	RegisterBroker(broker)
+
+	// Initialize the content-addressed blob store (ADR-084). Calling Init()
+	// here (not lazily) guarantees `.cog/blobs/` and the manifest are ready
+	// before any emit path starts writing digest-ref payloads. A failure to
+	// create the directory is logged but not fatal — individual Store calls
+	// will retry the mkdir and surface their own errors.
+	blobStore := NewBlobStore(workspaceRootFromCfg(cfg))
+	if err := blobStore.Init(); err != nil {
+		slog.Warn("process: blob store init failed", "err", err)
+	}
+
 	return &Process{
 		state:     StateReceptive,
 		nucleus:   nucleus,
@@ -210,6 +228,7 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 		nodeManifest:        loadManifestQuiet(cfg),
 		hookRegistry:        loadStateHookRegistry(workspaceRootFromCfg(cfg)),
 		broker:              broker,
+		blobStore:           blobStore,
 	}
 }
 
@@ -219,6 +238,17 @@ func (p *Process) Broker() *EventBroker {
 		return nil
 	}
 	return p.broker
+}
+
+// BlobStore returns the shared content-addressed blob store (nil if the
+// process was constructed without one). Emit paths and HTTP blob handlers
+// should prefer this shared handle over constructing new BlobStore values
+// per call so they pick up any future in-memory state (locks, caches).
+func (p *Process) BlobStore() *BlobStore {
+	if p == nil {
+		return nil
+	}
+	return p.blobStore
 }
 
 // workspaceRootFromCfg returns the workspace root from the config, or "" if nil.
@@ -357,6 +387,13 @@ func (p *Process) SubmitExternal(evt *GateEvent) bool {
 
 // Run starts the continuous process loop. It blocks until ctx is cancelled.
 func (p *Process) Run(ctx context.Context) error {
+	// Surface the blob store root in the boot log so operators can see
+	// where digest-ref payloads will land. Construction + Init happened in
+	// NewProcess; this is purely informational.
+	if p.blobStore != nil {
+		slog.Info("process: blob store ready", "root", p.blobStore.root)
+	}
+
 	// Build CogDoc index first (fast — just frontmatter parsing).
 	// This must happen before field.Update() which can be slow (git log per file).
 	slog.Info("process: building initial CogDoc index")

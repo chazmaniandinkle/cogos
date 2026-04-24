@@ -17,11 +17,56 @@ func TestCogBlockKindConstants(t *testing.T) {
 		{BlockImport, "import"},
 		{BlockAttention, "attention"},
 		{BlockSystemEvent, "system_event"},
+		// ADR-059 block-type vocabulary.
+		{BlockDocInsight, "doc.insight"},
+		{BlockDocEpisode, "doc.episode"},
+		{BlockDocProcedure, "doc.procedure"},
+		{BlockBusMessage, "bus.message"},
+		{BlockBusAck, "bus.ack"},
+		{BlockBusCheckpoint, "bus.checkpoint"},
+		{BlockSessionTurn, "session.turn"},
 	}
 
 	for _, tt := range tests {
 		if string(tt.kind) != tt.want {
 			t.Errorf("CogBlockKind = %q; want %q", tt.kind, tt.want)
+		}
+	}
+}
+
+func TestCogBlockKind_ADR059_RoundTrip(t *testing.T) {
+	// Verify marshal/unmarshal roundtrip for every ADR-059 block type.
+	kinds := []CogBlockKind{
+		BlockDocInsight,
+		BlockDocEpisode,
+		BlockDocProcedure,
+		BlockBusMessage,
+		BlockBusAck,
+		BlockBusCheckpoint,
+		BlockSessionTurn,
+	}
+
+	for _, k := range kinds {
+		original := CogBlock{
+			ID:   "block-" + string(k),
+			Kind: k,
+		}
+
+		data, err := json.Marshal(original)
+		if err != nil {
+			t.Fatalf("Marshal(%q) failed: %v", k, err)
+		}
+
+		var decoded CogBlock
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("Unmarshal(%q) failed: %v", k, err)
+		}
+
+		if decoded.Kind != k {
+			t.Errorf("Kind = %q; want %q", decoded.Kind, k)
+		}
+		if decoded.ID != original.ID {
+			t.Errorf("ID = %q; want %q", decoded.ID, original.ID)
 		}
 	}
 }

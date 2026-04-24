@@ -54,6 +54,21 @@ const (
 	BlockImport      CogBlockKind = "import"
 	BlockAttention   CogBlockKind = "attention"
 	BlockSystemEvent CogBlockKind = "system_event"
+
+	// ADR-059 block-type vocabulary.
+	//
+	// Document types (CogBlocks at rest).
+	BlockDocInsight   CogBlockKind = "doc.insight"
+	BlockDocEpisode   CogBlockKind = "doc.episode"
+	BlockDocProcedure CogBlockKind = "doc.procedure"
+
+	// Bus types (CogBlocks in flight).
+	BlockBusMessage    CogBlockKind = "bus.message"
+	BlockBusAck        CogBlockKind = "bus.ack"
+	BlockBusCheckpoint CogBlockKind = "bus.checkpoint"
+
+	// Session types.
+	BlockSessionTurn CogBlockKind = "session.turn"
 )
 
 // BlockProvenance records the origin and ingestion metadata of a CogBlock.
