@@ -75,7 +75,7 @@ func NewOllamaProvider(name string, cfg ProviderConfig) *OllamaProvider {
 	}
 	return &OllamaProvider{
 		name:          name,
-		endpoint:      strings.TrimRight(endpoint, "/"),
+		endpoint:      normalizeLocalLLMEndpoint(endpoint),
 		model:         cfg.Model,
 		contextWindow: cfg.ContextWindow,
 		timeout:       timeout,
@@ -166,13 +166,38 @@ func (p *OllamaProvider) Ping(ctx context.Context) (time.Duration, error) {
 // ── Ollama wire types ─────────────────────────────────────────────────────────
 
 type ollamaMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string           `json:"role"`
+	Content    string           `json:"content,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []ollamaToolCall `json:"tool_calls,omitempty"`
+}
+
+type ollamaTool struct {
+	Type     string             `json:"type"`
+	Function ollamaToolFunction `json:"function"`
+}
+
+type ollamaToolFunction struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Parameters  map[string]interface{} `json:"parameters"`
+}
+
+type ollamaToolCall struct {
+	ID       string               `json:"id,omitempty"`
+	Type     string               `json:"type"`
+	Function ollamaToolCallDetail `json:"function"`
+}
+
+type ollamaToolCallDetail struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type ollamaChatRequest struct {
 	Model    string          `json:"model"`
 	Messages []ollamaMessage `json:"messages"`
+	Tools    []ollamaTool    `json:"tools,omitempty"`
 	Stream   bool            `json:"stream"`
 	Think    bool            `json:"think"` // false = disable thinking mode (qwen3)
 	Options  map[string]any  `json:"options,omitempty"`
@@ -196,7 +221,24 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 		msgs = append(msgs, ollamaMessage{Role: "system", Content: req.SystemPrompt})
 	}
 	for _, m := range req.Messages {
-		msgs = append(msgs, ollamaMessage{Role: m.Role, Content: m.Content})
+		msg := ollamaMessage{
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCallID: m.ToolCallID,
+		}
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				msg.ToolCalls = append(msg.ToolCalls, ollamaToolCall{
+					ID:   tc.ID,
+					Type: "function",
+					Function: ollamaToolCallDetail{
+						Name:      tc.Name,
+						Arguments: tc.Arguments,
+					},
+				})
+			}
+		}
+		msgs = append(msgs, msg)
 	}
 
 	opts := map[string]any{}
@@ -213,9 +255,25 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 		opts["num_predict"] = req.MaxTokens
 	}
 
+	var tools []ollamaTool
+	if len(req.Tools) > 0 {
+		tools = make([]ollamaTool, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			tools = append(tools, ollamaTool{
+				Type: "function",
+				Function: ollamaToolFunction{
+					Name:        t.Name,
+					Description: t.Description,
+					Parameters:  t.InputSchema,
+				},
+			})
+		}
+	}
+
 	return &ollamaChatRequest{
 		Model:    model,
 		Messages: msgs,
+		Tools:    tools,
 		Stream:   stream,
 		Think:    false, // prevent silent token burn in qwen3 thinking mode
 		Options:  opts,
@@ -265,9 +323,8 @@ func (p *OllamaProvider) Complete(ctx context.Context, req *CompletionRequest) (
 		return nil, fmt.Errorf("ollama: decode response: %w", err)
 	}
 
-	return &CompletionResponse{
-		Content:    or.Message.Content,
-		StopReason: "end_turn",
+	out := &CompletionResponse{
+		Content: or.Message.Content,
 		Usage: TokenUsage{
 			InputTokens:  or.PromptEvalCount,
 			OutputTokens: or.EvalCount,
@@ -277,7 +334,20 @@ func (p *OllamaProvider) Complete(ctx context.Context, req *CompletionRequest) (
 			Model:    model,
 			Latency:  time.Since(start),
 		},
-	}, nil
+	}
+	if len(or.Message.ToolCalls) > 0 {
+		out.StopReason = "tool_use"
+		for _, tc := range or.Message.ToolCalls {
+			out.ToolCalls = append(out.ToolCalls, ToolCall{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			})
+		}
+	} else {
+		out.StopReason = "end_turn"
+	}
+	return out, nil
 }
 
 // Stream sends a streaming request and returns a channel of chunks.

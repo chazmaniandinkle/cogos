@@ -393,3 +393,86 @@ func containsCapability(caps []Capability, want Capability) bool {
 	}
 	return false
 }
+
+func TestBuildOllamaRequestToolsAndToolReplies(t *testing.T) {
+	t.Parallel()
+	req := &CompletionRequest{
+		Messages: []ProviderMessage{
+			{
+				Role: "assistant",
+				ToolCalls: []ToolCall{
+					{ID: "call_1", Name: "search", Arguments: `{"query":"x"}`},
+				},
+			},
+			{
+				Role:       "tool",
+				ToolCallID: "call_1",
+				Content:    `{"ok":true}`,
+			},
+		},
+		Tools: []ToolDefinition{
+			{
+				Name:        "search",
+				Description: "Search the memory index",
+				InputSchema: map[string]interface{}{"type": "object"},
+			},
+		},
+	}
+	r := buildOllamaRequest("m", req, false, 0)
+	if len(r.Tools) != 1 || r.Tools[0].Function.Name != "search" {
+		t.Fatalf("tools = %+v; want one search tool", r.Tools)
+	}
+	if len(r.Messages) != 2 {
+		t.Fatalf("messages len = %d; want 2", len(r.Messages))
+	}
+	if len(r.Messages[0].ToolCalls) != 1 {
+		t.Fatalf("assistant tool_calls len = %d; want 1", len(r.Messages[0].ToolCalls))
+	}
+	if r.Messages[1].ToolCallID != "call_1" {
+		t.Fatalf("tool_call_id = %q; want call_1", r.Messages[1].ToolCallID)
+	}
+}
+
+func TestOllamaCompleteToolCalls(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/chat" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ollamaChatResponse{
+			Model: "qwen2.5:9b",
+			Message: ollamaMessage{
+				Role: "assistant",
+				ToolCalls: []ollamaToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: ollamaToolCallDetail{
+							Name:      "search",
+							Arguments: `{"query":"hi"}`,
+						},
+					},
+				},
+			},
+			Done:            true,
+			PromptEvalCount: 5,
+			EvalCount:       3,
+		})
+	}))
+	defer srv.Close()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Endpoint: srv.URL, Model: "qwen2.5:9b"})
+	resp, err := p.Complete(context.Background(), &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "use a tool"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if resp.StopReason != "tool_use" {
+		t.Fatalf("StopReason = %q; want tool_use", resp.StopReason)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Name != "search" {
+		t.Fatalf("ToolCalls = %+v; want one search tool call", resp.ToolCalls)
+	}
+}

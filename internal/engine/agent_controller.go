@@ -17,7 +17,11 @@
 // sessions; those are separate APIs.
 package engine
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"strings"
+)
 
 // AgentController is the kernel-agnostic contract the MCP layer uses to
 // list, inspect, and trigger agent harness instances. The concrete
@@ -44,6 +48,11 @@ type AgentController interface {
 	// the cycle completes (or a 90s deadline elapses). When wait is false,
 	// returns immediately with a trigger receipt.
 	TriggerAgent(ctx context.Context, id string, reason string, wait bool) (*AgentTriggerResult, error)
+
+	// DispatchToHarness routes a one-shot task request through the local
+	// agent harness. The harness runs up to N parallel inference slots,
+	// each with its own tool loop, and returns an aggregated result batch.
+	DispatchToHarness(ctx context.Context, req DispatchRequest) (*DispatchBatchResult, error)
 }
 
 // ErrAgentNotFound is returned by GetAgent/TriggerAgent when no agent
@@ -192,4 +201,75 @@ type AgentTriggerResult struct {
 	Reason     string  `json:"reason,omitempty"`
 	DurationMs int64   `json:"duration_ms,omitempty"`
 	TimedOut   bool    `json:"timed_out,omitempty"`
+}
+
+// ── Dispatch types ────────────────────────────────────────────────────────────
+
+// DispatchModel names the routing tier for a dispatch request.
+type DispatchModel string
+
+const (
+	// DispatchModelE4B routes to the configured local e4b-class model (fast, small).
+	DispatchModelE4B DispatchModel = "e4b"
+	// DispatchModel26B routes to the largest local model (≥26B params). Falls
+	// back to DispatchModelE4B when no such model is loaded.
+	DispatchModel26B DispatchModel = "26b"
+)
+
+// DispatchRequest is the input to DispatchToHarness.
+type DispatchRequest struct {
+	AgentID        string        `json:"agent_id,omitempty"`
+	Task           string        `json:"task"`
+	SystemPrompt   string        `json:"system_prompt,omitempty"`
+	Tools          []string      `json:"tools,omitempty"` // subset of registered kernel tools; nil = all
+	Model          DispatchModel `json:"model,omitempty"` // "" → DispatchModelE4B
+	N              int           `json:"n,omitempty"`     // parallel slots; 0 or 1 = single
+	TimeoutSeconds int           `json:"timeout_seconds,omitempty"` // per-slot; 0 → 90s default
+}
+
+// Normalize fills in defaults and validates the request.
+func (r *DispatchRequest) Normalize() error {
+	if strings.TrimSpace(r.Task) == "" {
+		return &AgentControllerError{Code: "invalid_input", Message: "task is required"}
+	}
+	if r.N <= 0 {
+		r.N = 1
+	}
+	if r.N > 8 {
+		return &AgentControllerError{Code: "invalid_input", Message: fmt.Sprintf("n must be <= 8 (got %d)", r.N)}
+	}
+	if r.TimeoutSeconds <= 0 {
+		r.TimeoutSeconds = 90
+	}
+	if r.Model == "" {
+		r.Model = DispatchModelE4B
+	}
+	return nil
+}
+
+// DispatchToolCallSummary is a compact summary of one tool call in a dispatch slot.
+type DispatchToolCallSummary struct {
+	Name         string `json:"name"`
+	ArgsDigest   string `json:"args_digest,omitempty"`
+	ResultDigest string `json:"result_digest,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+// DispatchResult is the outcome of one parallel dispatch slot.
+type DispatchResult struct {
+	Index       int                       `json:"index"`
+	Success     bool                      `json:"success"`
+	Content     string                    `json:"content,omitempty"`
+	Error       string                    `json:"error,omitempty"`
+	Turns       int                       `json:"turns"`
+	DurationSec float64                   `json:"duration_sec"`
+	ModelUsed   DispatchModel             `json:"model_used"`
+	ToolCalls   []DispatchToolCallSummary `json:"tool_calls,omitempty"`
+}
+
+// DispatchBatchResult is the aggregated outcome of all parallel slots.
+type DispatchBatchResult struct {
+	Results          []DispatchResult `json:"results"`
+	TotalDurationSec float64          `json:"total_duration_sec"`
+	Notes            []string         `json:"notes,omitempty"`
 }

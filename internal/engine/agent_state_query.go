@@ -151,3 +151,12 @@ func QueryTriggerAgent(ctx context.Context, ctrl AgentController, req TriggerAge
 	}
 	return ctrl.TriggerAgent(ctx, req.AgentID, req.Reason, req.Wait)
 }
+
+// QueryDispatchToHarness routes a DispatchRequest through the AgentController.
+// Returns ErrAgentUnavailable when ctrl is nil.
+func QueryDispatchToHarness(ctx context.Context, ctrl AgentController, req DispatchRequest) (*DispatchBatchResult, error) {
+	if ctrl == nil {
+		return nil, ErrAgentUnavailable
+	}
+	return ctrl.DispatchToHarness(ctx, req)
+}

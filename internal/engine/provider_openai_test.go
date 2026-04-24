@@ -844,3 +844,14 @@ func TestOpenAIName(t *testing.T) {
 		t.Errorf("Name() = %q; want my-lmstudio", p.Name())
 	}
 }
+
+func TestNewOpenAICompatProviderNormalizesTrailingV1(t *testing.T) {
+	t.Parallel()
+	p := NewOpenAICompatProvider("openai-compat", ProviderConfig{
+		Endpoint: "http://localhost:1234/v1/",
+		Model:    "local-model",
+	})
+	if p.endpoint != "http://localhost:1234" {
+		t.Fatalf("endpoint = %q; want http://localhost:1234", p.endpoint)
+	}
+}

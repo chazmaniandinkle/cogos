@@ -1,0 +1,12 @@
+source_type = "local"
+source = "/Users/slowbro/.codex/.tmp/bundled-marketplaces/openai-bundled"
+
+[mcp_servers.cogos]
+
+[mcp_servers."cogos-http"]
+enabled = true
+url = "http://127.0.0.1:7823/mcp"
+
+[mcp_servers."cogos-v3"]
+enabled = true
+url = "http://127.0.0.1:6931/mcp"

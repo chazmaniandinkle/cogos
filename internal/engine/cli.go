@@ -230,6 +230,17 @@ func runServe(workspace string, port int, bindAddr string) {
 	defer cancel()
 	defer shutdownTelemetry(ctx0)
 
+	if server.mcpServer != nil {
+		ctrl, err := NewLocalHarnessController(cfg, nucleus, process, server.mcpServer)
+		if err != nil {
+			slog.Warn("local harness disabled", "err", err)
+		} else {
+			server.SetAgentController(ctrl)
+			ctrl.Start(ctx)
+			slog.Info("local harness started", "agent_id", DefaultAgentID, "interval", ctrl.interval.String())
+		}
+	}
+
 	// Start process goroutine.
 	processDone := make(chan error, 1)
 	go func() {
