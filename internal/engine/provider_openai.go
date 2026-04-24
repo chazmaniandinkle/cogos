@@ -23,14 +23,18 @@ import (
 )
 
 const (
-	openaiCompatDefaultEndpoint = "http://localhost:1234"
+	// openaiCompatDefaultEndpoint is the fallback endpoint when no Endpoint is
+	// configured and the COGOS_LLM_ENDPOINT environment variable is unset.
+	// Defaults to the Ollama loopback port; override via config or env for
+	// other servers (LM Studio on :1234, vLLM, llama.cpp, remote hosts, etc.).
+	openaiCompatDefaultEndpoint = "http://localhost:11434"
 	openaiCompatDefaultMaxToks  = 4096
 )
 
 // OpenAICompatProvider implements Provider against any OpenAI-compatible server.
 type OpenAICompatProvider struct {
 	name      string
-	endpoint  string // e.g. "http://localhost:1234" or "http://192.168.10.191:1234"
+	endpoint  string // e.g. "http://<inference-host>:<port>" (local or remote)
 	apiKey    string // optional; some local servers don't require auth
 	model     string
 	maxTokens int
@@ -39,8 +43,15 @@ type OpenAICompatProvider struct {
 }
 
 // NewOpenAICompatProvider creates an OpenAICompatProvider from a ProviderConfig.
+//
+// Endpoint resolution order: cfg.Endpoint > COGOS_LLM_ENDPOINT env >
+// openaiCompatDefaultEndpoint (localhost Ollama default). This lets users
+// point at an arbitrary OpenAI-compatible server without editing config.
 func NewOpenAICompatProvider(name string, cfg ProviderConfig) *OpenAICompatProvider {
 	endpoint := cfg.Endpoint
+	if endpoint == "" {
+		endpoint = os.Getenv("COGOS_LLM_ENDPOINT")
+	}
 	if endpoint == "" {
 		endpoint = openaiCompatDefaultEndpoint
 	}
