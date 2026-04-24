@@ -341,7 +341,10 @@ func TestLoadIdentityCRD_PrivateKeyRef_ValidFileScheme(t *testing.T) {
 	dir := t.TempDir()
 	idDir := filepath.Join(dir, ".cog", "config", "identities")
 	_ = os.MkdirAll(idDir, 0o755)
-	writeTempCRD(t, idDir, "cog.yaml", `
+	keysDir := t.TempDir()
+	keyPath := filepath.Join(keysDir, "cog-priv.pem")
+	keyRef := "file://" + keyPath
+	writeTempCRD(t, idDir, "cog.yaml", fmt.Sprintf(`
 apiVersion: cog.os/v1alpha1
 kind: Identity
 metadata:
@@ -355,12 +358,12 @@ spec:
     MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEstub...
     -----END PUBLIC KEY-----
   private_key:
-    ref: "file:///Users/slowbro/.cogos/keys/cog-priv.pem"
+    ref: %q
     integrity_hash: "sha256:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
   expressions:
     - aud: "*"
       display_name: Cog
-`)
+`, keyRef))
 	crd, err := LoadIdentityCRD(dir, "cog")
 	if err != nil {
 		t.Fatalf("LoadIdentityCRD: %v", err)
@@ -368,8 +371,8 @@ spec:
 	if crd.Spec.PrivateKey == nil {
 		t.Fatal("PrivateKey is nil; expected populated")
 	}
-	if crd.Spec.PrivateKey.Ref != "file:///Users/slowbro/.cogos/keys/cog-priv.pem" {
-		t.Errorf("Ref = %q", crd.Spec.PrivateKey.Ref)
+	if crd.Spec.PrivateKey.Ref != keyRef {
+		t.Errorf("Ref = %q, want %q", crd.Spec.PrivateKey.Ref, keyRef)
 	}
 	if !strings.HasPrefix(crd.Spec.PrivateKey.IntegrityHash, "sha256:") {
 		t.Errorf("IntegrityHash = %q", crd.Spec.PrivateKey.IntegrityHash)
