@@ -280,6 +280,24 @@ func (m *MCPServer) registerTools() {
 		Description: "Search kernel trace JSONL streams in .cog/run/ (attention, proprioceptive, internal_requests). Filter by source, session_id, level, case-insensitive substring, and time range (since/until accept RFC3339 or duration like 5m/1h). Returns unified chronological results with per-source scan diagnostics. Fallback: ls .cog/run/*.jsonl && jq -c . .cog/run/<name>.jsonl | head",
 	}), m.toolSearchTraces)
 
+	// Memory section-index ops (RFC-017 Phase B). Port of the legacy
+	// `cog memory toc` / `cog memory index` verbs from the 2.5.0 monolith
+	// (cog-workspace/.cog/memory.go:670,718). Before these tools existed,
+	// the v3 kernel could only surface section-aware reads by shelling
+	// out to scripts/cog — so agents reaching the kernel via MCP had no
+	// path to generate or inspect the `sections:` frontmatter block.
+	// Without that block, every cog_read_cogdoc degrades to a full-doc
+	// read. See Phase 24 MCP API Coverage Audit for the gap analysis.
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_memory_toc",
+		Description: "List a CogDoc's sections with line ranges and byte sizes. Default output is a pretty-printed text table showing total lines/bytes plus per-section nesting, line range, and size; pass as_yaml=true to get the `sections:` frontmatter YAML block that cog_memory_index injects. Useful for orienting to a long document before extracting a specific section via cog_read_cogdoc with #fragment. Fallback: ./scripts/cog memory toc <path> [--yaml]",
+	}, withToolObserver(m, "cog_memory_toc", m.toolMemoryTOC))
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_memory_index",
+		Description: "Generate the `sections:` frontmatter block for a CogDoc and inject it into the file's frontmatter (replacing any prior sections field). Required for cheap section-addressed reads: without `sections:` every cog_read_cogdoc call with a section selector falls back to whole-document reads. Pass dry_run=true to preview the block without writing. Requires existing frontmatter; indexing a plain markdown file is a no-op by design (run cog_write_cogdoc first). Writes are atomic. Fallback: ./scripts/cog memory index <path> [--dry-run]",
+	}, withToolObserver(m, "cog_memory_index", m.toolMemoryIndex))
+
 	// Kernel-native session/handoff tools (mcp_sessions.go). The 8 tools
 	// complement the 8 cogos_* bridge tools living in cog-sandbox-mcp:
 	// both surfaces coexist by design — same kernel truth, two MCP
@@ -541,6 +559,50 @@ type readCogdocResult struct {
 	SchemaIssues     []string          `json:"schema_issues,omitempty"`
 	PatchFrontmatter map[string]any    `json:"patch_frontmatter,omitempty"`
 	SchemaHint       string            `json:"schema_hint,omitempty"`
+}
+
+// memoryTOCInput matches the legacy `cog memory toc <path> [--yaml]` CLI.
+// Path resolution accepts absolute paths, workspace-relative paths, and
+// memory-relative paths (semantic/insights/foo.cog.md) — handled by the
+// underlying MemoryTOC function.
+type memoryTOCInput struct {
+	Path   string `json:"path" jsonschema:"Path to the CogDoc: absolute, workspace-relative, or memory-relative (e.g. semantic/insights/topic.cog.md)"`
+	AsYAML bool   `json:"as_yaml,omitempty" jsonschema:"Return the raw sections: YAML block (matches cog memory toc --yaml) instead of the text table"`
+}
+
+// memoryIndexInput matches the legacy `cog memory index <path>
+// [--dry-run]` CLI. Unlike the legacy --all mode (which walked every
+// cogdoc under .cog/mem/), this tool indexes a single document per
+// invocation. Bulk indexing is deferred to a follow-up tool so the MCP
+// surface stays clearly scoped per call.
+type memoryIndexInput struct {
+	Path   string `json:"path" jsonschema:"Path to the CogDoc: absolute, workspace-relative, or memory-relative (e.g. semantic/insights/topic.cog.md)"`
+	DryRun bool   `json:"dry_run,omitempty" jsonschema:"Preview the generated sections: block without writing it to the file"`
+}
+
+// memoryTOCResult is the structured response returned by cog_memory_toc.
+// The text/yaml field carries the rendered output exactly matching the
+// legacy CLI; path echoes the resolved input for clients that want to
+// confirm what was read.
+type memoryTOCResult struct {
+	Path     string `json:"path"`
+	AsYAML   bool   `json:"as_yaml"`
+	Rendered string `json:"rendered"`
+	NumLines int    `json:"num_lines,omitempty"`
+	NumBytes int    `json:"num_bytes,omitempty"`
+	NumSecs  int    `json:"num_sections,omitempty"`
+}
+
+// memoryIndexResult is the structured response returned by cog_memory_index.
+// When DryRun is true SectionsBlock carries the preview payload; when
+// DryRun is false Message carries the "Indexed <path> (N sections)"
+// confirmation string and SectionsBlock is empty.
+type memoryIndexResult struct {
+	Path          string `json:"path"`
+	DryRun        bool   `json:"dry_run"`
+	NumSections   int    `json:"num_sections"`
+	SectionsBlock string `json:"sections_block,omitempty"`
+	Message       string `json:"message,omitempty"`
 }
 
 type emitEventInput struct {
@@ -993,6 +1055,120 @@ func (m *MCPServer) toolWriteCogdoc(ctx context.Context, req *mcp.CallToolReques
 		"path":    result.Path,
 		"uri":     result.URI,
 	})
+}
+
+// toolMemoryTOC exposes the MemoryTOC port as cog_memory_toc. The handler
+// forwards to MemoryTOC in memory_sections.go and wraps the rendered
+// output in a structured result so clients that want metadata (section
+// count, total bytes) can read it without re-parsing the text table.
+func (m *MCPServer) toolMemoryTOC(ctx context.Context, req *mcp.CallToolRequest, input memoryTOCInput) (*mcp.CallToolResult, any, error) {
+	if input.Path == "" {
+		return textResult("path is required")
+	}
+
+	rendered, err := MemoryTOC(m.cfg.WorkspaceRoot, input.Path, input.AsYAML)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("toc failed: %v", err),
+			fmt.Sprintf("./scripts/cog memory toc %q", input.Path))
+	}
+
+	// Best-effort metadata. We re-parse to surface counts in the JSON
+	// response; this is a millisecond-scale double-read that matches the
+	// legacy CLI behaviour (legacy renders its own summary line too).
+	result := memoryTOCResult{
+		Path:     input.Path,
+		AsYAML:   input.AsYAML,
+		Rendered: rendered,
+	}
+	if raw, readErr := readCogDocContentV3(m.cfg.WorkspaceRoot, input.Path); readErr == nil {
+		body := raw
+		if _, b, ok := splitFrontmatter(raw); ok {
+			body = b
+		}
+		result.NumLines = len(strings.Split(raw, "\n"))
+		result.NumBytes = len(raw)
+		result.NumSecs = len(ParseMemorySections(body))
+	}
+	return marshalResult(result)
+}
+
+// toolMemoryIndex exposes the MemoryIndex port as cog_memory_index. On
+// dry-run the generated sections: block is returned but the file is
+// untouched. On live run the frontmatter is rewritten atomically and a
+// confirmation message is returned; the caller receives the final section
+// count so observability of the write is first-class.
+func (m *MCPServer) toolMemoryIndex(ctx context.Context, req *mcp.CallToolRequest, input memoryIndexInput) (*mcp.CallToolResult, any, error) {
+	if input.Path == "" {
+		return textResult("path is required")
+	}
+
+	out, err := MemoryIndex(m.cfg.WorkspaceRoot, input.Path, input.DryRun)
+	if err != nil {
+		suffix := ""
+		if input.DryRun {
+			suffix = " --dry-run"
+		}
+		return fallbackResult(fmt.Sprintf("index failed: %v", err),
+			fmt.Sprintf("./scripts/cog memory index %q%s", input.Path, suffix))
+	}
+
+	result := memoryIndexResult{
+		Path:   input.Path,
+		DryRun: input.DryRun,
+	}
+
+	// Count sections for the JSON response. On both dry-run and live
+	// paths the body we just parsed produced the sections we care about;
+	// re-reading is cheaper than threading a return value through the
+	// pure-Go core.
+	if raw, readErr := readCogDocContentV3(m.cfg.WorkspaceRoot, input.Path); readErr == nil {
+		body := raw
+		if _, b, ok := splitFrontmatter(raw); ok {
+			body = b
+		}
+		// Only count level ≥ 2 — matches what made it into the sections:
+		// block. The full ParseMemorySections return includes the doc
+		// title (level 1) which we filter out of the frontmatter.
+		count := 0
+		for _, s := range ParseMemorySections(body) {
+			if s.Level >= 2 {
+				count++
+			}
+		}
+		result.NumSections = count
+	}
+
+	if input.DryRun {
+		result.SectionsBlock = out
+	} else {
+		result.Message = out
+		// Refresh the CogDoc index so the freshly-indexed document
+		// reflects in the kernel's in-memory view on the next query.
+		// Parity with CogDocService.refreshIndex but local: MemoryIndex
+		// is not a go through CogDocService because it operates on raw
+		// frontmatter bytes rather than the structured opts shape.
+		m.refreshIndexAfterWrite()
+	}
+
+	return marshalResult(result)
+}
+
+// refreshIndexAfterWrite rebuilds the CogDoc index after a non-WriteAndSync
+// write path mutates disk. Kept small to avoid pulling the whole
+// CogDocService into the MemoryIndex path (which does not need field
+// boosts or ledger events — it's a metadata-only injection).
+func (m *MCPServer) refreshIndexAfterWrite() {
+	if m.process == nil {
+		return
+	}
+	idx, err := BuildIndex(m.cfg.WorkspaceRoot)
+	if err != nil {
+		slog.Warn("cog_memory_index: index refresh failed", "err", err)
+		return
+	}
+	m.process.indexMu.Lock()
+	m.process.index = idx
+	m.process.indexMu.Unlock()
 }
 
 // CogDocWriteOpts holds options for writing a CogDoc via the internal API.
