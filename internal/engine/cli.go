@@ -212,6 +212,15 @@ func runServe(workspace string, port int, bindAddr string) {
 	server := NewServer(cfg, nucleus, process)
 	server.SetRouter(router)
 
+	// Wire the session-activity publisher so handleTailerBlock can fan
+	// tailer blocks onto per-session bus channels (Phase 1A of the 4E
+	// cognitive-observer loop). server.busSessions is always non-nil by
+	// NewServer's contract; AppendEvent's signature matches
+	// SessionActivityPublisher by construction.
+	if server.busSessions != nil {
+		process.SetSessionActivityPublisher(server.busSessions.AppendEvent)
+	}
+
 	// Initialize telemetry (traces + metrics). No-op if no collector is available.
 	ctx0 := context.Background()
 	shutdownTelemetry := initTelemetry(ctx0)
