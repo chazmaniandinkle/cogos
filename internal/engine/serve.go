@@ -171,6 +171,10 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// above (incompatible session_id formats — see serve_sessions_channel.go).
 	s.registerChannelSessionRoutes(mux)
 
+	// Phase 1B: peer-awareness packet endpoint (READ side of the 4E
+	// ambient-awareness loop; Phase 1A populates channel.<sid>.activity).
+	s.registerPeerAwarenessRoutes(mux)
+
 	// Replay bus_sessions + bus_handoffs into the in-memory registries so
 	// the kernel starts with an accurate derived view. Bus is authoritative
 	// either way; this just warms the read path.

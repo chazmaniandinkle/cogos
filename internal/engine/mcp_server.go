@@ -286,6 +286,20 @@ func (m *MCPServer) registerTools() {
 	// status and plays the returned audio/wav locally. Supersedes the
 	// installed binary's OpenClaw gateway which silently drops audio bytes.
 	m.registerMod3Tools()
+
+	// Phase 1B: peer-awareness packet (READ side of the 4E ambient-
+	// awareness loop; Phase 1A publishes channel.<sid>.activity).
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name: "cog_render_peer_awareness_packet",
+		Description: "Render a token-budgeted peer-awareness packet for a " +
+			"session. Combines the session's recent tailer activity, open " +
+			"handoffs, peer sessions whose attention overlaps, and recent " +
+			"coord/impl chatter on bus_broadcast. Defaults: budget=500 " +
+			"tokens, window=15m, include_peers=true. Returns {packet, " +
+			"token_count, sources[]} — designed to be prepended verbatim to " +
+			"a UserPromptSubmit preamble. Fallback: curl " +
+			"http://localhost:6931/v1/peer-awareness?sid=<sid>",
+	}, withToolObserver(m, "cog_render_peer_awareness_packet", m.toolRenderPeerAwarenessPacket))
 }
 
 // registerResources registers MCP Resources — read-only addressable data.
@@ -1496,6 +1510,79 @@ func agentErrorResult(err error, fallback string) (*mcp.CallToolResult, any, err
 		msg = ace.Message
 	}
 	return fallbackResult(msg, fallback)
+}
+
+// --- Peer-awareness tool (Phase 1B of the 4E ambient-awareness loop) --
+
+// peerAwarenessInput mirrors the HTTP query parameters: sid (required),
+// budget (default 500), window (default 15m), include_peers (default true).
+type peerAwarenessInput struct {
+	Sid          string `json:"sid" jsonschema:"Session id to render the packet from. Required. Must match the lowercase/hyphen sid shape."`
+	Budget       int    `json:"budget,omitempty" jsonschema:"Token budget for the whole packet. Default 500, hard cap 4000."`
+	Window       string `json:"window,omitempty" jsonschema:"How far back to look for events. Go duration string (e.g. '15m', '1h'). Default '15m'."`
+	IncludePeers *bool  `json:"include_peers,omitempty" jsonschema:"When true (default), include the peer-overlap section. When false, only MY ACTIVITY / HANDOFFS / COORD render."`
+}
+
+// toolRenderPeerAwarenessPacket is the MCP surface for
+// cog_render_peer_awareness_packet. Wraps RenderPeerAwarenessPacket using
+// deps from the MCPServer's wired dependencies (bus manager, handoff
+// registry, attention log via the Server adapter if available).
+//
+// The MCP server today doesn't carry a Server handle — it holds the
+// BusSessionManager, SessionRegistry, HandoffRegistry directly — so we
+// build the deps bundle inline here and fall back to an attention log
+// reader over the workspace file when needed.
+func (m *MCPServer) toolRenderPeerAwarenessPacket(ctx context.Context, req *mcp.CallToolRequest, input peerAwarenessInput) (*mcp.CallToolResult, any, error) {
+	sid := strings.TrimSpace(input.Sid)
+	if sid == "" {
+		return fallbackResult("sid is required",
+			"curl 'http://localhost:6931/v1/peer-awareness?sid=<sid>'")
+	}
+	if err := ValidateSid(sid); err != nil {
+		return fallbackResult(fmt.Sprintf("invalid sid: %v", err),
+			"curl 'http://localhost:6931/v1/peer-awareness?sid=<sid>'")
+	}
+
+	paReq := PeerAwarenessRequest{
+		Sid:          sid,
+		Budget:       input.Budget,
+		IncludePeers: true,
+	}
+	if input.IncludePeers != nil {
+		paReq.IncludePeers = *input.IncludePeers
+	}
+	if input.Window != "" {
+		d, err := time.ParseDuration(input.Window)
+		if err != nil {
+			return fallbackResult(fmt.Sprintf("invalid window: %v", err),
+				"curl 'http://localhost:6931/v1/peer-awareness?sid=<sid>&window=15m'")
+		}
+		paReq.Window = d
+	}
+
+	deps := peerAwarenessDeps{}
+	if m.busSessions != nil {
+		deps.bus = m.busSessions
+		deps.renderer = m.busSessions
+	}
+	if m.handoffRegistry != nil {
+		deps.handoffs = m.handoffRegistry
+	}
+	// Attention log — the MCP surface doesn't hold a pointer, so fall
+	// back to reading the workspace file directly if it exists.
+	if m.cfg != nil && m.cfg.WorkspaceRoot != "" {
+		path := filepath.Join(m.cfg.WorkspaceRoot, ".cog", "run", "attention.jsonl")
+		if _, err := os.Stat(path); err == nil {
+			deps.attn = fileAttentionReader{path: path}
+		}
+	}
+
+	result, err := RenderPeerAwarenessPacket(deps, paReq)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("render failed: %v", err),
+			"curl 'http://localhost:6931/v1/peer-awareness?sid=<sid>'")
+	}
+	return marshalResult(result)
 }
 
 // toolReadToolCalls is the MCP handler for cog_read_tool_calls. It parses the
