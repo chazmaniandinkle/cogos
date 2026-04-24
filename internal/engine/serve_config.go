@@ -15,9 +15,9 @@ import (
 
 // registerConfigRoutes mounts the config read/write/rollback endpoints.
 func (s *Server) registerConfigRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/config", s.handleConfigGet)
-	mux.HandleFunc("PATCH /v1/config", s.handleConfigPatch)
-	mux.HandleFunc("POST /v1/config/rollback", s.handleConfigRollback)
+	s.route(mux, "GET /v1/config", s.handleConfigGet)
+	s.route(mux, "PATCH /v1/config", s.handleConfigPatch)
+	s.route(mux, "POST /v1/config/rollback", s.handleConfigRollback)
 }
 
 // handleConfigGet returns the effective kernel config. Query params:

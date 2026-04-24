@@ -47,16 +47,16 @@ import (
 // alongside the pre-existing `/v1/sessions` GET surface.
 func (s *Server) registerSessionMgmtRoutes(mux *http.ServeMux) {
 	// Sessions (specific-method first).
-	mux.HandleFunc("POST /v1/sessions/register", s.handleSessionRegister)
-	mux.HandleFunc("GET /v1/sessions/presence", s.handleSessionPresence)
-	mux.HandleFunc("POST /v1/sessions/{id}/heartbeat", s.handleSessionHeartbeat)
-	mux.HandleFunc("POST /v1/sessions/{id}/end", s.handleSessionEnd)
+	s.route(mux, "POST /v1/sessions/register", s.handleSessionRegister)
+	s.route(mux, "GET /v1/sessions/presence", s.handleSessionPresence)
+	s.route(mux, "POST /v1/sessions/{id}/heartbeat", s.handleSessionHeartbeat)
+	s.route(mux, "POST /v1/sessions/{id}/end", s.handleSessionEnd)
 
 	// Handoffs.
-	mux.HandleFunc("POST /v1/handoffs/offer", s.handleHandoffOffer)
-	mux.HandleFunc("GET /v1/handoffs", s.handleHandoffList)
-	mux.HandleFunc("POST /v1/handoffs/{id}/claim", s.handleHandoffClaim)
-	mux.HandleFunc("POST /v1/handoffs/{id}/complete", s.handleHandoffComplete)
+	s.route(mux, "POST /v1/handoffs/offer", s.handleHandoffOffer)
+	s.route(mux, "GET /v1/handoffs", s.handleHandoffList)
+	s.route(mux, "POST /v1/handoffs/{id}/claim", s.handleHandoffClaim)
+	s.route(mux, "POST /v1/handoffs/{id}/complete", s.handleHandoffComplete)
 }
 
 // ─── error helpers ───────────────────────────────────────────────────────────

@@ -39,21 +39,21 @@ import (
 // for readability.
 func (s *Server) registerBusRoutes(mux *http.ServeMux) {
 	// Specific first, catch-all later — same order as root's serve.go.
-	mux.HandleFunc("POST /v1/bus/send", s.handleBusSend)
-	mux.HandleFunc("POST /v1/bus/open", s.handleBusOpen)
-	mux.HandleFunc("GET /v1/bus/list", s.handleBusList)
-	mux.HandleFunc("GET /v1/bus/events", s.handleBusEventsGlobal) // cross-bus search
+	s.route(mux, "POST /v1/bus/send", s.handleBusSend)
+	s.route(mux, "POST /v1/bus/open", s.handleBusOpen)
+	s.route(mux, "GET /v1/bus/list", s.handleBusList)
+	s.route(mux, "GET /v1/bus/events", s.handleBusEventsGlobal) // cross-bus search
 
 	// Consumer cursor API (ADR-061).
-	mux.HandleFunc("GET /v1/bus/consumers", s.handleBusConsumers)
-	mux.HandleFunc("DELETE /v1/bus/consumers/", s.handleBusConsumerDelete)
+	s.route(mux, "GET /v1/bus/consumers", s.handleBusConsumers)
+	s.route(mux, "DELETE /v1/bus/consumers/", s.handleBusConsumerDelete)
 
 	// Catch-all for /v1/bus/{bus_id}/events[,/{seq}] and /v1/bus/{bus_id}/stats.
-	mux.HandleFunc("GET /v1/bus/", s.handleBusRoute)
+	s.route(mux, "GET /v1/bus/", s.handleBusRoute)
 
 	// Session surface.
-	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)
-	mux.HandleFunc("GET /v1/sessions/", s.handleSessionContext)
+	s.route(mux, "GET /v1/sessions", s.handleListSessions)
+	s.route(mux, "GET /v1/sessions/", s.handleSessionContext)
 }
 
 // ─── POST /v1/bus/send ───────────────────────────────────────────────────────

@@ -42,19 +42,19 @@ func (s *Server) logCompatDeprecated(r *http.Request) {
 // Called from NewServer after all v3 routes are registered.
 func (s *Server) registerCompatRoutes(mux *http.ServeMux) {
 	// Tier A: blocking for OpenClaw plugin
-	mux.HandleFunc("GET /v1/card", s.handleCard)
-	mux.HandleFunc("GET /v1/models", s.handleModels)
+	s.route(mux, "GET /v1/card", s.handleCard)
+	s.route(mux, "GET /v1/models", s.handleModels)
 
 	// Tier B: event stream + bus ack — now real, registered in serve.go
 	// (handleEvents + handleEventsStream). handleBusAck deleted — no
 	// consumer relied on it and the new SSE resume uses Last-Event-ID.
 
 	// Tier C: operational stability
-	mux.HandleFunc("GET /v1/providers", s.handleProviders)
-	mux.HandleFunc("GET /v1/taa", s.handleTAA)
-	mux.HandleFunc("GET /memory/search", s.handleMemorySearch)
-	mux.HandleFunc("GET /memory/read", s.handleMemoryRead)
-	mux.HandleFunc("GET /coherence/check", s.handleCoherenceCheck)
+	s.route(mux, "GET /v1/providers", s.handleProviders)
+	s.route(mux, "GET /v1/taa", s.handleTAA)
+	s.route(mux, "GET /memory/search", s.handleMemorySearch)
+	s.route(mux, "GET /memory/read", s.handleMemoryRead)
+	s.route(mux, "GET /coherence/check", s.handleCoherenceCheck)
 }
 
 // ── Tier A: OpenClaw plugin ────────────────────────────────────────────────────

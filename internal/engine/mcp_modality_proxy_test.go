@@ -1,0 +1,1108 @@
+// mcp_modality_proxy_test.go — coverage for the mod3 MCP proxy tools.
+//
+// Strategy: stand up a fake mod3 via httptest.NewServer, point an MCPServer's
+// proxy at it, exercise each tool handler directly (handler function +
+// typed input, bypassing the MCP SDK's JSON marshal layer). Playback is
+// stubbed via disablePlayback or the injectable player field so tests don't
+// spawn afplay.
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// ─── fake mod3 with synthesize + session routes ──────────────────────────────
+
+type fakeMod3Proxy struct {
+	t        *testing.T
+	srv      *httptest.Server
+	mu       sync.Mutex
+	captured []capturedProxyRequest
+
+	// Overrides for per-endpoint behavior.
+	synthesizeHandler  http.HandlerFunc
+	stopHandler        http.HandlerFunc
+	voicesHandler      http.HandlerFunc
+	healthHandler      http.HandlerFunc
+	regHandler         http.HandlerFunc
+	deregHandler       http.HandlerFunc
+	listSessionHandler http.HandlerFunc
+}
+
+type capturedProxyRequest struct {
+	Method string
+	Path   string
+	Query  string
+	Body   []byte
+}
+
+// synthWav is a tiny valid-ish WAV header + ~1KB of silence. Not a real
+// audio file — the proxy doesn't parse it, it just forwards/plays bytes.
+var synthWav = func() []byte {
+	b := make([]byte, 1024)
+	copy(b, []byte("RIFF\x00\x00\x00\x00WAVEfmt "))
+	return b
+}()
+
+func newFakeMod3Proxy(t *testing.T) *fakeMod3Proxy {
+	t.Helper()
+	fm := &fakeMod3Proxy{t: t}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /v1/synthesize", func(w http.ResponseWriter, r *http.Request) {
+		fm.capture(r)
+		if fm.synthesizeHandler != nil {
+			fm.synthesizeHandler(w, r)
+			return
+		}
+		// Emit the full mod3 header surface so the proxy can extract it.
+		w.Header().Set("X-Mod3-Job-Id", "job-test-0001")
+		w.Header().Set("X-Mod3-Voice", "bm_lewis")
+		w.Header().Set("X-Mod3-Duration-Sec", "1.23")
+		w.Header().Set("X-Mod3-Sample-Rate", "24000")
+		w.Header().Set("X-Mod3-Rtf", "9.29")
+		w.Header().Set("X-Mod3-Chunks", "1")
+		w.Header().Set("Content-Type", "audio/wav")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(synthWav)
+	})
+
+	mux.HandleFunc("POST /v1/stop", func(w http.ResponseWriter, r *http.Request) {
+		fm.capture(r)
+		if fm.stopHandler != nil {
+			fm.stopHandler(w, r)
+			return
+		}
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"status":        "stopped",
+			"dropped_jobs":  0,
+			"interrupted":   true,
+			"session_id":    r.URL.Query().Get("session_id"),
+			"job_id_target": r.URL.Query().Get("job_id"),
+		})
+	})
+
+	mux.HandleFunc("GET /v1/voices", func(w http.ResponseWriter, r *http.Request) {
+		fm.capture(r)
+		if fm.voicesHandler != nil {
+			fm.voicesHandler(w, r)
+			return
+		}
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"voices": []map[string]any{
+				{"id": "bm_lewis", "language": "en-GB"},
+				{"id": "af_bella", "language": "en-US"},
+			},
+		})
+	})
+
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		fm.capture(r)
+		if fm.healthHandler != nil {
+			fm.healthHandler(w, r)
+			return
+		}
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"status":       "ok",
+			"model_loaded": true,
+			"engine":       "kokoro",
+		})
+	})
+
+	mux.HandleFunc("POST /v1/sessions/register", func(w http.ResponseWriter, r *http.Request) {
+		fm.capture(r)
+		if fm.regHandler != nil {
+			fm.regHandler(w, r)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"session_id":     body["session_id"],
+			"participant_id": body["participant_id"],
+			"assigned_voice": "bm_lewis",
+		})
+	})
+
+	mux.HandleFunc("POST /v1/sessions/{id}/deregister", func(w http.ResponseWriter, r *http.Request) {
+		fm.capture(r)
+		if fm.deregHandler != nil {
+			fm.deregHandler(w, r)
+			return
+		}
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"status":     "ok",
+			"session_id": r.PathValue("id"),
+		})
+	})
+
+	mux.HandleFunc("GET /v1/sessions", func(w http.ResponseWriter, r *http.Request) {
+		fm.capture(r)
+		if fm.listSessionHandler != nil {
+			fm.listSessionHandler(w, r)
+			return
+		}
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"sessions":   []any{},
+			"voice_pool": []string{"bm_lewis", "af_bella"},
+		})
+	})
+
+	fm.srv = httptest.NewServer(mux)
+	t.Cleanup(func() { fm.srv.Close() })
+	return fm
+}
+
+func (fm *fakeMod3Proxy) capture(r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	fm.captured = append(fm.captured, capturedProxyRequest{
+		Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Body: body,
+	})
+}
+
+func (fm *fakeMod3Proxy) last() capturedProxyRequest {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if len(fm.captured) == 0 {
+		fm.t.Fatalf("no captured requests")
+	}
+	return fm.captured[len(fm.captured)-1]
+}
+
+// newProxyMCP builds a minimal MCPServer whose proxy points at fm, with
+// playback fully disabled so tests don't touch the audio stack. A live
+// Server is wired in as the channel-session backend so the session-family
+// MCP tools (register/deregister/list) flow through the kernel's shared
+// minting logic — matching production (ADR-082 Wave 3.5). Synthesis /
+// control tools continue calling mod3 directly via the proxy.
+func newProxyMCP(t *testing.T, fm *fakeMod3Proxy) *MCPServer {
+	t.Helper()
+	cfg := &Config{Mod3URL: fm.srv.URL}
+	srv := &Server{
+		cfg:                    cfg,
+		channelSessionRegistry: NewChannelSessionRegistry(),
+	}
+	m := &MCPServer{
+		cfg:                   cfg,
+		mod3Proxy:             &modalityProxy{disablePlayback: true},
+		channelSessionBackend: srv,
+	}
+	return m
+}
+
+// newProxyMCPWithServer is like newProxyMCP but returns the wired-in Server
+// so tests that want to assert on the kernel-side registry state can do so.
+func newProxyMCPWithServer(t *testing.T, fm *fakeMod3Proxy) (*MCPServer, *Server) {
+	t.Helper()
+	cfg := &Config{Mod3URL: fm.srv.URL}
+	srv := &Server{
+		cfg:                    cfg,
+		channelSessionRegistry: NewChannelSessionRegistry(),
+	}
+	m := &MCPServer{
+		cfg:                   cfg,
+		mod3Proxy:             &modalityProxy{disablePlayback: true},
+		channelSessionBackend: srv,
+	}
+	return m, srv
+}
+
+// decodeToolText parses the JSON text content of a CallToolResult.
+func decodeToolText(t *testing.T, res *mcp.CallToolResult) map[string]any {
+	t.Helper()
+	if res == nil || len(res.Content) == 0 {
+		t.Fatalf("empty result")
+	}
+	tc, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected *mcp.TextContent, got %T", res.Content[0])
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(tc.Text), &out); err != nil {
+		t.Fatalf("decode result text: %v (raw=%q)", err, tc.Text)
+	}
+	return out
+}
+
+// ─── mod3_speak ──────────────────────────────────────────────────────────────
+
+func TestMod3Speak_SuccessPath(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text: "hello world",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got IsError=true: %v", res.Content)
+	}
+
+	out := decodeToolText(t, res)
+	if ok, _ := out["ok"].(bool); !ok {
+		t.Fatalf("expected ok=true, got %v", out["ok"])
+	}
+	if bytes, _ := out["bytes"].(float64); bytes < 100 {
+		t.Fatalf("expected bytes > 100, got %v", out["bytes"])
+	}
+
+	metrics, _ := out["metrics"].(map[string]any)
+	if metrics == nil {
+		t.Fatal("expected metrics map")
+	}
+	if jobID, _ := metrics["job-id"].(string); jobID != "job-test-0001" {
+		t.Fatalf("expected job-id=job-test-0001, got %v", metrics["job-id"])
+	}
+	if dur, _ := metrics["duration-sec"].(float64); dur != 1.23 {
+		t.Fatalf("expected duration-sec=1.23, got %v", metrics["duration-sec"])
+	}
+	// Integer parse path — sample-rate comes as "24000".
+	if sr, ok := metrics["sample-rate"].(float64); !ok || sr != 24000 {
+		t.Fatalf("expected sample-rate=24000, got %v (%T)", metrics["sample-rate"], metrics["sample-rate"])
+	}
+	if got, _ := out["playback_status"].(string); got != "disabled" {
+		t.Fatalf("expected playback_status=disabled, got %v", out["playback_status"])
+	}
+}
+
+func TestMod3Speak_ForwardsSessionID(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	_, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:      "hello",
+		SessionID: "cs-abc123",
+		Voice:     "af_bella",
+		Speed:     1.1,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cap := fm.last()
+	var forwarded map[string]any
+	if err := json.Unmarshal(cap.Body, &forwarded); err != nil {
+		t.Fatalf("decode forwarded body: %v", err)
+	}
+	if forwarded["session_id"] != "cs-abc123" {
+		t.Fatalf("expected session_id=cs-abc123, got %v", forwarded["session_id"])
+	}
+	if forwarded["voice"] != "af_bella" {
+		t.Fatalf("expected voice=af_bella, got %v", forwarded["voice"])
+	}
+	if speed, _ := forwarded["speed"].(float64); speed != 1.1 {
+		t.Fatalf("expected speed=1.1, got %v", forwarded["speed"])
+	}
+}
+
+func TestMod3Speak_OmitsSessionIDWhenAbsent(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	_, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "plain"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cap := fm.last()
+	var forwarded map[string]any
+	if err := json.Unmarshal(cap.Body, &forwarded); err != nil {
+		t.Fatalf("decode forwarded body: %v", err)
+	}
+	if _, present := forwarded["session_id"]; present {
+		t.Fatalf("expected no session_id key, got %v", forwarded["session_id"])
+	}
+}
+
+func TestMod3Speak_EmptyTextRejects(t *testing.T) {
+	m := &MCPServer{cfg: &Config{Mod3URL: "http://unused"}}
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "   "})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// textResult — IsError is false because it's a validation message, but
+	// the content must mention the required field.
+	if len(res.Content) == 0 {
+		t.Fatal("expected content")
+	}
+	tc := res.Content[0].(*mcp.TextContent)
+	if !strings.Contains(tc.Text, "required") {
+		t.Fatalf("expected 'required' in message, got %q", tc.Text)
+	}
+}
+
+func TestMod3Speak_Mod3DownReturnsCleanError(t *testing.T) {
+	// Port that refuses connections.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close() // release the port so dials get ECONNREFUSED
+
+	m := &MCPServer{
+		cfg:       &Config{Mod3URL: "http://" + addr},
+		mod3Proxy: &modalityProxy{disablePlayback: true},
+	}
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "hi"})
+	if err != nil {
+		t.Fatalf("handler should not return Go error, got %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected IsError=true when mod3 is unreachable")
+	}
+	tc := res.Content[0].(*mcp.TextContent)
+	if !strings.Contains(strings.ToLower(tc.Text), "mod3 unreachable") {
+		t.Fatalf("expected 'mod3 unreachable' message, got %q", tc.Text)
+	}
+}
+
+func TestMod3Speak_PreservesMod3ErrorBody(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	fm.synthesizeHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"detail":"text must not be empty"}`))
+	}
+	m := newProxyMCP(t, fm)
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "bad"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected IsError=true on mod3 422")
+	}
+	tc := res.Content[0].(*mcp.TextContent)
+	if !strings.Contains(tc.Text, "422") {
+		t.Fatalf("expected '422' in error text, got %q", tc.Text)
+	}
+	if !strings.Contains(tc.Text, "text must not be empty") {
+		t.Fatalf("expected mod3 body preserved, got %q", tc.Text)
+	}
+}
+
+func TestMod3Speak_SkipPlaybackReturnsBase64(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:         "skip",
+		SkipPlayback: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := decodeToolText(t, res)
+	if got, _ := out["playback_status"].(string); got != "skipped" {
+		t.Fatalf("expected playback_status=skipped, got %v", out["playback_status"])
+	}
+	if b64, _ := out["audio_base64"].(string); b64 == "" {
+		t.Fatal("expected audio_base64 populated when skip_playback=true")
+	}
+}
+
+// ─── mod3_stop / voices / status / sessions ──────────────────────────────────
+
+func TestMod3Stop_ForwardsSessionAndJob(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	res, _, err := m.toolMod3Stop(context.Background(), nil, mod3StopInput{
+		SessionID: "cs-abc",
+		JobID:     "job-xyz",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatal("expected success")
+	}
+
+	cap := fm.last()
+	if !strings.Contains(cap.Query, "session_id=cs-abc") {
+		t.Fatalf("expected session_id in query, got %q", cap.Query)
+	}
+	if !strings.Contains(cap.Query, "job_id=job-xyz") {
+		t.Fatalf("expected job_id in query, got %q", cap.Query)
+	}
+
+	out := decodeToolText(t, res)
+	if out["status"] != "stopped" {
+		t.Fatalf("expected status=stopped, got %v", out["status"])
+	}
+}
+
+func TestMod3Voices_ReturnsRawList(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	res, _, err := m.toolMod3Voices(context.Background(), nil, mod3VoicesInput{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatal("expected success")
+	}
+	out := decodeToolText(t, res)
+	voices, _ := out["voices"].([]any)
+	if len(voices) != 2 {
+		t.Fatalf("expected 2 voices, got %d", len(voices))
+	}
+}
+
+func TestMod3Voices_ThreadsSessionID(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	_, _, _ = m.toolMod3Voices(context.Background(), nil, mod3VoicesInput{SessionID: "cs-qq"})
+	cap := fm.last()
+	if !strings.Contains(cap.Query, "session_id=cs-qq") {
+		t.Fatalf("expected session_id in query, got %q", cap.Query)
+	}
+}
+
+func TestMod3Status_HitsHealth(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	res, _, err := m.toolMod3Status(context.Background(), nil, mod3StatusInput{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatal("expected success")
+	}
+	out := decodeToolText(t, res)
+	if out["status"] != "ok" {
+		t.Fatalf("expected status=ok, got %v", out["status"])
+	}
+
+	cap := fm.last()
+	if cap.Path != "/health" {
+		t.Fatalf("expected /health, got %q", cap.Path)
+	}
+}
+
+func TestMod3Status_Mod3DownClean(t *testing.T) {
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	addr := l.Addr().String()
+	_ = l.Close()
+
+	m := &MCPServer{cfg: &Config{Mod3URL: "http://" + addr}}
+	res, _, err := m.toolMod3Status(context.Background(), nil, mod3StatusInput{})
+	if err != nil {
+		t.Fatalf("handler should not Go-error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected IsError=true")
+	}
+}
+
+// TestMod3RegisterSession_RoutesThroughKernel verifies that the MCP tool
+// goes through the kernel's shared RegisterChannelSession backend — not
+// directly to mod3 — and that the response is the merged {kernel, mod3}
+// block produced by that shared code path (ADR-082 Wave 3.5).
+func TestMod3RegisterSession_RoutesThroughKernel(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m, srv := newProxyMCPWithServer(t, fm)
+
+	res, _, err := m.toolMod3RegisterSession(context.Background(), nil, mod3RegisterSessionInput{
+		SessionID:             "cs-regtest",
+		ParticipantID:         "cog",
+		ParticipantType:       "agent",
+		PreferredVoice:        "bm_lewis",
+		PreferredOutputDevice: "system-default",
+		Priority:              2,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got IsError: %v", res.Content)
+	}
+
+	// The forward to mod3 must have happened via the kernel's shared
+	// method — verify the request body mod3 saw carries the caller-
+	// supplied session_id and participant_id unchanged.
+	cap := fm.last()
+	if cap.Path != "/v1/sessions/register" {
+		t.Fatalf("expected mod3 /v1/sessions/register, got %q", cap.Path)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(cap.Body, &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["session_id"] != "cs-regtest" {
+		t.Fatalf("bad session_id forwarded: %v", body["session_id"])
+	}
+	if body["participant_id"] != "cog" {
+		t.Fatalf("bad participant_id forwarded: %v", body["participant_id"])
+	}
+	if body["preferred_voice"] != "bm_lewis" {
+		t.Fatalf("bad preferred_voice forwarded: %v", body["preferred_voice"])
+	}
+
+	// The merged {kernel, mod3} shape must land — verify the kernel's
+	// identity record is present in the response.
+	out := decodeToolText(t, res)
+	kernel, ok := out["kernel"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected kernel block in response, got %v", out)
+	}
+	if kernel["session_id"] != "cs-regtest" {
+		t.Fatalf("expected kernel.session_id=cs-regtest, got %v", kernel["session_id"])
+	}
+	if kernel["id_source"] != "caller" {
+		t.Fatalf("expected id_source=caller, got %v", kernel["id_source"])
+	}
+
+	// Kernel registry must hold the committed record — proves we went
+	// through the shared backend and not straight to mod3.
+	if _, held := srv.channelSessionRegistry.Get("cs-regtest"); !held {
+		t.Fatal("expected kernel registry to hold record after register")
+	}
+}
+
+// TestMod3RegisterSession_KernelMintsWhenAbsent exercises the minting
+// path — caller omits session_id, kernel mints one, mod3 receives it.
+func TestMod3RegisterSession_KernelMintsWhenAbsent(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m, srv := newProxyMCPWithServer(t, fm)
+
+	res, _, err := m.toolMod3RegisterSession(context.Background(), nil, mod3RegisterSessionInput{
+		ParticipantID: "cog",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got IsError: %v", res.Content)
+	}
+
+	out := decodeToolText(t, res)
+	kernel, _ := out["kernel"].(map[string]any)
+	sid, _ := kernel["session_id"].(string)
+	if !strings.HasPrefix(sid, "cs-") {
+		t.Fatalf("expected minted cs-* session_id, got %q", sid)
+	}
+	if kernel["id_source"] != "minted" {
+		t.Fatalf("expected id_source=minted, got %v", kernel["id_source"])
+	}
+
+	// Mod3 must have seen the kernel-minted ID verbatim.
+	cap := fm.last()
+	var body map[string]any
+	_ = json.Unmarshal(cap.Body, &body)
+	if body["session_id"] != sid {
+		t.Fatalf("mod3 got session_id=%v, expected %q", body["session_id"], sid)
+	}
+
+	if _, held := srv.channelSessionRegistry.Get(sid); !held {
+		t.Fatalf("expected kernel registry to hold minted record %q", sid)
+	}
+}
+
+// TestMod3RegisterSession_ForwardsKindsAndMetadata verifies the Wave 3.5
+// schema alignment with the channel-provider RFC — `kinds` and `metadata`
+// flow through the kernel's register endpoint and land in mod3's request
+// body unchanged.
+func TestMod3RegisterSession_ForwardsKindsAndMetadata(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m, _ := newProxyMCPWithServer(t, fm)
+
+	_, _, err := m.toolMod3RegisterSession(context.Background(), nil, mod3RegisterSessionInput{
+		SessionID:       "cs-kinds",
+		ParticipantID:   "mod3-provider",
+		ParticipantType: "provider",
+		Kinds:           []string{"audio"},
+		Metadata: map[string]any{
+			"provider_id": "mod3-local",
+			"build":       "0.5.0",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cap := fm.last()
+	var body map[string]any
+	if err := json.Unmarshal(cap.Body, &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	kinds, ok := body["kinds"].([]any)
+	if !ok || len(kinds) != 1 || kinds[0] != "audio" {
+		t.Fatalf("expected kinds=[\"audio\"] forwarded, got %v", body["kinds"])
+	}
+	md, ok := body["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected metadata object forwarded, got %v (%T)", body["metadata"], body["metadata"])
+	}
+	if md["provider_id"] != "mod3-local" {
+		t.Fatalf("expected metadata.provider_id=mod3-local, got %v", md["provider_id"])
+	}
+	if body["participant_type"] != "provider" {
+		t.Fatalf("expected participant_type=provider, got %v", body["participant_type"])
+	}
+}
+
+func TestMod3RegisterSession_RejectsWithoutParticipant(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	res, _, err := m.toolMod3RegisterSession(context.Background(), nil, mod3RegisterSessionInput{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	tc := res.Content[0].(*mcp.TextContent)
+	if !strings.Contains(tc.Text, "participant_id") {
+		t.Fatalf("expected validation message, got %q", tc.Text)
+	}
+}
+
+func TestMod3RegisterSession_NoBackendReturnsCleanError(t *testing.T) {
+	// An MCPServer with no channel-session backend wired in must surface
+	// a clean "not configured" error rather than a nil deref — important
+	// because NewMCPServer (used by tests that only care about memory
+	// tools) doesn't wire the backend.
+	m := &MCPServer{cfg: &Config{Mod3URL: "http://unused"}}
+	res, _, err := m.toolMod3RegisterSession(context.Background(), nil, mod3RegisterSessionInput{
+		ParticipantID: "cog",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected IsError=true when backend is nil")
+	}
+	tc := res.Content[0].(*mcp.TextContent)
+	if !strings.Contains(tc.Text, "backend not configured") {
+		t.Fatalf("expected backend-not-configured message, got %q", tc.Text)
+	}
+}
+
+// TestMod3DeregisterSession_RoutesThroughKernel verifies the deregister
+// tool forwards via the kernel's shared path and the kernel drops its
+// identity record on success.
+func TestMod3DeregisterSession_RoutesThroughKernel(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m, srv := newProxyMCPWithServer(t, fm)
+
+	// Seed the kernel registry so we can see it get dropped.
+	srv.channelSessionRegistry.Put(ChannelSessionRecord{
+		SessionID: "cs-drop", ParticipantID: "cog",
+	})
+
+	res, _, err := m.toolMod3DeregisterSession(context.Background(), nil, mod3DeregisterSessionInput{
+		SessionID: "cs-drop",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got IsError: %v", res.Content)
+	}
+	cap := fm.last()
+	if cap.Path != "/v1/sessions/cs-drop/deregister" {
+		t.Fatalf("expected /v1/sessions/cs-drop/deregister at mod3, got %q", cap.Path)
+	}
+	if _, held := srv.channelSessionRegistry.Get("cs-drop"); held {
+		t.Fatal("expected kernel registry to drop record after successful deregister")
+	}
+}
+
+func TestMod3DeregisterSession_RequiresID(t *testing.T) {
+	m := &MCPServer{cfg: &Config{Mod3URL: "http://unused"}}
+	res, _, err := m.toolMod3DeregisterSession(context.Background(), nil, mod3DeregisterSessionInput{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	tc := res.Content[0].(*mcp.TextContent)
+	if !strings.Contains(tc.Text, "session_id") {
+		t.Fatalf("expected session_id message, got %q", tc.Text)
+	}
+}
+
+// TestMod3ListSessions_RoutesThroughKernel verifies list merges the
+// kernel snapshot with mod3's per-channel state (the new Wave 3.5
+// merged shape, not mod3's raw payload).
+func TestMod3ListSessions_RoutesThroughKernel(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m, srv := newProxyMCPWithServer(t, fm)
+
+	srv.channelSessionRegistry.Put(ChannelSessionRecord{
+		SessionID: "cs-seed", ParticipantID: "cog",
+	})
+
+	res, _, err := m.toolMod3ListSessions(context.Background(), nil, mod3ListSessionsInput{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got IsError: %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	kernel, ok := out["kernel"].([]any)
+	if !ok {
+		t.Fatalf("expected kernel array in merged response, got %v", out)
+	}
+	if len(kernel) != 1 {
+		t.Fatalf("expected 1 kernel record, got %d", len(kernel))
+	}
+	// Mod3 block must be present (from the fake list handler).
+	if _, present := out["mod3"]; !present {
+		t.Fatal("expected mod3 block in merged response")
+	}
+}
+
+// ─── metric extraction unit test ─────────────────────────────────────────────
+
+func TestExtractMod3Metrics_TypesByValue(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Mod3-Job-Id", "abc123")
+	h.Set("X-Mod3-Duration-Sec", "2.50")
+	h.Set("X-Mod3-Sample-Rate", "24000")
+	h.Set("X-Mod3-Rtf", "8.1")
+	h.Set("Content-Type", "audio/wav") // should be skipped
+
+	out := extractMod3Metrics(h)
+	if len(out) != 4 {
+		t.Fatalf("expected 4 metrics, got %d: %v", len(out), out)
+	}
+	if got, _ := out["job-id"].(string); got != "abc123" {
+		t.Fatalf("job-id: got %v", out["job-id"])
+	}
+	if got, ok := out["duration-sec"].(float64); !ok || got != 2.5 {
+		t.Fatalf("duration-sec: got %v (%T)", out["duration-sec"], out["duration-sec"])
+	}
+	if got, ok := out["sample-rate"].(int64); !ok || got != 24000 {
+		t.Fatalf("sample-rate should parse to int64, got %v (%T)",
+			out["sample-rate"], out["sample-rate"])
+	}
+	if _, present := out["content-type"]; present {
+		t.Fatal("content-type should be skipped")
+	}
+}
+
+// ─── playback injection test ─────────────────────────────────────────────────
+
+// TestPlayAudio_StubPlayer — validate the playback plumbing by injecting a
+// small shell-script player that records the file it received. Proves the
+// audio bytes reach the player (the bug the installed binary has today is
+// that they don't). Only runs on OSes where a shell is available.
+func TestPlayAudio_StubPlayer(t *testing.T) {
+	dir := t.TempDir()
+	recPath := filepath.Join(dir, "received.log")
+	stubPath := filepath.Join(dir, "stub-player.sh")
+
+	// Player writes its last-arg path and the first 4 bytes of the wav to
+	// received.log; proves (a) the player got a path, (b) the file exists
+	// at that path with our bytes.
+	stubBody := `#!/bin/sh
+path="$1"
+hdr=$(dd if="$path" bs=4 count=1 2>/dev/null)
+printf 'path=%s hdr=%s\n' "$path" "$hdr" > "` + recPath + `"
+`
+	if err := os.WriteFile(stubPath, []byte(stubBody), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	p := &modalityProxy{player: stubPath}
+	if err := p.playAudio(synthWav, true); err != nil {
+		t.Fatalf("playAudio: %v", err)
+	}
+
+	got, err := os.ReadFile(recPath)
+	if err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	line := string(got)
+	if !strings.Contains(line, "hdr=RIFF") {
+		t.Fatalf("player did not see RIFF header; got %q", line)
+	}
+	if !strings.Contains(line, "path=") {
+		t.Fatalf("player did not get a path arg; got %q", line)
+	}
+}
+
+// TestPlayAudio_NonBlockingSpawn — fire-and-forget. Use a sleep-style stub
+// and assert playAudio returns before the stub would finish. Prevents the
+// regression where speech synthesis blocks the MCP response on playback.
+func TestPlayAudio_NonBlockingSpawn(t *testing.T) {
+	dir := t.TempDir()
+	stubPath := filepath.Join(dir, "sleeper.sh")
+	stubBody := `#!/bin/sh
+sleep 5
+`
+	if err := os.WriteFile(stubPath, []byte(stubBody), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	p := &modalityProxy{player: stubPath}
+
+	done := make(chan struct{})
+	go func() {
+		if err := p.playAudio(synthWav, false); err != nil {
+			t.Errorf("playAudio: %v", err)
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected: playAudio returns immediately in non-blocking mode.
+	case <-time.After(2 * time.Second):
+		t.Fatal("playAudio(blocking=false) did not return within 2s")
+	}
+}
+
+// ─── Wave 4.3 — subscriber-check / afplay skip ───────────────────────────────
+
+// TestMod3Speak_NoSessionAlwaysSpawnsPlayer — session_id="" bypasses the
+// subscriber check entirely so CLI invocations of mod3_speak still play
+// audio through afplay as they always did.
+func TestMod3Speak_NoSessionAlwaysSpawnsPlayer(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	stubPath, count := writeStubPlayer(t)
+	m.mod3Proxy = &modalityProxy{player: stubPath}
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:     "no session",
+		Blocking: true, // wait for stub to finish so the test can assert invocation count
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	if got, _ := out["playback_status"].(string); got != "played" {
+		t.Fatalf("expected playback_status=played, got %v", out["playback_status"])
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("expected stub player invoked once, got %d", got)
+	}
+}
+
+// TestMod3Speak_SessionWithSubscriberSkipsPlayer — when the injected
+// subscriber-check returns true, the kernel skips afplay entirely and
+// returns playback_status=routed_ws. The stub player must NOT be invoked.
+func TestMod3Speak_SessionWithSubscriberSkipsPlayer(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	stubPath, count := writeStubPlayer(t)
+	m.mod3Proxy = &modalityProxy{
+		player: stubPath,
+		subscriberCheck: func(ctx context.Context, sessionID string) (bool, error) {
+			if sessionID != "cs-with-sub" {
+				t.Errorf("unexpected session_id=%q", sessionID)
+			}
+			return true, nil
+		},
+	}
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:      "skip me",
+		SessionID: "cs-with-sub",
+		Blocking:  true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	if got, _ := out["playback_status"].(string); got != "routed_ws" {
+		t.Fatalf("expected playback_status=routed_ws, got %v", out["playback_status"])
+	}
+	// Give any stray goroutine a moment to trip the stub — proving non-invocation.
+	time.Sleep(100 * time.Millisecond)
+	if got := count(); got != 0 {
+		t.Fatalf("expected stub player NOT invoked, got %d", got)
+	}
+}
+
+// TestMod3Speak_SessionWithoutSubscriberSpawnsPlayer — subscriber-check
+// returns false: kernel falls back to the normal afplay path and the stub
+// player IS invoked.
+func TestMod3Speak_SessionWithoutSubscriberSpawnsPlayer(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	stubPath, count := writeStubPlayer(t)
+	m.mod3Proxy = &modalityProxy{
+		player: stubPath,
+		subscriberCheck: func(ctx context.Context, sessionID string) (bool, error) {
+			return false, nil
+		},
+	}
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:      "no subscriber",
+		SessionID: "cs-no-sub",
+		Blocking:  true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	if got, _ := out["playback_status"].(string); got != "played" {
+		t.Fatalf("expected playback_status=played, got %v", out["playback_status"])
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("expected stub player invoked once, got %d", got)
+	}
+}
+
+// TestMod3Speak_SubscriberCheckErrorFallsBackToPlayer — transient
+// check error (mod3 flaky, timeout, etc.) must not orphan the audio.
+// The kernel logs the error, records subscriber_check_error in the result,
+// and still spawns the player so the user hears the reply.
+func TestMod3Speak_SubscriberCheckErrorFallsBackToPlayer(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	stubPath, count := writeStubPlayer(t)
+	m.mod3Proxy = &modalityProxy{
+		player: stubPath,
+		subscriberCheck: func(ctx context.Context, sessionID string) (bool, error) {
+			return false, fmt.Errorf("mod3 probe timed out")
+		},
+	}
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:      "check failed",
+		SessionID: "cs-flaky",
+		Blocking:  true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success despite check error, got %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	if got, _ := out["playback_status"].(string); got != "played" {
+		t.Fatalf("expected playback_status=played, got %v", out["playback_status"])
+	}
+	if checkErr, _ := out["subscriber_check_error"].(string); !strings.Contains(checkErr, "probe timed out") {
+		t.Fatalf("expected subscriber_check_error to surface, got %v", out["subscriber_check_error"])
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("expected stub player invoked once on check error, got %d", got)
+	}
+}
+
+// TestCheckSessionSubscriber_DefaultImplementationHitsMod3 — wire up a
+// stand-alone fake HTTP server that answers the
+// /v1/sessions/{id}/subscribers probe and verify the default implementation
+// (no injected subscriberCheck) parses its response correctly.
+func TestCheckSessionSubscriber_DefaultImplementationHitsMod3(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/cs-yes/subscribers", func(w http.ResponseWriter, r *http.Request) {
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"session_id": "cs-yes", "subscribed": true, "count": 1,
+		})
+	})
+	mux.HandleFunc("GET /v1/sessions/cs-no/subscribers", func(w http.ResponseWriter, r *http.Request) {
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"session_id": "cs-no", "subscribed": false, "count": 0,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	m := &MCPServer{
+		cfg:       &Config{Mod3URL: srv.URL},
+		mod3Proxy: &modalityProxy{disablePlayback: true},
+	}
+
+	yes, err := m.checkSessionSubscriber(context.Background(), "cs-yes")
+	if err != nil {
+		t.Fatalf("cs-yes: %v", err)
+	}
+	if !yes {
+		t.Fatal("cs-yes: expected subscribed=true")
+	}
+
+	no, err := m.checkSessionSubscriber(context.Background(), "cs-no")
+	if err != nil {
+		t.Fatalf("cs-no: %v", err)
+	}
+	if no {
+		t.Fatal("cs-no: expected subscribed=false")
+	}
+}
+
+// TestCheckSessionSubscriber_Mod3UnreachableReturnsError — transport
+// error (connection refused, timeout) must surface as a non-nil error so
+// toolMod3Speak records subscriber_check_error and falls back to afplay.
+func TestCheckSessionSubscriber_Mod3UnreachableReturnsError(t *testing.T) {
+	// Bind a port, close it so dials get ECONNREFUSED.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+
+	m := &MCPServer{
+		cfg:       &Config{Mod3URL: "http://" + addr},
+		mod3Proxy: &modalityProxy{disablePlayback: true},
+	}
+	subscribed, err := m.checkSessionSubscriber(context.Background(), "cs-anything")
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	if subscribed {
+		t.Fatal("expected subscribed=false on error")
+	}
+}
+
+// writeStubPlayer builds a temp shell script that records each invocation
+// by appending to a log file. Returns the path of the executable AND a
+// getter that returns the current invocation count. The stub exits
+// immediately so blocking=true still works in tests.
+func writeStubPlayer(t *testing.T) (stubPath string, count func() int) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "invocations.log")
+	stubPath = filepath.Join(dir, "stub-player.sh")
+	stubBody := `#!/bin/sh
+echo "invoked" >> "` + logPath + `"
+`
+	if err := os.WriteFile(stubPath, []byte(stubBody), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	count = func() int {
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			return 0
+		}
+		return strings.Count(string(data), "invoked\n")
+	}
+	return stubPath, count
+}

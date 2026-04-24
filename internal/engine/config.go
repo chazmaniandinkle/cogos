@@ -77,6 +77,16 @@ type Config struct {
 	// at .cog/run/kernel.log.jsonl. Leave empty for the default.
 	KernelLogPath string
 
+	// Mod3URL is the base URL (scheme + host + port) of the mod3 voice service
+	// that owns per-channel communication state (voice, output device, queue)
+	// keyed on kernel-issued session IDs. The kernel forwards channel-session
+	// registration to this URL; mod3 remains the per-channel state owner while
+	// the kernel retains identity authority (ADR-082 split).
+	//
+	// Default: http://localhost:7860. Override via `mod3_url` in kernel.yaml
+	// (top-level or under v3:) or via the COGOS_MOD3_URL env var.
+	Mod3URL string
+
 	LocalModel string
 
 	localModelConfigured bool
@@ -99,6 +109,7 @@ type kernelConfigSection struct {
 	LocalModel            string            `yaml:"local_model"`
 	DigestPaths           map[string]string `yaml:"digest_paths"`
 	KernelLogPath         string            `yaml:"kernel_log_path"`
+	Mod3URL               string            `yaml:"mod3_url"`
 }
 
 // kernelConfig is the on-disk YAML shape of .cog/config/kernel.yaml.
@@ -137,6 +148,7 @@ func LoadConfig(workspaceRoot string, port int) (*Config, error) {
 		ToolCallValidationEnabled: true,
 		LocalModel:                defaultOllamaModel,
 		DigestPaths:               make(map[string]string),
+		Mod3URL:                   "http://localhost:7860",
 	}
 
 	// Load from file if present.
@@ -148,6 +160,12 @@ func LoadConfig(workspaceRoot string, port int) (*Config, error) {
 			applyKernelSection(cfg, kc.kernelConfigSection)
 			applyKernelSection(cfg, kc.V3)
 		}
+	}
+
+	// Env override for the mod3 URL. Env wins over file; flags stay flag-only
+	// (we don't surface `--mod3-url` in CLI; one env var + YAML is enough).
+	if v := os.Getenv("COGOS_MOD3_URL"); v != "" {
+		cfg.Mod3URL = v
 	}
 
 	// Flag override.
@@ -210,6 +228,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	}
 	if s.KernelLogPath != "" {
 		cfg.KernelLogPath = s.KernelLogPath
+	}
+	if s.Mod3URL != "" {
+		cfg.Mod3URL = s.Mod3URL
 	}
 }
 

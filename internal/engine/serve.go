@@ -19,6 +19,15 @@
 //	GET  /v1/constellation/fovea           — current fovea state
 //	GET  /v1/constellation/adjacent?uri=… — adjacent nodes by attentional proximity
 //
+// Channel-session forwarder (ADR-082 Wave 2, see serve_sessions_channel.go):
+//
+//	POST /v1/channel-sessions/register             — kernel mints session_id
+//	                                                  and forwards to mod3;
+//	                                                  returns merged response
+//	POST /v1/channel-sessions/{id}/deregister      — proxy to mod3, drop record
+//	GET  /v1/channel-sessions                      — kernel view + mod3 list
+//	GET  /v1/channel-sessions/{id}                 — single-session detail
+//
 // The chat endpoint routes through the inference Router when one is set,
 // otherwise returns 501.
 package engine
@@ -52,8 +61,8 @@ type Server struct {
 	process         *Process
 	router          Router // nil until SetRouter is called
 	srv             *http.Server
-	debug           debugStore    // captures last request pipeline state
-	attentionLog    *attentionLog // per-server log (avoids global write race)
+	debug           debugStore      // captures last request pipeline state
+	attentionLog    *attentionLog   // per-server log (avoids global write race)
 	agentController AgentController // nil until SetAgentController is called
 	mcpServer       *MCPServer      // so SetAgentController can propagate to tools
 
@@ -71,6 +80,24 @@ type Server struct {
 	// these are derived views rebuilt from bus replay at startup.
 	sessionRegistry *SessionRegistry
 	handoffRegistry *HandoffRegistry
+
+	// ADR-082 Wave 2: kernel-owned identity registry for channel-participant
+	// sessions. The kernel mints session_id, mod3 stores per-channel state
+	// keyed on the kernel-issued ID. Distinct from sessionRegistry above,
+	// which enforces strict 3-component hyphen IDs for the agent/handoff
+	// protocol. See serve_sessions_channel.go for the full rationale.
+	channelSessionRegistry *ChannelSessionRegistry
+
+	// mod3Client is the HTTP client used to forward channel-session calls
+	// to mod3. Nil in production (falls back to the package-level
+	// mod3HTTPClient); tests set this to an httptest-backed client.
+	mod3Client *http.Client
+
+	// httpRoutes is the manifest-introspection registry. Every route added
+	// via s.route / s.routeH appends here; /v1/manifest serialises this
+	// slice. Populated at startup only — reads are lock-free because the
+	// slice is frozen by the time Start returns.
+	httpRoutes []routeMeta
 }
 
 // NewServer constructs a Server bound to the configured port.
@@ -94,25 +121,29 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.sessionRegistry = NewSessionRegistry()
 	s.handoffRegistry = NewHandoffRegistry()
 
+	// ADR-082 Wave 2 kernel-owned channel-session identity.
+	s.channelSessionRegistry = NewChannelSessionRegistry()
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", handleDashboard)
-	mux.HandleFunc("GET /canvas", handleCanvas)
-	mux.HandleFunc("GET /health", s.handleHealth)
-	mux.HandleFunc("GET /v1/context", s.handleContext)
-	mux.HandleFunc("GET /v1/resolve", s.handleResolve)
-	mux.HandleFunc("GET /v1/cogdoc/read", s.handleCogDocRead)
-	mux.HandleFunc("GET /v1/debug/last", s.handleDebugLast)
-	mux.HandleFunc("GET /v1/debug/context", s.handleDebugContext)
-	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
-	mux.HandleFunc("POST /v1/messages", s.handleAnthropicMessages)
-	mux.HandleFunc("GET /v1/proprioceptive", s.handleProprioceptive)
-	mux.HandleFunc("GET /v1/ledger", s.handleLedger)
-	mux.HandleFunc("GET /v1/traces", s.handleTraces)
-	mux.HandleFunc("GET /v1/lightcone", s.handleLightCone)
-	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext)
-	mux.HandleFunc("GET /v1/kernel-log", s.handleKernelLog)
-	mux.HandleFunc("GET /v1/tool-calls", s.handleToolCalls)
-	mux.HandleFunc("GET /v1/conversation", s.handleConversation)
+	s.route(mux, "GET /", handleDashboard)
+	s.route(mux, "GET /canvas", handleCanvas)
+	s.route(mux, "GET /health", s.handleHealth)
+	s.route(mux, "GET /v1/context", s.handleContext)
+	s.route(mux, "GET /v1/resolve", s.handleResolve)
+	s.route(mux, "GET /v1/cogdoc/read", s.handleCogDocRead)
+	s.route(mux, "GET /v1/debug/last", s.handleDebugLast)
+	s.route(mux, "GET /v1/debug/context", s.handleDebugContext)
+	s.route(mux, "POST /v1/chat/completions", s.handleChat)
+	s.route(mux, "POST /v1/messages", s.handleAnthropicMessages)
+	s.route(mux, "GET /v1/proprioceptive", s.handleProprioceptive)
+	s.route(mux, "GET /v1/ledger", s.handleLedger)
+	s.route(mux, "GET /v1/traces", s.handleTraces)
+	s.route(mux, "GET /v1/lightcone", s.handleLightCone)
+	s.route(mux, "POST /v1/context/foveated", s.handleFoveatedContext)
+	s.route(mux, "GET /v1/kernel-log", s.handleKernelLog)
+	s.route(mux, "GET /v1/tool-calls", s.handleToolCalls)
+	s.route(mux, "GET /v1/conversation", s.handleConversation)
+	s.route(mux, "GET /v1/manifest", s.handleManifest)
 
 	// Constellation / attention endpoints (Phase 3)
 	s.registerAttentionRoutes(mux)
@@ -133,6 +164,13 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// cleanly with the pre-existing GET /v1/sessions[/{id}] surface.
 	s.registerSessionMgmtRoutes(mux)
 
+	// ADR-082 Wave 2: kernel-side channel-session forwarder. The four
+	// /v1/channel-sessions/* routes mint session_ids, record identity
+	// locally, and forward to mod3 at cfg.Mod3URL. Namespaced under
+	// /v1/channel-sessions/* to coexist with the agent-session surface
+	// above (incompatible session_id formats — see serve_sessions_channel.go).
+	s.registerChannelSessionRoutes(mux)
+
 	// Replay bus_sessions + bus_handoffs into the in-memory registries so
 	// the kernel starts with an accurate derived view. Bus is authoritative
 	// either way; this just warms the read path.
@@ -146,9 +184,15 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	if bindAddr == "" {
 		bindAddr = "127.0.0.1"
 	}
+	// Wrap the mux with CORS middleware so browser origins (e.g. the mod3
+	// dashboard at http://localhost:7860) can POST to /v1/* without the
+	// preflight failing. See serve_cors.go for the policy rationale —
+	// loopback origins are echoed, everything else gets "*".
+	handler := corsMiddleware(mux)
+
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", bindAddr, cfg.Port),
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 300 * time.Second, // 5 min — streaming responses can be long
 		IdleTimeout:  120 * time.Second,
