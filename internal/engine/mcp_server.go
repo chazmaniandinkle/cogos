@@ -202,6 +202,11 @@ func (m *MCPServer) registerTools() {
 	}, m.toolTriggerAgentLoop)
 
 	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_dispatch_to_harness",
+		Description: "Phase 2 transport: dispatch a task into the kernel-interior agent harness with structured return, optional concurrency (n=1..4), per-call tool scope narrowing, optional system-prompt override, and pluggable model routing (e4b local Ollama, default; 26b LM Studio with degrade-to-e4b fallback). Synchronous: blocks until every slot completes, errors, or hits its per-slot timeout (default 30s, max 120s). Returns one DispatchResult per slot with content (the agent's final respond text), tool-call digests, duration, and turn count. Use this for the foveal->peripheral handoff — offload validation, rewriting, modality matching to the resident swarm instead of paying with Anthropic tokens. Backward-compat note: cog_trigger_agent_loop still wakes the singleton with no payload; this tool is the new payload-bearing path.",
+	}, m.toolDispatchToHarness)
+
+	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_tail_kernel_log",
 		Description: "Read recent entries from the kernel's own diagnostic log (slog JSON at .cog/run/kernel.log.jsonl). Returns newest-first, optionally filtered by level, substring, and time range. This is the OPERATOR/DEBUG surface — for hash-chained event history use cog_read_ledger (when available); for client metabolites (turn metrics, attention, proprioceptive) use cog_search_traces. Fallback: tail -n 100 .cog/run/kernel.log.jsonl | jq -c .",
 	}, m.toolTailKernelLog)
@@ -546,6 +551,25 @@ type triggerAgentLoopInput struct {
 	AgentID string `json:"agent_id,omitempty" jsonschema:"Which agent to trigger. Default \"primary\"."`
 	Reason  string `json:"reason,omitempty" jsonschema:"Free-text tag stored on a synthetic agent.wake event for audit (optional)."`
 	Wait    bool   `json:"wait,omitempty" jsonschema:"If true, block until the cycle completes (up to 90s) and return the outcome. Default false (fire-and-forget)."`
+}
+
+// dispatchToHarnessInput is the wire shape for cog_dispatch_to_harness — the
+// Phase 2 task-parameterized transport from the foveal Claude session into
+// the resident peripheral swarm. See engine/agent_dispatch.go for the
+// underlying DispatchRequest contract.
+type dispatchToHarnessInput struct {
+	AgentID      string                 `json:"agent_id,omitempty" jsonschema:"Which harness instance to dispatch into. Default \"primary\"."`
+	Task         string                 `json:"task" jsonschema:"Required. The user-role prompt the harness's Execute loop will receive."`
+	Tools        []string               `json:"tools,omitempty" jsonschema:"Optional tool allowlist (subset of registered core tools). nil/empty uses the full default set. Unknown names error in the per-slot result rather than silently dropping."`
+	Model        string                 `json:"model,omitempty" jsonschema:"Inference backend. \"e4b\" (default, local Ollama) or \"26b\" (LM Studio at 192.168.10.191:1234). Unknown values fall back to e4b."`
+	Timeout      int                    `json:"timeout_seconds,omitempty" jsonschema:"Per-slot wall-clock budget in seconds. Default 30, max 120. On exceed, that slot returns success=false error=\"timeout\"; sibling slots continue."`
+	N            int                    `json:"n,omitempty" jsonschema:"Parallel fan-out, [1,4]. Default 1. Each slot gets its own context, its own deadline, and its own result entry; failures don't abort siblings."`
+	SystemPrompt string                 `json:"system_prompt,omitempty" jsonschema:"Optional system-prompt override for this dispatch only. Empty keeps the harness default. Used by output-alignment roles (validator/rewriter/modality-matcher)."`
+	Thinking     *bool                  `json:"thinking,omitempty" jsonschema:"Optional override of the model's think flag. nil keeps the harness default."`
+	Iss          string                 `json:"iss,omitempty" jsonschema:"OIDC-shaped identity claim: issuer (e.g. \"anthropic.claude-code\"). Forwarded as trace metadata; full CRD binding waits for Wave 6b."`
+	Sub          string                 `json:"sub,omitempty" jsonschema:"OIDC-shaped identity claim: subject (e.g. session id, user handle)."`
+	Aud          string                 `json:"aud,omitempty" jsonschema:"OIDC-shaped identity claim: audience (e.g. \"cogos.kernel\")."`
+	Claims       map[string]interface{} `json:"claims,omitempty" jsonschema:"Free-form OIDC claim bag forwarded to the dispatch's trace metadata."`
 }
 
 // readToolCallsInput mirrors ToolCallQuery for the MCP surface. Time bounds
@@ -1438,6 +1462,34 @@ func (m *MCPServer) toolTriggerAgentLoop(ctx context.Context, req *mcp.CallToolR
 	})
 	if err != nil {
 		return agentErrorResult(err, "curl -X POST http://localhost:6931/v1/agents/primary/tick")
+	}
+	return marshalResult(result)
+}
+
+// toolDispatchToHarness implements cog_dispatch_to_harness — Phase 2
+// task-parameterized transport. See engine/agent_dispatch.go for the
+// underlying contract and the project_cogos_foveal_and_peripheral.md memory
+// note for the architectural framing.
+func (m *MCPServer) toolDispatchToHarness(ctx context.Context, req *mcp.CallToolRequest, input dispatchToHarnessInput) (*mcp.CallToolResult, any, error) {
+	dr := DispatchRequest{
+		AgentID:        input.AgentID,
+		Task:           input.Task,
+		Tools:          input.Tools,
+		Model:          DispatchModel(input.Model),
+		TimeoutSeconds: input.Timeout,
+		N:              input.N,
+		SystemPrompt:   input.SystemPrompt,
+		Thinking:       input.Thinking,
+		Identity: DispatchIdentity{
+			Iss:    input.Iss,
+			Sub:    input.Sub,
+			Aud:    input.Aud,
+			Claims: input.Claims,
+		},
+	}
+	result, err := QueryDispatchToHarness(ctx, m.agentController, dr)
+	if err != nil {
+		return agentErrorResult(err, "curl -X POST http://localhost:6931/v1/agents/primary/dispatch -d @body.json")
 	}
 	return marshalResult(result)
 }
