@@ -561,7 +561,7 @@ type dispatchToHarnessInput struct {
 	AgentID      string                 `json:"agent_id,omitempty" jsonschema:"Which harness instance to dispatch into. Default \"primary\"."`
 	Task         string                 `json:"task" jsonschema:"Required. The user-role prompt the harness's Execute loop will receive."`
 	Tools        []string               `json:"tools,omitempty" jsonschema:"Optional tool allowlist (subset of registered core tools). nil/empty uses the full default set. Unknown names error in the per-slot result rather than silently dropping."`
-	Model        string                 `json:"model,omitempty" jsonschema:"Inference backend. \"e4b\" (default, local Ollama) or \"26b\" (LM Studio at 192.168.10.191:1234). Unknown values fall back to e4b."`
+	Model        string                 `json:"model,omitempty" jsonschema:"Inference backend. \"e4b\" (default, local Ollama) or \"26b\" (configured remote OpenAI-compatible endpoint). Unknown values fall back to e4b."`
 	Timeout      int                    `json:"timeout_seconds,omitempty" jsonschema:"Per-slot wall-clock budget in seconds. Default 30, max 120. On exceed, that slot returns success=false error=\"timeout\"; sibling slots continue."`
 	N            int                    `json:"n,omitempty" jsonschema:"Parallel fan-out, [1,4]. Default 1. Each slot gets its own context, its own deadline, and its own result entry; failures don't abort siblings."`
 	SystemPrompt string                 `json:"system_prompt,omitempty" jsonschema:"Optional system-prompt override for this dispatch only. Empty keeps the harness default. Used by output-alignment roles (validator/rewriter/modality-matcher)."`

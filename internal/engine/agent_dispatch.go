@@ -24,8 +24,8 @@ package engine
 import "context"
 
 // DispatchModel selects the inference backend. "e4b" routes to the always-
-// resident Ollama (localhost:11434), "26b" routes to LM Studio at the
-// configured remote (192.168.10.191:1234) over the OpenAI-compatible API.
+// resident Ollama (localhost:11434), "26b" routes to a configured remote
+// OpenAI-compatible endpoint (e.g. LM Studio at <inference-host>:<port>).
 // Empty string is normalized to "e4b" by the dispatcher.
 type DispatchModel string
 
