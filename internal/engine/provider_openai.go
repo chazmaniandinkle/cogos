@@ -48,13 +48,7 @@ type OpenAICompatProvider struct {
 // openaiCompatDefaultEndpoint (localhost Ollama default). This lets users
 // point at an arbitrary OpenAI-compatible server without editing config.
 func NewOpenAICompatProvider(name string, cfg ProviderConfig) *OpenAICompatProvider {
-	endpoint := cfg.Endpoint
-	if endpoint == "" {
-		endpoint = os.Getenv("COGOS_LLM_ENDPOINT")
-	}
-	if endpoint == "" {
-		endpoint = openaiCompatDefaultEndpoint
-	}
+	endpoint := resolveLocalLLMEndpoint(cfg.Endpoint)
 	timeout := time.Duration(cfg.Timeout) * time.Second
 	if timeout == 0 {
 		timeout = 60 * time.Second
@@ -69,7 +63,7 @@ func NewOpenAICompatProvider(name string, cfg ProviderConfig) *OpenAICompatProvi
 	}
 	return &OpenAICompatProvider{
 		name:      name,
-		endpoint:  strings.TrimRight(endpoint, "/"),
+		endpoint:  normalizeLocalLLMEndpoint(endpoint),
 		apiKey:    apiKey,
 		model:     cfg.Model,
 		maxTokens: maxTokens,

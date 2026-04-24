@@ -17,7 +17,9 @@
 // sessions; those are separate APIs.
 package engine
 
-import "context"
+import (
+	"context"
+)
 
 // AgentController is the kernel-agnostic contract the MCP layer uses to
 // list, inspect, and trigger agent harness instances. The concrete
@@ -44,6 +46,7 @@ type AgentController interface {
 	// the cycle completes (or a 90s deadline elapses). When wait is false,
 	// returns immediately with a trigger receipt.
 	TriggerAgent(ctx context.Context, id string, reason string, wait bool) (*AgentTriggerResult, error)
+
 }
 
 // ErrAgentNotFound is returned by GetAgent/TriggerAgent when no agent
@@ -193,3 +196,4 @@ type AgentTriggerResult struct {
 	DurationMs int64   `json:"duration_ms,omitempty"`
 	TimedOut   bool    `json:"timed_out,omitempty"`
 }
+

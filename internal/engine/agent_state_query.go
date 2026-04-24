@@ -151,3 +151,5 @@ func QueryTriggerAgent(ctx context.Context, ctrl AgentController, req TriggerAge
 	}
 	return ctrl.TriggerAgent(ctx, req.AgentID, req.Reason, req.Wait)
 }
+
+

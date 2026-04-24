@@ -224,6 +224,37 @@ func (r *KernelToolRegistry) Definitions() []ToolDefinition {
 	return r.definitions
 }
 
+// Scoped returns a registry limited to the named tool subset. Empty names keep
+// the original registry. Unknown names return an error instead of silently
+// widening the scope.
+func (r *KernelToolRegistry) Scoped(names []string) (*KernelToolRegistry, error) {
+	if r == nil {
+		return nil, fmt.Errorf("nil kernel tool registry")
+	}
+	if len(names) == 0 {
+		return r, nil
+	}
+
+	out := &KernelToolRegistry{
+		cfg:       r.cfg,
+		proprio:   r.proprio,
+		executors: make(map[string]toolExecutor, len(names)),
+	}
+	for _, name := range names {
+		exec, ok := r.executors[name]
+		if !ok {
+			return nil, fmt.Errorf("kernel tool %q not registered", name)
+		}
+		def, ok := lookupToolDefinition(r.definitions, name)
+		if !ok {
+			return nil, fmt.Errorf("kernel tool %q missing definition", name)
+		}
+		out.executors[name] = exec
+		out.definitions = append(out.definitions, def)
+	}
+	return out, nil
+}
+
 func toolCallValidationEnabled(provider Provider, cfg *Config) bool {
 	caps := provider.Capabilities()
 	if caps.HasCapability(CapToolUse) {
