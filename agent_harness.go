@@ -3,7 +3,7 @@
 // Runs as a goroutine inside the kernel process. Calls a local model (Gemma E4B
 // via Ollama) through the OpenAI chat completions wire protocol. The loop is:
 //
-//   Observation → Assess (JSON mode) → Execute (tool loop) → Callback
+//	Observation → Assess (JSON mode) → Execute (tool loop) → Callback
 //
 // No framework dependencies. Uses net/http directly against Ollama's
 // OpenAI-compatible /v1/chat/completions endpoint.
@@ -121,20 +121,20 @@ func WithSessionIDs(ctx context.Context, ids []string) context.Context {
 
 // agentChatRequest is the Ollama native /api/chat request body.
 type agentChatRequest struct {
-	Model    string             `json:"model"`
-	Messages []agentChatMessage `json:"messages"`
-	Tools    []ToolDefinition   `json:"tools,omitempty"`
-	Stream   bool               `json:"stream"`
-	Think    bool               `json:"think"`              // explicit thinking control
-	Format   string             `json:"format,omitempty"`   // "json" for structured output
+	Model    string                 `json:"model"`
+	Messages []agentChatMessage     `json:"messages"`
+	Tools    []ToolDefinition       `json:"tools,omitempty"`
+	Stream   bool                   `json:"stream"`
+	Think    bool                   `json:"think"`             // explicit thinking control
+	Format   string                 `json:"format,omitempty"`  // "json" for structured output
 	Options  map[string]interface{} `json:"options,omitempty"` // Ollama model options (num_ctx, temperature, etc.)
 }
 
 // agentChatMessage is a single message in the conversation.
 type agentChatMessage struct {
-	Role       string          `json:"role"`                  // system, user, assistant, tool
-	Content    string          `json:"content,omitempty"`     // text content
-	ToolCalls  []agentToolCall `json:"tool_calls,omitempty"`  // assistant tool invocations
+	Role       string          `json:"role"`                   // system, user, assistant, tool
+	Content    string          `json:"content,omitempty"`      // text content
+	ToolCalls  []agentToolCall `json:"tool_calls,omitempty"`   // assistant tool invocations
 	ToolCallID string          `json:"tool_call_id,omitempty"` // for role=tool responses (OpenAI compat in Ollama)
 }
 
@@ -160,12 +160,12 @@ type agentChatResponse struct {
 	DoneReason string `json:"done_reason,omitempty"`
 
 	// Ollama performance metrics (nanoseconds)
-	TotalDuration    int64 `json:"total_duration,omitempty"`
-	LoadDuration     int64 `json:"load_duration,omitempty"`
-	PromptEvalCount  int   `json:"prompt_eval_count,omitempty"`
+	TotalDuration      int64 `json:"total_duration,omitempty"`
+	LoadDuration       int64 `json:"load_duration,omitempty"`
+	PromptEvalCount    int   `json:"prompt_eval_count,omitempty"`
 	PromptEvalDuration int64 `json:"prompt_eval_duration,omitempty"`
-	EvalCount        int   `json:"eval_count,omitempty"`
-	EvalDuration     int64 `json:"eval_duration,omitempty"`
+	EvalCount          int   `json:"eval_count,omitempty"`
+	EvalDuration       int64 `json:"eval_duration,omitempty"`
 }
 
 // --- Tool definition types ---
@@ -296,7 +296,7 @@ func (h *AgentHarness) Execute(ctx context.Context, systemPrompt, task string) (
 			Messages: messages,
 			Tools:    h.tools,
 			Stream:   false,
-			Think:    false, // disable thinking for tool loop
+			Think:    false,                                   // disable thinking for tool loop
 			Options:  map[string]interface{}{"num_ctx": 8192}, // 8K context for tool loop
 		}
 
@@ -446,4 +446,466 @@ func (h *AgentHarness) dispatchTool(ctx context.Context, tc agentToolCall) (json
 		return nil, fmt.Errorf("unknown tool: %s", tc.Function.Name)
 	}
 	return fn(ctx, json.RawMessage(tc.Function.Arguments))
+}
+
+// --- Phase 2: task-parameterized dispatch (cog_dispatch_to_harness) ---
+//
+// ExecuteScoped is the per-call variant of Execute that supports:
+//   - per-call tool subset (scope narrowing) without mutating h.tools
+//   - per-call backend override (LM Studio routing, custom model name)
+//   - per-call think-flag override (peer reasoning vs JSON discipline)
+//   - structured return: surfaces tool-call summaries + the respond-tool's
+//     content (when the agent invoked respond instead of emitting plain text)
+//
+// Background: a dispatch from the foveal Claude into the peripheral Gemma
+// swarm needs (a) deterministic tool envelope per role, (b) the actual user-
+// visible text the agent produced, and (c) enough trace metadata to debug
+// without touching the ledger. Execute returns "" when respond is the only
+// thing the agent did; ExecuteScoped fixes that by remembering the respond
+// argument's text and using it as the canonical Content.
+//
+// KV-cache discipline: each call rebuilds the messages slice fresh and posts
+// to Ollama with its own context — Ollama's KV cache is request-keyed by the
+// full prompt, so distinct dispatches don't collide. Concurrent calls are
+// safe; correctness comes from the freshness of the messages slice rather
+// than goroutine isolation.
+
+// ExecuteScopedOptions controls a single ExecuteScoped invocation. The zero
+// value behaves identically to Execute: harness defaults for system prompt,
+// tools, backend, and think flag.
+type ExecuteScopedOptions struct {
+	// SystemPrompt overrides the default system prompt for this call only.
+	// Empty string keeps the caller-supplied default.
+	SystemPrompt string
+
+	// AllowedTools, when non-empty, restricts the tool registry to names in
+	// the slice. Names not present in h.toolFuncs surface as
+	// ErrUnknownScopedTool. nil/empty uses the full default set.
+	AllowedTools []string
+
+	// BackendURL overrides h.ollamaURL for this call. Empty keeps the
+	// default. Must point at an OpenAI-compatible-or-Ollama-native chat
+	// endpoint; the dispatcher decides which family.
+	BackendURL string
+
+	// BackendKind selects how to talk to BackendURL: "ollama" (default,
+	// /api/chat) or "openai" (LM Studio, /v1/chat/completions).
+	BackendKind string
+
+	// Model overrides h.model for this call. Empty keeps the default.
+	Model string
+
+	// Thinking, when non-nil, overrides the think flag for this call.
+	Thinking *bool
+
+	// MaxTurns overrides h.maxTurns. Zero keeps the default.
+	MaxTurns int
+}
+
+// ErrUnknownScopedTool is returned by ExecuteScoped when AllowedTools
+// references a tool name that is not in the harness registry. Surfaces
+// as the per-slot Error in the dispatcher rather than a transport panic.
+var ErrUnknownScopedTool = fmt.Errorf("scoped tool not registered")
+
+// ExecuteScopedResult is the structured return from ExecuteScoped. Content
+// is the canonical user-visible string (the respond tool's text, or the
+// final assistant content if respond never ran), ToolCalls is the per-turn
+// summary, and Turns counts how many tool-loop iterations actually ran.
+type ExecuteScopedResult struct {
+	Content   string                       `json:"content"`
+	ToolCalls []ScopedExecuteToolCallEntry `json:"tool_calls"`
+	Turns     int                          `json:"turns"`
+}
+
+// ScopedExecuteToolCallEntry is one tool invocation observed in the loop,
+// truncated to keep result envelopes small.
+type ScopedExecuteToolCallEntry struct {
+	Name         string `json:"name"`
+	ArgsDigest   string `json:"args_digest,omitempty"`
+	ResultDigest string `json:"result_digest,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+// ExecuteScoped runs the tool loop with per-call overrides. See
+// ExecuteScopedOptions for what each field does. Returns the structured
+// result regardless of whether the model called respond or not.
+func (h *AgentHarness) ExecuteScoped(ctx context.Context, task string, opts ExecuteScopedOptions) (*ExecuteScopedResult, error) {
+	systemPrompt := opts.SystemPrompt
+	maxTurns := opts.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = h.maxTurns
+	}
+	think := false
+	if opts.Thinking != nil {
+		think = *opts.Thinking
+	}
+
+	// Build the per-call tool view. We keep two parallel structures: the
+	// allowed []ToolDefinition (sent to the model) and an allowed
+	// map[string]ToolFunc (used to dispatch by name). Both default to the
+	// harness's full registry when AllowedTools is empty.
+	allowedDefs, allowedFuncs, err := h.scopeTools(opts.AllowedTools)
+	if err != nil {
+		return nil, err
+	}
+
+	model := opts.Model
+	if model == "" {
+		model = h.model
+	}
+	backendURL := opts.BackendURL
+	if backendURL == "" {
+		backendURL = h.ollamaURL
+	}
+	backendKind := opts.BackendKind
+	if backendKind == "" {
+		backendKind = backendKindOllama
+	}
+
+	messages := []agentChatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: task},
+	}
+
+	result := &ExecuteScopedResult{}
+	respondContent := ""
+
+	for turn := 0; turn < maxTurns; turn++ {
+		req := agentChatRequest{
+			Model:    model,
+			Messages: messages,
+			Tools:    allowedDefs,
+			Stream:   false,
+			Think:    think,
+			Options:  map[string]interface{}{"num_ctx": 8192},
+		}
+
+		resp, err := h.chatCompletionTo(ctx, backendURL, backendKind, req)
+		if err != nil {
+			return result, fmt.Errorf("execute-scoped turn %d: %w", turn, err)
+		}
+		result.Turns = turn + 1
+
+		msg := resp.Message
+
+		// No tool calls — model is done. Use respondContent if we captured
+		// one earlier; otherwise the assistant's final content.
+		if len(msg.ToolCalls) == 0 {
+			if respondContent != "" {
+				result.Content = respondContent
+			} else {
+				result.Content = msg.Content
+			}
+			return result, nil
+		}
+
+		messages = append(messages, agentChatMessage{
+			Role:      "assistant",
+			ToolCalls: msg.ToolCalls,
+		})
+
+		var waitInvoked bool
+		var waitReason string
+		for _, tc := range msg.ToolCalls {
+			entry := ScopedExecuteToolCallEntry{
+				Name:       tc.Function.Name,
+				ArgsDigest: digestJSON(tc.Function.Arguments),
+			}
+
+			fn, ok := allowedFuncs[tc.Function.Name]
+			if !ok {
+				// Out-of-scope tool: tell the model it's not available
+				// without aborting the loop, and record the violation.
+				errMsg := fmt.Sprintf("tool %q is not in this dispatch's scope", tc.Function.Name)
+				entry.Error = errMsg
+				result.ToolCalls = append(result.ToolCalls, entry)
+				blocked := json.RawMessage(fmt.Sprintf(`{"error": %q}`, errMsg))
+				messages = append(messages, agentChatMessage{
+					Role:       "tool",
+					ToolCallID: tc.ID,
+					Content:    string(blocked),
+				})
+				continue
+			}
+
+			toolStart := time.Now()
+			toolResult, toolErr := fn(ctx, json.RawMessage(tc.Function.Arguments))
+			toolDuration := time.Since(toolStart)
+			if cycleID := cycleIDFromContext(ctx); cycleID != "" {
+				ev, bErr := trace.NewToolDispatch(
+					engine.TraceIdentity(),
+					cycleID,
+					tc.Function.Name,
+					tc.Function.Arguments,
+					toolDuration,
+					toolErr,
+				)
+				if bErr == nil {
+					emitCycleEvent(ev)
+				}
+			}
+			if toolErr != nil {
+				entry.Error = toolErr.Error()
+				toolResult = []byte(fmt.Sprintf(`{"error": %q}`, toolErr.Error()))
+			}
+			entry.ResultDigest = digestJSON(toolResult)
+
+			if tc.Function.Name == waitToolName {
+				waitInvoked = true
+				if r := extractWaitReason(toolResult); r != "" {
+					waitReason = r
+				}
+			}
+			if tc.Function.Name == respondToolName {
+				if t := extractRespondText(json.RawMessage(tc.Function.Arguments)); t != "" {
+					respondContent = t
+				}
+			}
+
+			result.ToolCalls = append(result.ToolCalls, entry)
+			messages = append(messages, agentChatMessage{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Content:    string(toolResult),
+			})
+		}
+
+		if waitInvoked {
+			if respondContent != "" {
+				result.Content = respondContent
+			} else if waitReason != "" {
+				result.Content = fmt.Sprintf("waited: %s", waitReason)
+			} else {
+				result.Content = "waited"
+			}
+			return result, nil
+		}
+	}
+
+	if respondContent != "" {
+		result.Content = respondContent
+		return result, nil
+	}
+	return result, fmt.Errorf("execute-scoped: hit max turns (%d) without completion", maxTurns)
+}
+
+// scopeTools returns the per-call tool view. Empty AllowedTools yields the
+// full default registry. Unknown names cause an error.
+func (h *AgentHarness) scopeTools(allowed []string) ([]ToolDefinition, map[string]ToolFunc, error) {
+	if len(allowed) == 0 {
+		return h.tools, h.toolFuncs, nil
+	}
+	defs := make([]ToolDefinition, 0, len(allowed))
+	funcs := make(map[string]ToolFunc, len(allowed))
+	for _, name := range allowed {
+		fn, ok := h.toolFuncs[name]
+		if !ok {
+			return nil, nil, fmt.Errorf("%w: %s", ErrUnknownScopedTool, name)
+		}
+		funcs[name] = fn
+		// Find the matching definition by name; toolFuncs and tools are
+		// kept in sync by RegisterTool, so the definition is guaranteed
+		// to exist when fn does.
+		for _, def := range h.tools {
+			if def.Function.Name == name {
+				defs = append(defs, def)
+				break
+			}
+		}
+	}
+	return defs, funcs, nil
+}
+
+// ToolNames returns the names of all currently-registered tools. Useful for
+// tests and for the dispatcher to validate AllowedTools without poking at
+// internals.
+func (h *AgentHarness) ToolNames() []string {
+	out := make([]string, 0, len(h.toolFuncs))
+	for name := range h.toolFuncs {
+		out = append(out, name)
+	}
+	return out
+}
+
+// extractRespondText pulls the "text" field from the respond tool's JSON
+// arguments. Returns "" on parse failure or empty text.
+func extractRespondText(args json.RawMessage) string {
+	if len(args) == 0 {
+		return ""
+	}
+	var p struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return ""
+	}
+	return p.Text
+}
+
+// digestJSON returns a short, log-safe view of a JSON value: trimmed of
+// surrounding whitespace and clipped to digestMaxBytes characters with an
+// ellipsis suffix when truncated. Returns "" for empty input.
+func digestJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	s := string(raw)
+	if len(s) > digestMaxBytes {
+		return s[:digestMaxBytes] + "..."
+	}
+	return s
+}
+
+// digestMaxBytes caps the per-field size in tool-call summaries so a single
+// dispatch result envelope stays well under any reasonable HTTP body limit
+// even with N=4 and 10 tool calls per slot.
+const digestMaxBytes = 200
+
+// backendKindOllama and backendKindOpenAI select which wire protocol
+// chatCompletionTo speaks. Ollama uses /api/chat with the native shape;
+// OpenAI uses /v1/chat/completions and a slightly different request/response.
+const (
+	backendKindOllama = "ollama"
+	backendKindOpenAI = "openai"
+)
+
+// chatCompletionTo is the per-call variant of chatCompletion: takes an
+// explicit backend URL and kind so a dispatch can route to LM Studio without
+// mutating h.ollamaURL. Ollama path is the existing /api/chat shape; OpenAI
+// path translates to /v1/chat/completions and back.
+func (h *AgentHarness) chatCompletionTo(ctx context.Context, backendURL, kind string, req agentChatRequest) (*agentChatResponse, error) {
+	if backendURL == "" {
+		backendURL = h.ollamaURL
+	}
+	if kind == "" {
+		kind = backendKindOllama
+	}
+	if kind == backendKindOpenAI {
+		return h.chatCompletionOpenAI(ctx, backendURL, req)
+	}
+	// Ollama native — same as chatCompletion but parameterized URL.
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, backendURL+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpResp, err := h.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("http request: %w", err)
+	}
+	defer httpResp.Body.Close()
+	respBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http %d: %s", httpResp.StatusCode, string(respBody))
+	}
+	var resp agentChatResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+	return &resp, nil
+}
+
+// chatCompletionOpenAI talks to a /v1/chat/completions endpoint (LM Studio,
+// vLLM, OpenAI proper). Translates the Ollama-shaped request into the
+// OpenAI shape and translates the response back. Tool-call ID and arguments
+// shape match the Ollama native format already, so the rest of the loop
+// doesn't need to know which backend served a turn.
+func (h *AgentHarness) chatCompletionOpenAI(ctx context.Context, backendURL string, req agentChatRequest) (*agentChatResponse, error) {
+	type openaiToolCallFn struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}
+	type openaiToolCall struct {
+		ID       string           `json:"id"`
+		Type     string           `json:"type"`
+		Function openaiToolCallFn `json:"function"`
+	}
+	type openaiMessage struct {
+		Role       string           `json:"role"`
+		Content    string           `json:"content,omitempty"`
+		ToolCalls  []openaiToolCall `json:"tool_calls,omitempty"`
+		ToolCallID string           `json:"tool_call_id,omitempty"`
+	}
+	type openaiRequest struct {
+		Model    string           `json:"model"`
+		Messages []openaiMessage  `json:"messages"`
+		Tools    []ToolDefinition `json:"tools,omitempty"`
+		Stream   bool             `json:"stream"`
+	}
+
+	// Translate request — flatten our agentChatMessage into openaiMessage.
+	// OpenAI's tool_calls.function.arguments is a JSON-encoded *string*,
+	// not a JSON object — re-encode as needed.
+	outMsgs := make([]openaiMessage, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		om := openaiMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
+		for _, tc := range m.ToolCalls {
+			om.ToolCalls = append(om.ToolCalls, openaiToolCall{
+				ID:   tc.ID,
+				Type: "function",
+				Function: openaiToolCallFn{
+					Name:      tc.Function.Name,
+					Arguments: string(tc.Function.Arguments),
+				},
+			})
+		}
+		outMsgs = append(outMsgs, om)
+	}
+	body, err := json.Marshal(openaiRequest{
+		Model:    req.Model,
+		Messages: outMsgs,
+		Tools:    req.Tools,
+		Stream:   false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal openai request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, backendURL+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create openai request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpResp, err := h.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("http openai request: %w", err)
+	}
+	defer httpResp.Body.Close()
+	respBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read openai response: %w", err)
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openai http %d: %s", httpResp.StatusCode, string(respBody))
+	}
+
+	// Translate response — OpenAI returns choices[0].message; flatten.
+	var rawResp struct {
+		Choices []struct {
+			Message openaiMessage `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(respBody, &rawResp); err != nil {
+		return nil, fmt.Errorf("parse openai response: %w", err)
+	}
+	out := &agentChatResponse{Done: true}
+	if len(rawResp.Choices) == 0 {
+		return out, nil
+	}
+	m := rawResp.Choices[0].Message
+	out.Message.Role = m.Role
+	out.Message.Content = m.Content
+	for _, tc := range m.ToolCalls {
+		ac := agentToolCall{ID: tc.ID, Type: "function"}
+		ac.Function.Name = tc.Function.Name
+		ac.Function.Arguments = json.RawMessage(tc.Function.Arguments)
+		out.Message.ToolCalls = append(out.Message.ToolCalls, ac)
+	}
+	return out, nil
 }
