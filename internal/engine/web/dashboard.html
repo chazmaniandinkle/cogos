@@ -1481,7 +1481,9 @@ let lastAutonomicHash = '';
 
 async function refreshAutonomicHistory() {
   try {
-    const res = await fetch(API + '/v1/bus/bus_kernel_proprio/events?limit=10&type=kernel.health.snapshot.v1');
+    // The endpoint returns events in seq-ascending order with no `order=desc` support.
+    // Fetch a wider window so we capture the latest activity, then sort + slice on the client.
+    const res = await fetch(API + '/v1/bus/bus_kernel_proprio/events?limit=200&type=kernel.health.snapshot.v1');
     if (!res.ok) return;
     const events = await res.json();
     // Only re-render if data changed (avoids collapsing open <details>)
@@ -1499,8 +1501,9 @@ function renderAutonomicHistory(events) {
     return;
   }
 
-  // Most recent first (server returns oldest-first within a bus)
-  const sorted = events.slice().sort((a, b) => b.ts.localeCompare(a.ts));
+  // Most recent first (server returns oldest-first within a bus). Cap to the
+  // last 10 visible rows; older history is on disk and queryable via tools.
+  const sorted = events.slice().sort((a, b) => b.ts.localeCompare(a.ts)).slice(0, 10);
 
   let html = '';
   for (const evt of sorted) {
