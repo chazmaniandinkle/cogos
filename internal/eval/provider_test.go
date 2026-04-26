@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 )
@@ -954,4 +955,55 @@ func actionSummary(actions []reconcile.Action) []string {
 		s = append(s, string(a.Action)+"/"+ea+":"+reason)
 	}
 	return s
+}
+
+// ---------------------------------------------------------------------------
+// TestIsBaselineStale: Bug 1 — verifies the 7-day staleness check is applied
+// ---------------------------------------------------------------------------
+
+func TestIsBaselineStale_NoPin(t *testing.T) {
+	exp := &Experiment{ID: "exp-001"}
+	pins := map[string]string{} // no pin set
+	if !isBaselineStale(exp, pins, "") {
+		t.Error("expected stale=true when no pin set")
+	}
+}
+
+func TestIsBaselineStale_PinSetRecentRun(t *testing.T) {
+	exp := &Experiment{ID: "exp-001"}
+	pins := map[string]string{"exp-001": "run-abc"}
+	// Recent run (1 hour ago) — should NOT be stale
+	recent := time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339)
+	if isBaselineStale(exp, pins, recent) {
+		t.Error("expected stale=false for recent run with pin set")
+	}
+}
+
+func TestIsBaselineStale_PinSetOldRun(t *testing.T) {
+	exp := &Experiment{ID: "exp-001"}
+	pins := map[string]string{"exp-001": "run-abc"}
+	// Old run (8 days ago) — should be stale
+	old := time.Now().UTC().Add(-8 * 24 * time.Hour).Format(time.RFC3339)
+	if !isBaselineStale(exp, pins, old) {
+		t.Error("expected stale=true for run older than 7 days with pin set")
+	}
+}
+
+func TestIsBaselineStale_PinSetNeverRun(t *testing.T) {
+	exp := &Experiment{ID: "exp-001"}
+	pins := map[string]string{"exp-001": "run-abc"}
+	// Pin set but latestRunAt="" means never run — should be stale
+	if !isBaselineStale(exp, pins, "") {
+		t.Error("expected stale=true when pin is set but no run has occurred")
+	}
+}
+
+func TestIsBaselineStale_PinSetBoundary(t *testing.T) {
+	exp := &Experiment{ID: "exp-001"}
+	pins := map[string]string{"exp-001": "run-abc"}
+	// Exactly at the boundary: 7 days - 1 minute ago, should NOT be stale
+	justUnder := time.Now().UTC().Add(-(7*24*time.Hour - time.Minute)).Format(time.RFC3339)
+	if isBaselineStale(exp, pins, justUnder) {
+		t.Error("expected stale=false for run just under 7 days ago")
+	}
 }
