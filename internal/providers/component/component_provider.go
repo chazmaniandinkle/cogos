@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	"github.com/cogos-dev/cogos/internal/workspace"
 	"github.com/cogos-dev/cogos/pkg/reconcile"
@@ -79,6 +80,24 @@ var (
 	// NowISO returns the current timestamp in ISO-8601 form.
 	NowISO func() string
 )
+
+// daemonWorkspaceRoot is injected by SetWorkspaceRoot at daemon boot so
+// Health() does not fall back to workspace.ResolveWorkspace() (whose DI seams
+// are not wired in cmd/cogos).
+var (
+	daemonWorkspaceRootMu sync.RWMutex
+	daemonWorkspaceRoot   string
+)
+
+// SetWorkspaceRoot injects the resolved workspace path into this package so
+// that Health() can resolve the component config path without depending on
+// workspace.ResolveWorkspace(). Called by engine.SetProvidersWorkspace
+// immediately after LoadConfig resolves cfg.WorkspaceRoot.
+func SetWorkspaceRoot(root string) {
+	daemonWorkspaceRootMu.Lock()
+	defer daemonWorkspaceRootMu.Unlock()
+	daemonWorkspaceRoot = root
+}
 
 // ComponentProvider implements reconcile.Reconcilable for workspace
 // component management.
@@ -336,6 +355,13 @@ func (c *ComponentProvider) BuildState(config any, live any, existing *reconcile
 // Health returns the current three-axis status of the component subsystem.
 func (c *ComponentProvider) Health() reconcile.ResourceStatus {
 	root := c.root
+	if root == "" {
+		// Prefer the daemon-injected root (set at boot by SetWorkspaceRoot) so
+		// the daemon binary does not need workspace.ResolveWorkspace's DI seams.
+		daemonWorkspaceRootMu.RLock()
+		root = daemonWorkspaceRoot
+		daemonWorkspaceRootMu.RUnlock()
+	}
 	if root == "" {
 		var err error
 		root, _, err = workspace.ResolveWorkspace()

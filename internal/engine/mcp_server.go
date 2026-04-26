@@ -137,6 +137,15 @@ func (m *MCPServer) Handler() http.Handler {
 	return m.handler
 }
 
+// Server returns the underlying *mcp.Server for use by extension hooks
+// (e.g. eval.RegisterEvalTools) that call mcp.AddTool directly.
+// Extensions must be registered before Handler() is first called — the
+// intended call site is RegisterMCPExtensions, which fires inside
+// registerMCPRoutes before h := mcpSrv.Handler().
+func (m *MCPServer) Server() *mcp.Server {
+	return m.server
+}
+
 // registerTools registers MCP tools.
 // Design: tools are actions with side effects or non-trivial computation.
 // Read-only state queries will migrate to MCP Resources in Phase 2.

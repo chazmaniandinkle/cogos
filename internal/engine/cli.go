@@ -172,6 +172,14 @@ func runServe(workspace string, port int, bindAddr string) {
 	upgradeLoggerWithFileSink(cfg)
 	slog.Info("config loaded", "workspace", cfg.WorkspaceRoot, "port", cfg.Port, "bind", cfg.BindAddr)
 
+	// Inject the resolved workspace root into daemon-side providers so their
+	// Health() implementations can perform real filesystem checks.
+	// SetProvidersWorkspace is set by cmd/cogos/providers_wire.go; nil in tests.
+	if SetProvidersWorkspace != nil {
+		SetProvidersWorkspace(cfg.WorkspaceRoot)
+		slog.Info("providers workspace wired", "workspace", cfg.WorkspaceRoot)
+	}
+
 	if reuse, msg, err := planServeState(cfg, checkDaemonHealth); err != nil {
 		slog.Error("daemon lifecycle failed", "err", err)
 		os.Exit(1)
