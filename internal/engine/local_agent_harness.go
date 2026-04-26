@@ -133,7 +133,13 @@ type LocalHarnessController struct {
 	lastModel       string
 	lastCycle       *localHarnessCycleRecord
 	lastLLMCycle    time.Time // wall-clock time of the last LLM assess call
-	history         []localHarnessCycleRecord
+	// lastEscalatedFingerprint is the snapshotFingerprint of the snapshot
+	// that last triggered an escalateDegradedHealth cycle. Used to suppress
+	// repeat escalations on stable degradation: the LLM has already seen
+	// this exact picture; only the idle re-checkin window should fire next.
+	// Cleared whenever the snapshot returns to AllGreen.
+	lastEscalatedFingerprint string
+	history                  []localHarnessCycleRecord
 }
 
 func NewLocalHarnessController(cfg *Config, nucleus *Nucleus, process *Process, mcpSrv *MCPServer) (*LocalHarnessController, error) {
@@ -222,9 +228,49 @@ func (c *LocalHarnessController) autonomicTick(ctx context.Context) {
 	// 4. Evaluate escalation predicate.
 	c.mu.RLock()
 	lastLLM := c.lastLLMCycle
+	lastFP := c.lastEscalatedFingerprint
 	c.mu.RUnlock()
 
+	// When the snapshot returns to all-green, clear the dedupe fingerprint
+	// so the next degradation (even if it's the same shape as before) is
+	// treated as a new event the LLM should see.
+	if snap.AllGreen() && lastFP != "" {
+		c.mu.Lock()
+		c.lastEscalatedFingerprint = ""
+		c.mu.Unlock()
+	}
+
 	reason := shouldEscalate(snap, triggerPending, lastLLM, c.autonomicCfg)
+
+	// Stable-degradation suppression. If the same provider population is in
+	// the same non-green buckets as the snapshot that last triggered an LLM
+	// cycle, don't keep waking the LLM every minute — the agent has already
+	// seen this picture. The 1h idle re-checkin remains the safety valve, so
+	// the agent does check back on the same problem periodically. Explicit
+	// triggers (TriggerAgent) and out-of-sync (real declared-vs-live drift)
+	// bypass dedupe — those are signals the operator wants surfaced.
+	if reason == escalateDegradedHealth && lastFP != "" {
+		fp := snapshotFingerprint(snap)
+		if fp == lastFP {
+			window := c.autonomicCfg.idleRecheckIn()
+			if !triggerPending && !lastLLM.IsZero() && time.Since(lastLLM) < window {
+				slog.Debug("autonomic: stable degradation, suppressing escalation",
+					"providers", len(snap.Providers),
+					"degraded", snap.Counts.Degraded,
+					"missing", snap.Counts.Missing,
+					"suspended", snap.Counts.Suspended,
+					"fingerprint", fp[:12],
+				)
+				return
+			}
+			// Window has elapsed — fall through to escalation. Reframe the
+			// reason so the log reflects what's actually happening: the LLM
+			// is checking back on a stable problem, not seeing it for the
+			// first time.
+			reason = escalateIdleRecheckIn
+		}
+	}
+
 	if reason == "" {
 		// All green, no trigger, idle window not elapsed — pure deterministic tick.
 		slog.Debug("autonomic: tick complete, no escalation",
@@ -241,6 +287,19 @@ func (c *LocalHarnessController) autonomicTick(ctx context.Context) {
 		"missing", snap.Counts.Missing,
 	)
 	c.tryStartCycle(string(reason), 0, nil)
+
+	// Record the fingerprint so the next tick can suppress a repeat of the
+	// same degradation. Only update on degraded_health escalations: idle
+	// recheckins, explicit triggers, and out-of-sync don't represent "the
+	// LLM has seen this degradation."
+	if reason == escalateDegradedHealth {
+		fp := snapshotFingerprint(snap)
+		if fp != "" {
+			c.mu.Lock()
+			c.lastEscalatedFingerprint = fp
+			c.mu.Unlock()
+		}
+	}
 }
 
 func (c *LocalHarnessController) tryStartCycle(reason string, triggerSeq int64, waiter chan<- localHarnessCycleOutcome) bool {

@@ -18,9 +18,12 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/cogos-dev/cogos/pkg/reconcile"
@@ -210,6 +213,38 @@ func emitHealthSnapshot(ctx context.Context, mgr *BusSessionManager, snap Kernel
 	if _, err := mgr.AppendEvent(autonomicBusChannel, autonomicEventType, autonomicEventFrom, payload); err != nil {
 		slog.Warn("autonomic: failed to emit health snapshot to bus", "channel", autonomicBusChannel, "err", err)
 	}
+}
+
+// snapshotFingerprint returns a deterministic hash of the per-provider health
+// shape (name, Health, Sync) sorted by name. Two snapshots with the same
+// fingerprint represent the same provider population in the same buckets —
+// the caller can treat them as the same event for the purpose of suppressing
+// repeat LLM escalation. Operation and Message are intentionally excluded:
+// Operation transitions are short-lived and Message often carries timestamps
+// or counters that would defeat the dedupe.
+//
+// Returns "" when the snapshot has no providers (an empty registry has no
+// degradation to dedupe).
+func snapshotFingerprint(snap KernelHealthSnapshot) string {
+	if len(snap.Providers) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(snap.Providers))
+	for n := range snap.Providers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	h := sha256.New()
+	for _, n := range names {
+		st := snap.Providers[n]
+		h.Write([]byte(n))
+		h.Write([]byte{'|'})
+		h.Write([]byte(st.Health))
+		h.Write([]byte{'|'})
+		h.Write([]byte(st.Sync))
+		h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // snapshotToPayload serialises KernelHealthSnapshot into the map[string]any

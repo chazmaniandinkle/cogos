@@ -492,6 +492,232 @@ func TestAutonomicTickerIdleWindowNotElapsed(t *testing.T) {
 	})
 }
 
+// --- snapshotFingerprint + dedupe tests ------------------------------------
+
+func TestSnapshotFingerprint_StableOrderIndependent(t *testing.T) {
+	a := KernelHealthSnapshot{Providers: map[string]reconcile.ResourceStatus{
+		"alpha": {Health: reconcile.HealthHealthy, Sync: reconcile.SyncStatusSynced},
+		"beta":  {Health: reconcile.HealthDegraded, Sync: reconcile.SyncStatusOutOfSync},
+	}}
+	b := KernelHealthSnapshot{Providers: map[string]reconcile.ResourceStatus{
+		"beta":  {Health: reconcile.HealthDegraded, Sync: reconcile.SyncStatusOutOfSync},
+		"alpha": {Health: reconcile.HealthHealthy, Sync: reconcile.SyncStatusSynced},
+	}}
+	if snapshotFingerprint(a) != snapshotFingerprint(b) {
+		t.Error("fingerprint should be order-independent")
+	}
+}
+
+func TestSnapshotFingerprint_DiffersOnHealthFlip(t *testing.T) {
+	a := KernelHealthSnapshot{Providers: map[string]reconcile.ResourceStatus{
+		"x": {Health: reconcile.HealthHealthy, Sync: reconcile.SyncStatusSynced},
+	}}
+	b := KernelHealthSnapshot{Providers: map[string]reconcile.ResourceStatus{
+		"x": {Health: reconcile.HealthDegraded, Sync: reconcile.SyncStatusSynced},
+	}}
+	if snapshotFingerprint(a) == snapshotFingerprint(b) {
+		t.Error("fingerprint should differ when Health bucket changes")
+	}
+}
+
+func TestSnapshotFingerprint_DiffersOnProviderAddRemove(t *testing.T) {
+	one := KernelHealthSnapshot{Providers: map[string]reconcile.ResourceStatus{
+		"x": {Health: reconcile.HealthHealthy, Sync: reconcile.SyncStatusSynced},
+	}}
+	two := KernelHealthSnapshot{Providers: map[string]reconcile.ResourceStatus{
+		"x": {Health: reconcile.HealthHealthy, Sync: reconcile.SyncStatusSynced},
+		"y": {Health: reconcile.HealthHealthy, Sync: reconcile.SyncStatusSynced},
+	}}
+	if snapshotFingerprint(one) == snapshotFingerprint(two) {
+		t.Error("fingerprint should differ when a new provider appears")
+	}
+}
+
+func TestSnapshotFingerprint_StableAcrossOperationFlip(t *testing.T) {
+	// Operation transitions are short-lived and not load-bearing for the
+	// dedupe contract — fingerprint should be stable across them.
+	a := KernelHealthSnapshot{Providers: map[string]reconcile.ResourceStatus{
+		"x": {Health: reconcile.HealthHealthy, Sync: reconcile.SyncStatusSynced, Operation: reconcile.OperationIdle},
+	}}
+	b := KernelHealthSnapshot{Providers: map[string]reconcile.ResourceStatus{
+		"x": {Health: reconcile.HealthHealthy, Sync: reconcile.SyncStatusSynced, Operation: reconcile.OperationSyncing},
+	}}
+	if snapshotFingerprint(a) != snapshotFingerprint(b) {
+		t.Error("fingerprint should be stable across Operation transitions")
+	}
+}
+
+func TestSnapshotFingerprint_EmptyRegistry(t *testing.T) {
+	if got := snapshotFingerprint(KernelHealthSnapshot{}); got != "" {
+		t.Errorf("empty registry: expected empty fingerprint, got %q", got)
+	}
+}
+
+// TestAutonomicTick_DedupeStableDegradationSuppresses verifies the core
+// contract: when the same provider population is in the same non-green
+// buckets as the snapshot that last triggered an LLM cycle (and the idle
+// re-checkin window has not elapsed), autonomicTick suppresses escalation.
+// We simulate "we already escalated for this picture" by pre-arming
+// lastEscalatedFingerprint and a recent lastLLMCycle, then asserting that
+// running stays false (no cycle goroutine spawned).
+func TestAutonomicTick_DedupeStableDegradationSuppresses(t *testing.T) {
+	providers := []*stubProvider{
+		{name: "ok", status: greenStatus()},
+		{name: "broken", status: reconcile.ResourceStatus{
+			Sync:    reconcile.SyncStatusOutOfSync,
+			Health:  reconcile.HealthDegraded,
+			Message: "stable degradation",
+		}},
+	}
+
+	withProviders(t, providers, func() {
+		root := makeWorkspace(t)
+		cfg := makeConfig(t, root)
+		cfg.LocalModel = "gemma4:e4b"
+		proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+		srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+
+		ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+		if err != nil {
+			t.Fatalf("NewLocalHarnessController: %v", err)
+		}
+
+		// Compute the fingerprint the upcoming tick will see.
+		snap := buildKernelHealthSnapshot(context.Background())
+		fp := snapshotFingerprint(snap)
+		if fp == "" {
+			t.Fatal("expected non-empty fingerprint for two-provider snap")
+		}
+
+		// Pre-arm: the LLM has already seen this exact picture, recently.
+		ctrl.mu.Lock()
+		ctrl.lastEscalatedFingerprint = fp
+		ctrl.lastLLMCycle = time.Now().UTC()
+		ctrl.mu.Unlock()
+		ctrl.autonomicCfg = AutonomicConfig{IdleRecheckIn: time.Hour}
+
+		ctrl.autonomicTick(context.Background())
+
+		// Suppression happens before tryStartCycle, so running must remain false.
+		if ctrl.running.Load() {
+			t.Error("expected running=false after stable-degradation tick was suppressed")
+		}
+	})
+}
+
+// TestAutonomicTick_DedupeFiresOnHealthChange verifies that when the
+// degradation shape CHANGES (a provider transitions to a new non-green
+// bucket), suppression releases and the LLM is re-escalated.
+func TestAutonomicTick_DedupeFiresOnHealthChange(t *testing.T) {
+	providers := []*stubProvider{
+		{name: "ok", status: greenStatus()},
+		{name: "shifty", status: reconcile.ResourceStatus{
+			Sync:   reconcile.SyncStatusOutOfSync,
+			Health: reconcile.HealthDegraded,
+		}},
+	}
+
+	withProviders(t, providers, func() {
+		root := makeWorkspace(t)
+		cfg := makeConfig(t, root)
+		cfg.LocalModel = "gemma4:e4b"
+		proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+		srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+
+		ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+		if err != nil {
+			t.Fatalf("NewLocalHarnessController: %v", err)
+		}
+
+		// Pre-arm with a fingerprint that does NOT match the current snapshot
+		// (simulates "previous degradation was different from current").
+		ctrl.mu.Lock()
+		ctrl.lastEscalatedFingerprint = "stale-fingerprint-from-before"
+		ctrl.lastLLMCycle = time.Now().UTC()
+		ctrl.mu.Unlock()
+		ctrl.autonomicCfg = AutonomicConfig{IdleRecheckIn: time.Hour}
+
+		// Reason returned by shouldEscalate will be escalateDegradedHealth, but
+		// dedupe sees the saved fingerprint doesn't match → escalation proceeds.
+		// running flips to true under tryStartCycle's CompareAndSwap.
+		ctrl.autonomicTick(context.Background())
+
+		// Wait briefly for the cycle goroutine to be observed as running. It may
+		// finish quickly without an LLM mock, but it should at least start.
+		started := false
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if ctrl.running.Load() {
+				started = true
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		// The cycle goroutine may have already errored out and reset running.
+		// Verify EITHER running was observed true, OR the saved fingerprint
+		// has been updated to the new snapshot's fingerprint (proof that the
+		// post-escalation update path executed).
+		ctrl.mu.RLock()
+		newFP := ctrl.lastEscalatedFingerprint
+		ctrl.mu.RUnlock()
+		expectedFP := snapshotFingerprint(buildKernelHealthSnapshot(context.Background()))
+		if !started && newFP != expectedFP {
+			t.Errorf("expected escalation to fire on changed fingerprint: started=%v newFP=%q expected=%q",
+				started, newFP, expectedFP)
+		}
+
+		// Wait for the cycle to settle so we don't leak a goroutine into the next test.
+		settleDeadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(settleDeadline) {
+			if !ctrl.running.Load() {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
+}
+
+// TestAutonomicTick_DedupeReleasesOnReturnToGreen verifies that when the
+// snapshot returns to AllGreen, the saved fingerprint is cleared so a
+// later degradation re-escalates (rather than being suppressed against a
+// stale fingerprint).
+func TestAutonomicTick_DedupeReleasesOnReturnToGreen(t *testing.T) {
+	providers := []*stubProvider{
+		{name: "ok", status: greenStatus()},
+	}
+
+	withProviders(t, providers, func() {
+		root := makeWorkspace(t)
+		cfg := makeConfig(t, root)
+		cfg.LocalModel = "gemma4:e4b"
+		proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+		srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+
+		ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+		if err != nil {
+			t.Fatalf("NewLocalHarnessController: %v", err)
+		}
+
+		// Pre-arm a stale fingerprint (from a previous degradation cycle).
+		// Set lastLLMCycle recent so idle_recheckin doesn't fire.
+		ctrl.mu.Lock()
+		ctrl.lastEscalatedFingerprint = "stale-from-previous-degradation"
+		ctrl.lastLLMCycle = time.Now().UTC()
+		ctrl.mu.Unlock()
+		ctrl.autonomicCfg = AutonomicConfig{IdleRecheckIn: time.Hour}
+
+		ctrl.autonomicTick(context.Background())
+
+		// Snapshot is all-green, so the fingerprint should be cleared.
+		ctrl.mu.RLock()
+		fp := ctrl.lastEscalatedFingerprint
+		ctrl.mu.RUnlock()
+		if fp != "" {
+			t.Errorf("expected fingerprint cleared on return-to-green, got %q", fp)
+		}
+	})
+}
+
 // --- snapshotToPayload unit test -------------------------------------------
 
 func TestSnapshotToPayload_Roundtrip(t *testing.T) {
