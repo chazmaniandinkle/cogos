@@ -249,6 +249,9 @@ func runServe(workspace string, port int, bindAddr string) {
 		if err != nil {
 			slog.Warn("local harness disabled", "err", err)
 		} else {
+			// Wire the bus layer so each tick emits a KernelHealthSnapshot
+			// to bus_kernel_proprio. This is optional — nil is a safe no-op.
+			ctrl.SetBusSessionManager(server.busSessions)
 			server.SetAgentController(ctrl)
 			ctrl.Start(ctx)
 			slog.Info("local harness started", "agent_id", DefaultAgentID, "interval", ctrl.interval.String())
