@@ -19,9 +19,15 @@ package main
 import (
 	"time"
 
+	"github.com/cogos-dev/cogos/internal/engine"
 	"github.com/cogos-dev/cogos/internal/eval"
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 )
+
+// evalProviderInstance is the singleton EvalProvider registered with the
+// reconcile registry. The same instance is passed to RegisterEvalTools so
+// the MCP tools share state (root path, dispatcher) with the reconcile loop.
+var evalProviderInstance = eval.New(nil, nil, nil)
 
 func init() {
 	// Wire the NowISO dependency so EvalProvider uses the same timestamp
@@ -39,5 +45,13 @@ func init() {
 
 	// Register the eval provider with the reconcile registry.
 	// The provider's Reconcilable methods are now fully implemented (Phase C).
-	reconcile.RegisterProvider("eval", eval.New(nil, nil, nil))
+	reconcile.RegisterProvider("eval", evalProviderInstance)
+
+	// Register the four eval MCP tools (cog_run_experiment, cog_list_experiments,
+	// cog_get_experiment_status, cog_pin_baseline) via the engine's MCP extension
+	// hook. This is called once when registerMCPRoutes builds the MCP server,
+	// so the same evalProviderInstance that the reconcile loop uses is passed in.
+	engine.RegisterMCPExtensions = func(srv *engine.MCPServer) {
+		eval.RegisterEvalTools(srv.Server(), evalProviderInstance)
+	}
 }
