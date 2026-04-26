@@ -25,8 +25,6 @@ package eval
 
 import (
 	"context"
-	"errors"
-	"time"
 
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 )
@@ -514,6 +512,9 @@ type EvalProvider struct {
 	emitter BusEmitter
 	// reader reads cogdoc files. Set by boot path.
 	reader CogdocReader
+	// busReader reads events from bus_tournament. Added in Phase C for FetchLive.
+	// May be nil when the kernel is not running; FetchLive degrades gracefully.
+	busReader BusReader
 	// lastHealth is the cached health status, updated on each reconcile cycle.
 	lastHealth reconcile.ResourceStatus
 }
@@ -530,200 +531,41 @@ var (
 	NowISO func() string
 )
 
+// New constructs an EvalProvider with the given dependencies.
+// Any dependency may be nil; the provider degrades gracefully.
+// This is the preferred constructor over the NewEvalProvider function variable.
+func New(dispatcher AgentDispatcher, emitter BusEmitter, reader CogdocReader) *EvalProvider {
+	return &EvalProvider{
+		dispatcher: dispatcher,
+		emitter:    emitter,
+		lastHealth: reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusUnknown,
+			Health:    reconcile.HealthMissing,
+			Operation: reconcile.OperationIdle,
+			Message:   "eval provider not yet reconciled",
+		},
+	}
+}
+
+// NewWithReader constructs an EvalProvider with a BusReader for FetchLive.
+// The reader reads bus events; the emitter sends them.
+func NewWithReader(dispatcher AgentDispatcher, emitter BusEmitter, reader CogdocReader, busReader BusReader) *EvalProvider {
+	p := New(dispatcher, emitter, reader)
+	p.busReader = busReader
+	return p
+}
+
 // Type returns the resource type identifier. Satisfies reconcile.Reconcilable.
 func (e *EvalProvider) Type() string { return "eval" }
 
-// LoadConfig loads the declared eval configuration from the workspace.
-//
-// What it reads:
-//  1. All .cog.md files under the tournament experiments directory
-//     (resolved from workspace root as
-//     .cog/mem/semantic/architecture/tournament/experiments/ via uri.go
-//     "mem" projection — see uri.go line 51).
-//  2. Baseline pin state from .cog/state/eval-baselines.json
-//     (JSON file with map[experiment_id]run_id — see design memo Q1).
-//
-// Returns *EvalConfig. Callers must type-assert: config.(*EvalConfig).
-//
-// TODO(Phase C): implement via CogdocReader.GlobCogdocs +
-// CogdocReader.ReadCogdoc; parse YAML frontmatter to populate
-// Experiment.VariantAxes, TaskIDs, AutoReconcile, etc.
-// Mirror the Python logic in evals/tournament/variants.py load_variants()
-// and evals/tournament/matrix.py load_experiment_from_cogdoc().
-func (e *EvalProvider) LoadConfig(root string) (any, error) {
-	e.root = root
-	// TODO(Phase C): enumerate experiment cogdocs via CogdocReader.GlobCogdocs
-	// with prefix "<root>/.cog/mem/semantic/architecture/tournament/experiments/".
-	// Parse each .cog.md frontmatter into an Experiment struct.
-	// Load baseline pins from "<root>/.cog/state/eval-baselines.json" if present.
-	return nil, errors.New("TODO: LoadConfig not implemented — Phase C skeleton")
-}
-
-// FetchLive fetches the current live state from bus_tournament.
-//
-// What it reads:
-//   - All CogBlock events on bus_tournament (channel carrying tournament.trial.v1
-//     and tournament.experiment.v1 blocks, emitted by ApplyPlan via BusEmitter).
-//   - Read window: all-time (re-materialized per reconcile cycle). The channel's
-//     retention policy governs eviction independently.
-//
-// The scorecard for each experiment is computed inline from the fetched trials.
-// Returns *EvalLiveState. Callers must type-assert: live.(*EvalLiveState).
-//
-// TODO(Phase C): implement via BusEmitter's read path (or a companion
-// BusReader interface for reading vs emitting). Deserialize TrialRecord from
-// each event payload. Call buildScorecard() per experiment.
-// See evals/tournament/compare.py build_scorecard() for the aggregation logic.
-func (e *EvalProvider) FetchLive(ctx context.Context, config any) (any, error) {
-	// TODO(Phase C): read bus_tournament events, deserialize TrialRecords,
-	// group by experiment_id, build Scorecard per experiment.
-	return nil, errors.New("TODO: FetchLive not implemented — Phase C skeleton")
-}
-
-// ComputePlan compares declared experiments against completed trial data and
-// produces a reconciliation plan.
-//
-// Planning rules (in priority order):
-//  1. No runs for this experiment → EvalActionRun (full matrix expansion at apply time)
-//  2. New variant axis cells since last run → EvalActionRunIncremental (only new cells)
-//  3. Pinned baseline is stale (> 7 days old, or run_id missing) → EvalActionRefreshBaseline
-//  4. Regression detected (pass rate drop > 10pp vs pinned baseline) → EvalActionRetryRegression
-//  5. In-flight trials (EvalProviderState.InFlightTrialIDs non-empty) → EvalActionSkip (wait)
-//  6. Circuit breaker tripped (RecentFailureCounts[id] > threshold) → EvalActionSkip (suspended)
-//  7. AutoReconcile=false and no explicit trigger → EvalActionSkip (on-demand only)
-//  8. Experiment is current and healthy → EvalActionSkip (in sync)
-//
-// Returns a reconcile.Plan with ResourceType "eval". Each reconcile.Action
-// carries a Details map with EvalPlanDetail fields serialized as map[string]any.
-//
-// TODO(Phase C): implement the planning rules listed above. Parse EvalProviderState
-// from state.Metadata["eval_state"] using encoding/json. Use the Python
-// compare.py regression_check() logic (compare.py lines 174-199) as the
-// regression detection reference.
-func (e *EvalProvider) ComputePlan(config any, live any, state *reconcile.State) (*reconcile.Plan, error) {
-	// TODO(Phase C): implement planning rules.
-	// cfg := config.(*EvalConfig)
-	// ls := live.(*EvalLiveState)
-	// eps := parseEvalProviderState(state)
-	// For each experiment in cfg.Experiments:
-	//   determine action using priority rules above
-	//   append reconcile.Action with EvalPlanDetail in Details
-	return nil, errors.New("TODO: ComputePlan not implemented — Phase C skeleton")
-}
-
-// ApplyPlan executes planned eval actions.
-//
-// For each action in plan.Actions:
-//   - EvalActionRun: expand full trial matrix, dispatch trials sequentially
-//     (Ollama single-thread constraint — see feedback_ollama_single_thread_constraint.md),
-//     emit TrialRecord CogBlocks via BusEmitter to bus_tournament after each trial.
-//   - EvalActionRunIncremental: dispatch only the TrialSpecs in action.Details.
-//   - EvalActionRefreshBaseline: re-run baseline cells, update baseline pin.
-//   - EvalActionRetryRegression: re-run regressed cells from action.Details.
-//   - EvalActionSkip: emit a reconcile.Result with ApplySkipped, no dispatch.
-//
-// Trial dispatch granularity: one trial at a time, returning to ComputePlan
-// between each (fine-grain — see design memo Q4). This allows interruption and
-// drift detection mid-run. ApplyPlan is called once per reconcile cycle; the
-// per-cycle budget limits how many trials run before the next cycle checks state.
-//
-// Concurrency: ApplyPlan must acquire an eval-scoped mutex before dispatching
-// to Ollama. The metabolic cycle ticker also uses Ollama (see
-// feedback_ollama_single_thread_constraint.md). Recommended: eval reconciliation
-// holds a per-cycle budget (e.g. 3 trials/cycle) and releases the mutex between
-// trials so the metabolic ticker can run (see design memo Q5).
-//
-// TODO(Phase C): implement dispatch loop. Use e.dispatcher.DispatchToHarness()
-// per trial. Call e.emitter.EmitCogBlock("bus_tournament", record) after each.
-// Track in-flight trial IDs in EvalProviderState for the next cycle.
-// Mirror the Python runner loop in evals/tournament/runner.py run_experiment()
-// (runner.py lines 187-338).
-func (e *EvalProvider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]reconcile.Result, error) {
-	// TODO(Phase C): implement dispatch loop.
-	return nil, errors.New("TODO: ApplyPlan not implemented — Phase C skeleton")
-}
-
-// BuildState constructs reconcile state from live trial data (for snapshot/import).
-//
-// What it stores in the state:
-//   - One reconcile.Resource per experiment, carrying:
-//     Address: "eval.<experiment_id>"
-//     ExternalID: latest run ID (or "" if no runs yet)
-//     Attributes: map with trial_count, pass_rate, last_run_at, baseline_pinned
-//   - EvalProviderState in state.Metadata["eval_state"] (JSON-encoded).
-//
-// TODO(Phase C): implement by iterating live.(*EvalLiveState).Scorecards,
-// building reconcile.Resource per experiment. Pattern mirrors
-// component_provider.go BuildState() (component_provider.go lines 293-334).
-func (e *EvalProvider) BuildState(config any, live any, existing *reconcile.State) (*reconcile.State, error) {
-	// TODO(Phase C): implement state construction.
-	// ls := live.(*EvalLiveState)
-	// cfg := config.(*EvalConfig)
-	return nil, errors.New("TODO: BuildState not implemented — Phase C skeleton")
-}
-
-// Health returns the current three-axis status of the eval subsystem.
-//
-// Health axes:
-//   - Sync: OutOfSync if any AutoReconcile experiments have pending runs;
-//     Synced if all declared experiments have recent runs or are on-demand only.
-//   - Health: Degraded if any experiment has tripped its circuit breaker;
-//     Progressing if any trials are in flight;
-//     Healthy otherwise.
-//   - Operation: Syncing when trials are in flight; Idle otherwise.
-//
-// Message carries a summary: "N pending, M in-flight, K suspended".
-//
-// TODO(Phase C): implement by reading e.lastHealth (updated at end of each
-// ApplyPlan call) and optionally doing a lightweight cogdoc scan to check
-// for newly declared experiments.
-func (e *EvalProvider) Health() reconcile.ResourceStatus {
-	// TODO(Phase C): implement health computation.
-	// Return cached e.lastHealth if available; otherwise return Unknown.
-	return reconcile.ResourceStatus{
-		Sync:      reconcile.SyncStatusUnknown,
-		Health:    reconcile.HealthMissing,
-		Operation: reconcile.OperationIdle,
-		Message:   "eval provider not yet wired (Phase C skeleton)",
-	}
-}
-
 // ---------------------------------------------------------------------------
-// Internal helpers (stubs — implement in Phase C)
-// ---------------------------------------------------------------------------
-
-// nowISO delegates to the wired NowISO function, falling back to a sentinel.
-// Pattern mirrors component_provider.go nowISO() (lines 390-396).
-func nowISO() string {
-	if NowISO != nil {
-		return NowISO()
-	}
-	return time.Now().UTC().Format(time.RFC3339)
-}
-
-// parseEvalProviderState deserializes EvalProviderState from reconcile.State.Metadata.
-// Returns a zero-value EvalProviderState if the key is absent or unparseable.
-//
-// TODO(Phase C): implement using encoding/json.Unmarshal on
-// state.Metadata["eval_state"]. The Metadata field is map[string]any, so
-// re-serialize the value to JSON first (it may have been round-tripped through
-// interface{}).
-func parseEvalProviderState(_ *reconcile.State) EvalProviderState {
-	return EvalProviderState{
-		CircuitBreakerThreshold: 3,
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Registration guard
+// Method implementations
 // ---------------------------------------------------------------------------
 //
-// DO NOT uncomment the init() below until Phase C is formally shipped and
-// all Reconcilable methods are implemented.
+// Phase C: All Reconcilable method bodies are implemented in provider_impl.go.
+// Internal helpers (nowISO, parseEvalProviderState, buildScorecard, etc.) also
+// live there. This file provides the type definitions and constructors only.
 //
-// When ready, add:
-//   func init() {
-//       reconcile.RegisterProvider("eval", &EvalProvider{})
-//   }
-//
-// See component_provider.go line 91 for the registration pattern.
+// Registration: The eval provider is registered with pkg/reconcile by
+// eval_wiring.go (workspace root main package init) following the pattern
+// from component_wiring.go.
