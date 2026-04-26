@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os/exec"
 	"strings"
@@ -134,15 +135,26 @@ func (p *ClaudeCodeProvider) Ping(ctx context.Context) (time.Duration, error) {
 }
 
 // Complete sends a prompt and waits for the full response.
+// It uses stream-json internally so that tool_use events emitted by the
+// subprocess are captured and returned in CompletionResponse.ToolCalls.
 func (p *ClaudeCodeProvider) Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error) {
 	start := time.Now()
 
 	prompt := p.buildPrompt(req)
 	args := p.buildArgs(req)
-	args = append(args, "--output-format", "json")
+	args = append(args,
+		"--output-format", "stream-json",
+		"--verbose",
+		"--include-partial-messages",
+	)
 
 	cmd := exec.CommandContext(ctx, p.cliBinary, args...)
 	cmd.Stdin = strings.NewReader(prompt)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
 
 	proc := p.procMgr.Track(cmd, ManagedProcessOpts{
 		Kind:   ProcessForeground,
@@ -150,34 +162,74 @@ func (p *ClaudeCodeProvider) Complete(ctx context.Context, req *CompletionReques
 	})
 	defer p.procMgr.Remove(proc.ID)
 
-	out, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("cancelled: %w", ctx.Err())
-		}
-		return nil, fmt.Errorf("claude exited with error: %w", err)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start claude: %w", err)
 	}
 
-	var result ccResult
-	if err := json.Unmarshal(out, &result); err != nil {
-		return nil, fmt.Errorf("parse claude output: %w", err)
+	content, toolCalls, usage, stopReason, parseErr := p.drainStreamJSON(stdout)
+
+	if waitErr := cmd.Wait(); waitErr != nil && ctx.Err() != nil {
+		return nil, fmt.Errorf("cancelled: %w", ctx.Err())
 	}
 
-	if result.IsError {
-		return nil, fmt.Errorf("claude error: %s", result.Result)
+	if parseErr != nil {
+		return nil, parseErr
 	}
 
-	usage := p.extractUsage(&result)
-	return &CompletionResponse{
-		Content:    result.Result,
-		StopReason: result.StopReason,
+	resp := &CompletionResponse{
+		Content:    content,
+		ToolCalls:  toolCalls,
+		StopReason: stopReason,
 		Usage:      usage,
 		ProviderMeta: ProviderMeta{
 			Provider: p.name,
-			Model:    p.resolveModel(&result),
+			Model:    p.model,
 			Latency:  time.Since(start),
 		},
-	}, nil
+	}
+	return resp, nil
+}
+
+// drainStreamJSON reads NDJSON lines from r and aggregates them into a
+// complete response. It returns the accumulated text content, any tool calls
+// that were emitted (finalized at content_block_stop), the token usage from
+// the result message, the stop reason, and any parse error.
+func (p *ClaudeCodeProvider) drainStreamJSON(r io.Reader) (content string, toolCalls []ToolCall, usage TokenUsage, stopReason string, err error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+
+	state := newCCStreamState()
+	var sb strings.Builder
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		chunk, done := p.parseStreamLine(line, state)
+		if chunk != nil {
+			if chunk.Error != nil {
+				return "", nil, TokenUsage{}, "", chunk.Error
+			}
+			if chunk.Delta != "" {
+				sb.WriteString(chunk.Delta)
+			}
+			if chunk.Done && chunk.Usage != nil {
+				usage = *chunk.Usage
+			}
+		}
+		if done {
+			if chunk != nil {
+				stopReason = chunk.StopReason
+			}
+			break
+		}
+	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		return "", nil, TokenUsage{}, "", fmt.Errorf("scan stream: %w", scanErr)
+	}
+
+	return sb.String(), state.done, usage, state.stopReason, nil
 }
 
 // Stream spawns a claude process and returns incremental chunks.
@@ -219,13 +271,15 @@ func (p *ClaudeCodeProvider) Stream(ctx context.Context, req *CompletionRequest)
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 256*1024), 256*1024) // 256KB line buffer
 
+		state := newCCStreamState()
+
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			if len(line) == 0 {
 				continue
 			}
 
-			chunk, done := p.parseStreamLine(line)
+			chunk, done := p.parseStreamLine(line, state)
 			if chunk != nil {
 				select {
 				case ch <- *chunk:
@@ -411,17 +465,48 @@ type ccResult struct {
 
 // ccStreamEvent wraps an Anthropic SSE event inside stream-json output.
 type ccStreamEvent struct {
-	Type  string `json:"type"` // content_block_delta, message_delta, message_stop, etc.
+	Type  string `json:"type"` // content_block_start, content_block_delta, content_block_stop, message_delta, etc.
 	Index int    `json:"index"`
+	// ContentBlock is populated for content_block_start events.
+	ContentBlock struct {
+		Type string `json:"type"` // "text" or "tool_use"
+		ID   string `json:"id"`   // tool call id (tool_use only)
+		Name string `json:"name"` // tool name (tool_use only)
+	} `json:"content_block"`
+	// Delta is populated for content_block_delta events.
 	Delta struct {
-		Type string `json:"type"` // text_delta, input_json_delta
-		Text string `json:"text"`
+		Type      string `json:"type"`       // "text_delta" or "input_json_delta"
+		Text      string `json:"text"`       // populated for text_delta
+		PartialJSON string `json:"partial_json"` // populated for input_json_delta
 	} `json:"delta"`
 }
 
+// partialToolCall accumulates streamed tool_use content block data.
+type partialToolCall struct {
+	id   string
+	name string
+	args strings.Builder
+}
+
+// ccStreamState holds mutable state across a sequence of parseStreamLine calls.
+type ccStreamState struct {
+	// pending maps content_block index → in-progress tool call.
+	pending map[int]*partialToolCall
+	// done is the list of finalized tool calls.
+	done []ToolCall
+	// stopReason from the result message.
+	stopReason string
+}
+
+func newCCStreamState() *ccStreamState {
+	return &ccStreamState{pending: make(map[int]*partialToolCall)}
+}
+
 // parseStreamLine parses a single NDJSON line from claude's stream output.
-// Returns a StreamChunk (or nil if the line should be skipped) and whether this is the final line.
-func (p *ClaudeCodeProvider) parseStreamLine(line []byte) (*StreamChunk, bool) {
+// State carries mutable tool-call aggregation across calls; pass the same
+// pointer for every line in a stream. Returns a StreamChunk (or nil if the
+// line should be skipped) and whether this is the final line.
+func (p *ClaudeCodeProvider) parseStreamLine(line []byte, state *ccStreamState) (*StreamChunk, bool) {
 	var msg ccStreamMessage
 	if err := json.Unmarshal(line, &msg); err != nil {
 		slog.Debug("claudecode: unparseable stream line", "err", err)
@@ -434,16 +519,68 @@ func (p *ClaudeCodeProvider) parseStreamLine(line []byte) (*StreamChunk, bool) {
 		if err := json.Unmarshal(msg.Event, &evt); err != nil {
 			return nil, false
 		}
-		if evt.Delta.Type == "text_delta" && evt.Delta.Text != "" {
-			return &StreamChunk{Delta: evt.Delta.Text}, false
+
+		switch evt.Type {
+		case "content_block_start":
+			if evt.ContentBlock.Type == "tool_use" {
+				state.pending[evt.Index] = &partialToolCall{
+					id:   evt.ContentBlock.ID,
+					name: evt.ContentBlock.Name,
+				}
+				return &StreamChunk{
+					ToolCallDelta: &ToolCallDelta{
+						Index: evt.Index,
+						ID:    evt.ContentBlock.ID,
+						Name:  evt.ContentBlock.Name,
+					},
+				}, false
+			}
+			return nil, false
+
+		case "content_block_delta":
+			switch evt.Delta.Type {
+			case "text_delta":
+				if evt.Delta.Text != "" {
+					return &StreamChunk{Delta: evt.Delta.Text}, false
+				}
+			case "input_json_delta":
+				if ptc, ok := state.pending[evt.Index]; ok && evt.Delta.PartialJSON != "" {
+					ptc.args.WriteString(evt.Delta.PartialJSON)
+					return &StreamChunk{
+						ToolCallDelta: &ToolCallDelta{
+							Index:     evt.Index,
+							ArgsDelta: evt.Delta.PartialJSON,
+						},
+					}, false
+				}
+			}
+			return nil, false
+
+		case "content_block_stop":
+			// Finalize any pending tool call at this index.
+			if ptc, ok := state.pending[evt.Index]; ok {
+				state.done = append(state.done, ToolCall{
+					ID:        ptc.id,
+					Name:      ptc.name,
+					Arguments: ptc.args.String(),
+				})
+				delete(state.pending, evt.Index)
+			}
+			return nil, false
+
+		default:
+			return nil, false
 		}
-		return nil, false
 
 	case "result":
+		if state != nil {
+			state.stopReason = msg.StopReason
+		}
 		usage := p.extractUsageFromRaw(msg.Usage)
 		chunk := &StreamChunk{
-			Done:  true,
-			Usage: &usage,
+			Done:       true,
+			StopReason: msg.StopReason,
+			Usage:      &usage,
 			ProviderMeta: &ProviderMeta{
 				Provider: p.name,
 				Model:    p.model,
