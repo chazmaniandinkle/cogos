@@ -109,16 +109,27 @@ type DispatchRequest struct {
 	Thinking       *bool
 }
 
+// DispatchToolCallSummary is a shape copy of internal/engine.DispatchToolCallSummary
+// (agent_dispatch.go lines 98-103). Carries the digest of one tool invocation.
+type DispatchToolCallSummary struct {
+	Name         string `json:"name"`
+	ArgsDigest   string `json:"args_digest,omitempty"`
+	ResultDigest string `json:"result_digest,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
 // DispatchResult is a shape copy of internal/engine.DispatchResult
-// (agent_dispatch.go lines 105-119).
+// (agent_dispatch.go lines 107-119). ToolCalls carries per-invocation summaries
+// populated by the harness; extractToolCallNamesFromContent reads these.
 type DispatchResult struct {
-	Index       int     `json:"index"`
-	Success     bool    `json:"success"`
-	Content     string  `json:"content,omitempty"`
-	Error       string  `json:"error,omitempty"`
-	DurationSec float64 `json:"duration_sec"`
-	Turns       int     `json:"turns"`
-	ModelUsed   string  `json:"model_used,omitempty"`
+	Index       int                       `json:"index"`
+	Success     bool                      `json:"success"`
+	Content     string                    `json:"content,omitempty"`
+	ToolCalls   []DispatchToolCallSummary `json:"tool_calls,omitempty"`
+	Error       string                    `json:"error,omitempty"`
+	DurationSec float64                   `json:"duration_sec"`
+	Turns       int                       `json:"turns"`
+	ModelUsed   string                    `json:"model_used,omitempty"`
 }
 
 // DispatchBatchResult is a shape copy of internal/engine.DispatchBatchResult

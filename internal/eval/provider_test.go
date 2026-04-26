@@ -965,6 +965,121 @@ func actionSummary(actions []reconcile.Action) []string {
 // TestWriteDispatchTrigger / TestComputePlan_DispatchTrigger: Bug 2
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TestExtractToolCallNamesFromResult: Bug 3 — tool call extraction
+// ---------------------------------------------------------------------------
+
+func TestExtractToolCallNamesFromResult_WithToolCalls(t *testing.T) {
+	dr := DispatchResult{
+		Index:   0,
+		Success: true,
+		Content: "done",
+		ToolCalls: []DispatchToolCallSummary{
+			{Name: "cog_get_state", ArgsDigest: "abc"},
+			{Name: "cog_read_cogdoc", ArgsDigest: "def"},
+		},
+	}
+	names := extractToolCallNamesFromResult(dr)
+	if len(names) != 2 {
+		t.Fatalf("expected 2 names, got %v", names)
+	}
+	if names[0] != "cog_get_state" || names[1] != "cog_read_cogdoc" {
+		t.Errorf("unexpected names: %v", names)
+	}
+}
+
+func TestExtractToolCallNamesFromResult_NoToolCalls(t *testing.T) {
+	dr := DispatchResult{Index: 0, Success: true, Content: "done"}
+	names := extractToolCallNamesFromResult(dr)
+	if names != nil {
+		t.Errorf("expected nil for empty tool calls, got %v", names)
+	}
+}
+
+func TestExtractToolCallNamesFromResult_EmptyNames(t *testing.T) {
+	// ToolCalls present but all names empty — should return nil
+	dr := DispatchResult{
+		ToolCalls: []DispatchToolCallSummary{{Name: ""}, {Name: ""}},
+	}
+	names := extractToolCallNamesFromResult(dr)
+	if names != nil {
+		t.Errorf("expected nil when all names are empty, got %v", names)
+	}
+}
+
+func TestApplyPlan_ToolCallsReachRubric(t *testing.T) {
+	// Verify that DispatchResult.ToolCalls flow into the rubric scorer.
+	// The trial should PASS because cog_get_state appears in the result.
+	emitter := &stubEmitter{}
+	dispatcher := &stubDispatcher{
+		results: []DispatchResult{{
+			Index:   0,
+			Success: true,
+			Content: "state retrieved",
+			ToolCalls: []DispatchToolCallSummary{
+				{Name: "cog_get_state"},
+			},
+		}},
+	}
+	p := buildTestProvider(dispatcher, emitter, nil)
+	p.root = t.TempDir()
+
+	specsJSON, _ := json.Marshal([]TrialSpec{{
+		TrialID:      "exp-tc__sp-1+td-1__task-1",
+		ExperimentID: "exp-tc",
+		TaskVariant: Variant{
+			ID:    "task-1",
+			Class: "task",
+			Content: map[string]interface{}{
+				"prompt": "Call cog_get_state",
+				"rubric": map[string]interface{}{
+					"expected_tools": []interface{}{"cog_get_state"},
+				},
+			},
+		},
+		VariantIDs: map[string]string{"system_prompt": "sp-1", "tool_description": "td-1"},
+		Target:     "test",
+	}})
+	var specsAny interface{}
+	_ = json.Unmarshal(specsJSON, &specsAny)
+
+	plan := &reconcile.Plan{
+		ResourceType: "eval",
+		Actions: []reconcile.Action{{
+			Action:       reconcile.ActionCreate,
+			ResourceType: "eval",
+			Name:         "eval.exp-tc",
+			Details: map[string]any{
+				"experiment_id": "exp-tc",
+				"eval_action":   string(EvalActionRunIncremental),
+				"trial_specs":   specsAny,
+			},
+		}},
+	}
+
+	results, err := p.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("no results")
+	}
+	if results[0].Status == reconcile.ApplyFailed {
+		t.Errorf("trial failed (tool call rubric not satisfied): %s", results[0].Error)
+	}
+	// The trial must have passed (cog_get_state present in ToolCalls)
+	if len(emitter.emitted) == 0 {
+		t.Fatal("no CogBlock emitted")
+	}
+	trialRaw := emitter.emitted[0]["trial"]
+	b, _ := json.Marshal(trialRaw)
+	var tr TrialRecord
+	_ = json.Unmarshal(b, &tr)
+	if !tr.Passed {
+		t.Errorf("trial should have passed (cog_get_state in expected_tools), failures: %v", tr.Failures)
+	}
+}
+
 func TestWriteDispatchTrigger_CreatesFile(t *testing.T) {
 	dir := t.TempDir()
 	if err := writeDispatchTrigger(dir, "exp-001", false); err != nil {
