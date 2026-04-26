@@ -996,9 +996,10 @@ func (e *EvalProvider) runTrial(ctx context.Context, spec TrialSpec) (*TrialReco
 
 	dr := result.Results[0]
 
-	// Extract tool calls from the result content (simplified — real implementation
-	// would parse from result metadata)
-	toolCallNames := extractToolCallNamesFromContent(dr.Content)
+	// Extract tool call names from the structured ToolCalls field populated by
+	// the harness. This replaces the old content-parsing stub which always
+	// returned nil, breaking all tool-call rubric assertions.
+	toolCallNames := extractToolCallNamesFromResult(dr)
 	scored := NewDispatchScoredResult(dr, toolCallNames)
 	verdict := Score(rubric, scored)
 
@@ -1079,11 +1080,23 @@ func toStringSlice(v interface{}) []string {
 	return nil
 }
 
-// extractToolCallNamesFromContent is a stub — in a real implementation, tool
-// call names would come from structured metadata in the dispatch result.
-// For now, return empty (the kernel returns them in a structured field).
-func extractToolCallNamesFromContent(_ string) []string {
-	return nil
+// extractToolCallNamesFromResult extracts tool call names from a DispatchResult.
+// The harness populates DispatchResult.ToolCalls with per-invocation summaries;
+// each summary carries the Name field. Returns nil if no tool calls were made.
+func extractToolCallNamesFromResult(dr DispatchResult) []string {
+	if len(dr.ToolCalls) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(dr.ToolCalls))
+	for _, tc := range dr.ToolCalls {
+		if tc.Name != "" {
+			names = append(names, tc.Name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
 }
 
 // extractTrialSpecsFromDetail extracts TrialSpec objects from action.Details.
