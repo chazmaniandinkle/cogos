@@ -81,14 +81,19 @@ func makeRunExperimentHandler(p *EvalProvider) mcp.ToolHandlerFor[runExperimentI
 			return evalErrorResult(fmt.Sprintf("experiment %q not found", input.ExperimentID)), nil, nil
 		}
 
-		// Set dispatch trigger in a way that ComputePlan can read via state metadata.
-		// In a live system this would update state.Metadata["dispatch_triggers"] atomically.
-		// For Phase C, we return the trigger intent — the next reconcile cycle picks it up.
+		// Write a dispatch trigger so ComputePlan picks it up on the next cycle.
+		// Mirrors the writePinBaseline pattern: persist to a JSON sidecar in
+		// .cog/state/ so the trigger survives across the MCP→reconcile boundary.
+		if err := writeDispatchTrigger(p.root, input.ExperimentID, input.Force); err != nil {
+			return evalErrorResult(fmt.Sprintf("write dispatch trigger: %v", err)), nil, nil
+		}
+
 		resp := map[string]any{
 			"ok":            true,
 			"experiment_id": input.ExperimentID,
 			"message":       fmt.Sprintf("experiment %q queued for next reconcile cycle", input.ExperimentID),
 			"force":         input.Force,
+			"trigger_file":  "eval-dispatch-triggers.json",
 		}
 		b, _ := json.Marshal(resp)
 		return &mcp.CallToolResult{
@@ -330,6 +335,56 @@ func makePinBaselineHandler(p *EvalProvider) mcp.ToolHandlerFor[pinBaselineInput
 			Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
 		}, resp, nil
 	}
+}
+
+// writeDispatchTrigger records an on-demand experiment trigger in
+// .cog/state/eval-dispatch-triggers.json. The map value is "force" (bool).
+// ComputePlan calls readAndClearDispatchTriggers() to consume and atomically
+// remove entries so they fire exactly once.
+func writeDispatchTrigger(root, experimentID string, force bool) error {
+	stateDir := filepath.Join(root, ".cog", "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", stateDir, err)
+	}
+
+	triggersPath := filepath.Join(stateDir, "eval-dispatch-triggers.json")
+	triggers := map[string]bool{}
+
+	if data, err := os.ReadFile(triggersPath); err == nil {
+		_ = json.Unmarshal(data, &triggers) // ignore parse errors — start fresh
+	}
+
+	// A force=true trigger takes priority; never downgrade from force to non-force.
+	if existing, ok := triggers[experimentID]; !ok || force && !existing {
+		triggers[experimentID] = force
+	}
+
+	b, err := json.MarshalIndent(triggers, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(triggersPath, b, 0o644)
+}
+
+// readAndClearDispatchTriggers reads the pending trigger file and clears it.
+// Returns map[experimentID]force. The file is removed (not just emptied) so
+// a missing file is the normal steady state. Called by ComputePlan before
+// rule evaluation.
+func readAndClearDispatchTriggers(root string) map[string]bool {
+	triggersPath := filepath.Join(root, ".cog", "state", "eval-dispatch-triggers.json")
+	data, err := os.ReadFile(triggersPath)
+	if err != nil {
+		return map[string]bool{} // no triggers pending
+	}
+
+	triggers := map[string]bool{}
+	_ = json.Unmarshal(data, &triggers)
+
+	// Clear the file atomically — write an empty map so a partial read can't
+	// see stale triggers on the next cycle. Ignore write errors (best-effort).
+	_ = os.WriteFile(triggersPath, []byte("{}"), 0o644)
+
+	return triggers
 }
 
 // writePinBaseline writes a baseline pin to .cog/state/eval-baselines.json.

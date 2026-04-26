@@ -480,6 +480,18 @@ func (e *EvalProvider) ComputePlan(config any, live any, state *reconcile.State)
 		}
 	}
 
+	// Merge in triggers from the sidecar file written by cog_run_experiment.
+	// This bridges the MCP-tool invocation → reconcile-cycle gap. The file is
+	// cleared by readAndClearDispatchTriggers so each trigger fires exactly once.
+	if e.root != "" {
+		for expID, force := range readAndClearDispatchTriggers(e.root) {
+			dispatchTriggers[expID] = true
+			if force {
+				forcedExperiments[expID] = true
+			}
+		}
+	}
+
 	var actions []reconcile.Action
 	summary := reconcile.Summary{}
 

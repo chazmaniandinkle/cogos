@@ -961,6 +961,89 @@ func actionSummary(actions []reconcile.Action) []string {
 // TestIsBaselineStale: Bug 1 — verifies the 7-day staleness check is applied
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TestWriteDispatchTrigger / TestComputePlan_DispatchTrigger: Bug 2
+// ---------------------------------------------------------------------------
+
+func TestWriteDispatchTrigger_CreatesFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeDispatchTrigger(dir, "exp-001", false); err != nil {
+		t.Fatalf("writeDispatchTrigger: %v", err)
+	}
+
+	triggers := readAndClearDispatchTriggers(dir)
+	if !triggers["exp-001"] && triggers["exp-001"] != false {
+		// key must be present (false = non-force trigger)
+	}
+	if _, ok := triggers["exp-001"]; !ok {
+		t.Error("expected exp-001 key in triggers")
+	}
+}
+
+func TestWriteDispatchTrigger_ForceUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	// Write non-force first
+	_ = writeDispatchTrigger(dir, "exp-001", false)
+	// Upgrade to force
+	_ = writeDispatchTrigger(dir, "exp-001", true)
+	triggers := readAndClearDispatchTriggers(dir)
+	if !triggers["exp-001"] {
+		t.Error("expected force=true after upgrade")
+	}
+}
+
+func TestReadAndClearDispatchTriggers_ClearsFile(t *testing.T) {
+	dir := t.TempDir()
+	_ = writeDispatchTrigger(dir, "exp-001", false)
+	// First read consumes the trigger
+	triggers1 := readAndClearDispatchTriggers(dir)
+	if _, ok := triggers1["exp-001"]; !ok {
+		t.Error("expected trigger on first read")
+	}
+	// Second read should find no triggers (file cleared)
+	triggers2 := readAndClearDispatchTriggers(dir)
+	if _, ok := triggers2["exp-001"]; ok {
+		t.Error("expected trigger cleared after first read")
+	}
+}
+
+func TestComputePlan_DispatchTriggerFromFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a trigger for exp-001
+	if err := writeDispatchTrigger(dir, "exp-001", false); err != nil {
+		t.Fatalf("writeDispatchTrigger: %v", err)
+	}
+
+	p := buildTestProvider(nil, nil, nil)
+	p.root = dir
+
+	cfg := &EvalConfig{
+		Experiments: map[string]*Experiment{
+			"exp-001": {
+				ID:            "exp-001",
+				AutoReconcile: false, // on-demand only — needs trigger
+				TaskIDs:       []string{"task-1"},
+				VariantAxes:   map[string][]string{"system_prompt": {"sp-1"}},
+				Target:        "test",
+			},
+		},
+		BaselinePins: map[string]string{},
+	}
+	ls := &EvalLiveState{Scorecards: map[string]*Scorecard{}}
+
+	plan, err := p.ComputePlan(cfg, ls, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+
+	// Should have a non-skip action for exp-001 (trigger overrides auto_reconcile=false)
+	actions := filterNonSkip(plan.Actions)
+	if len(actions) == 0 {
+		t.Errorf("expected non-skip action when trigger is set, got all skips: %v", actionSummary(plan.Actions))
+	}
+}
+
 func TestIsBaselineStale_NoPin(t *testing.T) {
 	exp := &Experiment{ID: "exp-001"}
 	pins := map[string]string{} // no pin set
