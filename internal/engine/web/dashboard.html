@@ -595,6 +595,14 @@ body {
             <div class="pred-graph-empty">No turns recorded yet</div>
           </div>
         </div>
+
+        <!-- Autonomic History -->
+        <div class="proprio-section">
+          <div class="proprio-section-title">Autonomic History</div>
+          <div id="proprio-autonomic-history" style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto">
+            <div class="pred-graph-empty">No autonomic snapshots yet</div>
+          </div>
+        </div>
       </div>
 
       <div class="panel-section" id="tab-decompose">
@@ -1451,6 +1459,7 @@ document.querySelectorAll('.panel-tab').forEach(tab => {
   tab.addEventListener('click', () => {
     if (tab.dataset.tab === 'proprio') {
       refreshProprioceptive();
+      refreshAutonomicHistory();
     }
   });
 });
@@ -1464,6 +1473,113 @@ function startProprioPolling() {
       refreshProprioceptive();
     }
   }, 10000);
+}
+
+// ── Autonomic History ──
+let autonomicRefreshTimer = null;
+let lastAutonomicHash = '';
+
+async function refreshAutonomicHistory() {
+  try {
+    const res = await fetch(API + '/v1/bus/bus_kernel_proprio/events?limit=10&type=kernel.health.snapshot.v1');
+    if (!res.ok) return;
+    const events = await res.json();
+    // Only re-render if data changed (avoids collapsing open <details>)
+    const hash = JSON.stringify((events || []).map(e => e.seq + ':' + e.ts));
+    if (hash === lastAutonomicHash) return;
+    lastAutonomicHash = hash;
+    renderAutonomicHistory(events || []);
+  } catch {}
+}
+
+function renderAutonomicHistory(events) {
+  const container = document.getElementById('proprio-autonomic-history');
+  if (!events || events.length === 0) {
+    container.innerHTML = '<div class="pred-graph-empty">No autonomic snapshots yet</div>';
+    return;
+  }
+
+  // Most recent first (server returns oldest-first within a bus)
+  const sorted = events.slice().sort((a, b) => b.ts.localeCompare(a.ts));
+
+  let html = '';
+  for (const evt of sorted) {
+    const p = evt.payload || {};
+    const counts = p.counts || {};
+    const providers = p.providers || {};
+    const ts = evt.ts ? new Date(evt.ts) : null;
+    const ago = ts ? timeSince(ts) + ' ago' : '--';
+    const total = (counts.healthy || 0) + (counts.degraded || 0) + (counts.missing || 0) + (counts.suspended || 0);
+    const allGreen = (counts.degraded || 0) === 0 && (counts.missing || 0) === 0 && (counts.suspended || 0) === 0;
+
+    // Count non-healthy providers for summary
+    const unhealthy = Object.entries(providers).filter(([, s]) => s.health !== 'Healthy');
+
+    // Summary line color: green if all-green, yellow if degraded/missing/suspended
+    const summaryColor = allGreen ? 'var(--green)' : 'var(--yellow)';
+
+    // Compose the summary badge text
+    let badge = `${total} provider${total !== 1 ? 's' : ''}`;
+    if (allGreen) {
+      badge += ` — all healthy`;
+    } else {
+      const parts = [];
+      if (counts.healthy) parts.push(`${counts.healthy} healthy`);
+      if (counts.degraded) parts.push(`${counts.degraded} degraded`);
+      if (counts.missing) parts.push(`${counts.missing} missing`);
+      if (counts.suspended) parts.push(`${counts.suspended} suspended`);
+      badge += ' — ' + parts.join(', ');
+    }
+
+    // Escalation reason lives on payload as escalation_reason (not emitted yet
+    // by autonomic_ticker, but guard defensively)
+    const reason = p.escalation_reason ? ` · <span style="color:var(--orange)">${esc(p.escalation_reason)}</span>` : '';
+
+    html += `<details style="margin-bottom:6px;border-left:2px solid ${summaryColor};padding-left:6px">`;
+    html += `<summary style="cursor:pointer;color:var(--text)">`;
+    html += `<span style="color:var(--text-dim);font-size:10px">${ago}</span>`;
+    html += ` <span style="color:${summaryColor}">${badge}</span>`;
+    html += reason;
+    html += `</summary>`;
+    html += `<div style="margin-top:6px;padding:4px;background:var(--bg-surface);border-radius:3px">`;
+
+    if (unhealthy.length > 0) {
+      // Table header
+      html += `<div style="display:grid;grid-template-columns:1fr 60px 80px 60px 1fr;gap:2px 8px;color:var(--text-dim);font-size:10px;border-bottom:1px solid var(--border);padding-bottom:2px;margin-bottom:4px">`;
+      html += `<span>Provider</span><span>Sync</span><span>Health</span><span>Op</span><span>Note</span>`;
+      html += `</div>`;
+      for (const [name, st] of unhealthy) {
+        const hColor = st.health === 'Degraded' ? 'var(--red)' : st.health === 'Missing' ? 'var(--yellow)' : st.health === 'Suspended' ? 'var(--text-dim)' : 'var(--text)';
+        const sColor = st.sync === 'OutOfSync' ? 'var(--yellow)' : 'var(--text-dim)';
+        html += `<div style="display:grid;grid-template-columns:1fr 60px 80px 60px 1fr;gap:2px 8px;font-size:10px;color:var(--text);padding:1px 0">`;
+        html += `<span>${esc(name)}</span>`;
+        html += `<span style="color:${sColor}">${esc(st.sync || '--')}</span>`;
+        html += `<span style="color:${hColor}">${esc(st.health || '--')}</span>`;
+        html += `<span style="color:var(--text-dim)">${esc(st.operation || '--')}</span>`;
+        html += `<span style="color:var(--text-dim)">${esc(st.message || '')}</span>`;
+        html += `</div>`;
+      }
+    }
+
+    if (counts.healthy > 0) {
+      html += `<div style="margin-top:4px;color:var(--text-dim);font-size:10px">(${counts.healthy} other${counts.healthy !== 1 ? 's' : ''} healthy)</div>`;
+    }
+
+    html += `</div></details>`;
+  }
+
+  container.innerHTML = html;
+}
+
+function startAutonomicPolling() {
+  if (autonomicRefreshTimer) return;
+  refreshAutonomicHistory(); // immediate first fetch
+  autonomicRefreshTimer = setInterval(() => {
+    const tab = document.querySelector('.panel-tab[data-tab="proprio"]');
+    if (tab && tab.classList.contains('active')) {
+      refreshAutonomicHistory();
+    }
+  }, 65000);
 }
 
 // ── Decomposition Panel ──
@@ -1807,6 +1923,7 @@ function startAgentPolling() {
 pollHealth();
 setInterval(pollHealth, 5000);
 startProprioPolling();
+startAutonomicPolling();
 startDecompPolling();
 startAgentPolling();
 inputEl.focus();
