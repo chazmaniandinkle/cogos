@@ -42,6 +42,7 @@ const (
 	BlockProject   = "project"   // CLAUDE.md content
 	BlockKnowledge = "knowledge" // Foveated CogDocs
 	BlockNode      = "node"      // Sibling service health
+	BlockHealth    = "health"    // Reconcilable provider health (substrate proprioception)
 	BlockField     = "field"     // Attentional field top-N
 	BlockEvents    = "events"    // Recent ledger events
 	BlockFocus     = "focus"     // Current anchor/intent
@@ -53,6 +54,7 @@ var DefaultTiers = map[string]int{
 	BlockProject:   0, // Always present (CLAUDE.md)
 	BlockKnowledge: 1, // Priority — foveated docs
 	BlockNode:      2, // Flexible — node health
+	BlockHealth:    2, // Flexible — Reconcilable proprioception
 	BlockField:     2, // Flexible — attentional field
 	BlockEvents:    2, // Flexible — recent events
 	BlockFocus:     2, // Flexible — anchor/intent
@@ -64,6 +66,7 @@ var DefaultStability = map[string]int{
 	BlockProject:   90, // CLAUDE.md rarely changes
 	BlockKnowledge: 30, // Changes every turn based on query
 	BlockNode:      70, // Changes on 60s heartbeat
+	BlockHealth:    60, // Changes when Reconcilable plan/apply state shifts
 	BlockField:     40, // Changes as salience shifts
 	BlockEvents:    20, // Changes every turn
 	BlockFocus:     10, // Changes every turn

@@ -210,6 +210,14 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 		frame.Blocks = append(frame.Blocks, *blk)
 	}
 
+	// Tier 2, stability 60: Substrate proprioception (Reconcilable health).
+	// This is the return path that closes the sensorium → cognitive substrate
+	// loop — the kernel's body-state surfacing into the agent's foveated
+	// context. Cheap by design: per-provider Health() with timeout.
+	if blk := buildHealthBlock(r.Context()); blk != nil {
+		frame.Blocks = append(frame.Blocks, *blk)
+	}
+
 	// Tier 2, stability 40: Attentional field top-10
 	if blk := buildFieldBlock(s.process, s.cfg.WorkspaceRoot); blk != nil {
 		frame.Blocks = append(frame.Blocks, *blk)
