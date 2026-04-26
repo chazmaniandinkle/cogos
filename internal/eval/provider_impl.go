@@ -553,7 +553,14 @@ func (e *EvalProvider) ComputePlan(config any, live any, state *reconcile.State)
 		}
 
 		// Rule 3: stale baseline — run full refresh if baseline pin is stale/missing
-		if isBaselineStale(exp, cfg.BaselinePins) {
+		// Compute the latest run timestamp for this experiment from live trials.
+		latestRunAt := ""
+		for _, tr := range ls.Trials {
+			if tr.ExperimentID == expID && tr.Timestamp > latestRunAt {
+				latestRunAt = tr.Timestamp
+			}
+		}
+		if isBaselineStale(exp, cfg.BaselinePins, latestRunAt) {
 			additiveActions = append(additiveActions, evalAction(expID, EvalActionRefreshBaseline, EvalPlanDetail{
 				ExperimentID: expID,
 				EvalAction:   EvalActionRefreshBaseline,
@@ -734,11 +741,26 @@ func baselineVariantKey(bv string) string {
 	return bv
 }
 
-// isBaselineStale returns true if the experiment's baseline pin is missing or older
-// than baselineStaleDays.
-func isBaselineStale(exp *Experiment, pins map[string]string) bool {
+// isBaselineStale returns true if the experiment's baseline pin is missing, or
+// if the pin is set but no trial has run within baselineStaleDays days.
+// latestRunAt is the ISO-8601 timestamp of the most recent trial for this
+// experiment (empty string = never run).
+func isBaselineStale(exp *Experiment, pins map[string]string, latestRunAt string) bool {
 	pin := pins[exp.ID]
-	return pin == ""
+	if pin == "" {
+		return true
+	}
+	// Pin is set — check whether any run happened within the staleness window.
+	if latestRunAt == "" {
+		// Pinned but never run — treat as stale so a fresh baseline can be gathered.
+		return true
+	}
+	ts, err := time.Parse(time.RFC3339, latestRunAt)
+	if err != nil {
+		// Unparseable timestamp — treat as stale rather than silently suppress.
+		return true
+	}
+	return time.Since(ts) > baselineStaleDays*24*time.Hour
 }
 
 // buildTrialSpecsForCells constructs TrialSpec objects for the given (variantKey, taskID) cells.
