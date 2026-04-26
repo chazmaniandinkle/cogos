@@ -10,18 +10,24 @@
 //
 // This package provides daemon-safe provider structs whose Health()
 // implementations replicate the workspace-root logic using only importable
-// packages (os, filepath, pkg/reconcile, internal/workspace).
+// packages (os, filepath, pkg/reconcile).
 // The non-health methods (LoadConfig, FetchLive, ComputePlan, ApplyPlan,
 // BuildState) return errors — the daemon only exercises Health() through the
 // proprioception block.
+//
+// Workspace context is injected at boot via SetWorkspaceRoot(), called by
+// engine.SetProvidersWorkspace after LoadConfig resolves cfg.WorkspaceRoot.
+// This avoids the workspace.ResolveWorkspace() dependency-injection seams
+// (LoadConfig/GitRoot func vars) that are only wired in the cog CLI's main
+// package, not in cmd/cogos.
 //
 // The component provider is already fully extracted to
 // internal/providers/component and is wired here via blank import.
 // The other seven are implemented as minimal structs below.
 //
-// cmd/cogos/providers_wire.go blank-imports this package so its init()
-// runs at daemon boot, completing the registration before the HTTP server
-// starts.
+// cmd/cogos/providers_wire.go imports this package (triggering init()) and
+// wires both engine.RegisterProviders and engine.SetProvidersWorkspace so
+// the full seam is operational before the HTTP server starts serving requests.
 package daemon
 
 import (
@@ -29,13 +35,37 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
-	"github.com/cogos-dev/cogos/internal/workspace"
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 
 	// Trigger internal/providers/component's init() which registers "component".
 	_ "github.com/cogos-dev/cogos/internal/providers/component"
 )
+
+// workspaceRoot is set at daemon boot by SetWorkspaceRoot (called from
+// engine.SetProvidersWorkspace after LoadConfig resolves the workspace path).
+// It is read by resolveRoot() on every Health() probe. Zero value means
+// "not yet wired" — callers get a clear error rather than a silent bad result.
+var (
+	workspaceRootMu sync.RWMutex
+	workspaceRoot   string
+)
+
+// SetWorkspaceRoot injects the resolved workspace path into this package so
+// that all daemon-side provider Health() implementations can resolve their
+// filesystem checks without depending on workspace.ResolveWorkspace(), whose
+// dependency-injection seams (LoadConfig/GitRoot) are not wired in the
+// cmd/cogos binary.
+//
+// Must be called before any provider Health() invocation — engine.runServe()
+// calls it via engine.SetProvidersWorkspace immediately after LoadConfig
+// resolves cfg.WorkspaceRoot.
+func SetWorkspaceRoot(root string) {
+	workspaceRootMu.Lock()
+	defer workspaceRootMu.Unlock()
+	workspaceRoot = root
+}
 
 func init() {
 	reconcile.RegisterProvider("agent", &agentProvider{})
@@ -47,15 +77,19 @@ func init() {
 	reconcile.RegisterProvider("service", &serviceProvider{})
 }
 
-// resolveRoot returns workspace root or an error status.
+// resolveRoot returns the workspace root or an error status.
+// It reads the package-level workspaceRoot set by SetWorkspaceRoot, bypassing
+// workspace.ResolveWorkspace() whose DI seams are not wired in cmd/cogos.
 func resolveRoot() (string, *reconcile.ResourceStatus) {
-	root, _, err := workspace.ResolveWorkspace()
-	if err != nil {
+	workspaceRootMu.RLock()
+	root := workspaceRoot
+	workspaceRootMu.RUnlock()
+	if root == "" {
 		s := reconcile.ResourceStatus{
 			Sync:      reconcile.SyncStatusUnknown,
 			Health:    reconcile.HealthMissing,
 			Operation: reconcile.OperationIdle,
-			Message:   "workspace not found",
+			Message:   "workspace not yet configured",
 		}
 		return "", &s
 	}
