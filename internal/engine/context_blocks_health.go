@@ -44,12 +44,23 @@ type healthSample struct {
 	Error  string // non-empty if probe failed (panic, timeout)
 }
 
-// isGreen reports whether a sample is fully healthy across all three axes.
+// isGreen reports whether a sample is in a non-attention-requiring state.
+//
+// Sync=Unknown is treated as not-disqualifying: most daemon-side providers
+// report Unknown by design (they're stubs without a comparable declared
+// state), and Health is the load-bearing axis for "does the operator need
+// to look at this?" A provider with Sync=Unknown but Health=Healthy is
+// quiet — same as Sync=Synced + Healthy. A provider with Sync=OutOfSync
+// is loud regardless of Health, and is caught separately by HasOutOfSync
+// in the escalation predicate.
 func (h *healthSample) isGreen() bool {
 	if h.Error != "" {
 		return false
 	}
-	return h.Status.Sync == reconcile.SyncStatusSynced &&
+	syncOK := h.Status.Sync == reconcile.SyncStatusSynced ||
+		h.Status.Sync == reconcile.SyncStatusUnknown ||
+		h.Status.Sync == ""
+	return syncOK &&
 		h.Status.Health == reconcile.HealthHealthy &&
 		(h.Status.Operation == reconcile.OperationIdle ||
 			h.Status.Operation == "")

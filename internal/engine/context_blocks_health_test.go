@@ -392,6 +392,68 @@ func TestBuildHealthBlock_RealisticSubstrate(t *testing.T) {
 	})
 }
 
+// TestIsGreen_AcceptsUnknownSync verifies the relaxed isGreen contract: a
+// provider that reports Health=Healthy but Sync=Unknown (the common state for
+// daemon-side stubs that have no comparable declared form) is treated as
+// not requiring attention. Real attention-warranting Sync states like
+// OutOfSync still disqualify.
+func TestIsGreen_AcceptsUnknownSync(t *testing.T) {
+	cases := []struct {
+		name      string
+		sync      reconcile.SyncStatus
+		health    reconcile.HealthStatus
+		op        reconcile.OperationPhase
+		wantGreen bool
+	}{
+		{"sync-unknown-healthy-idle", reconcile.SyncStatusUnknown, reconcile.HealthHealthy, reconcile.OperationIdle, true},
+		{"sync-empty-healthy-idle", "", reconcile.HealthHealthy, reconcile.OperationIdle, true},
+		{"sync-synced-healthy-idle", reconcile.SyncStatusSynced, reconcile.HealthHealthy, reconcile.OperationIdle, true},
+		{"sync-outofsync-healthy-idle", reconcile.SyncStatusOutOfSync, reconcile.HealthHealthy, reconcile.OperationIdle, false},
+		{"sync-unknown-degraded-idle", reconcile.SyncStatusUnknown, reconcile.HealthDegraded, reconcile.OperationIdle, false},
+		{"sync-unknown-missing-idle", reconcile.SyncStatusUnknown, reconcile.HealthMissing, reconcile.OperationIdle, false},
+		{"sync-unknown-suspended-idle", reconcile.SyncStatusUnknown, reconcile.HealthSuspended, reconcile.OperationIdle, false},
+		{"sync-synced-healthy-syncing", reconcile.SyncStatusSynced, reconcile.HealthHealthy, reconcile.OperationSyncing, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := healthSample{
+				Status: reconcile.ResourceStatus{Sync: tc.sync, Health: tc.health, Operation: tc.op},
+			}
+			if got := h.isGreen(); got != tc.wantGreen {
+				t.Errorf("isGreen()=%v, want %v", got, tc.wantGreen)
+			}
+		})
+	}
+}
+
+// TestBuildHealthBlock_AllUnknownSyncCollapses confirms that a registry full
+// of daemon-side stubs (Sync=Unknown but Health=Healthy) renders as the
+// collapsed all-green summary, not the full attention table. Before the
+// isGreen relax this case rendered "0 healthy, N need attention" because
+// every provider failed the Sync==Synced check.
+func TestBuildHealthBlock_AllUnknownSyncCollapses(t *testing.T) {
+	stub := func(name string) *stubProvider {
+		return &stubProvider{name: name, status: reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusUnknown,
+			Health:    reconcile.HealthHealthy,
+			Operation: reconcile.OperationIdle,
+		}}
+	}
+	providers := []*stubProvider{stub("alpha"), stub("beta"), stub("gamma")}
+	withProviders(t, providers, func() {
+		blk := buildHealthBlock(context.Background())
+		if blk == nil {
+			t.Fatal("expected non-nil block")
+		}
+		if strings.Contains(blk.Content, "| Provider |") {
+			t.Errorf("Sync=Unknown + Healthy should collapse to summary, got table:\n%s", blk.Content)
+		}
+		if !strings.Contains(blk.Content, "3 providers") {
+			t.Errorf("expected '3 providers' summary, got:\n%s", blk.Content)
+		}
+	})
+}
+
 // Helpers ────────────────────────────────────────────────────────────────────
 
 func greenStatus() reconcile.ResourceStatus {
