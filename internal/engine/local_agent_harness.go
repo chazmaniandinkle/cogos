@@ -104,6 +104,14 @@ type LocalHarnessController struct {
 	started  time.Time
 	interval time.Duration
 
+	// autonomicCfg holds escalation-predicate tunables. Safe to read from
+	// multiple goroutines — written once before Start().
+	autonomicCfg AutonomicConfig
+
+	// busSessions is optional; when set, each tick emits a
+	// KernelHealthSnapshot to bus_kernel_proprio. Nil is a safe no-op.
+	busSessions *BusSessionManager
+
 	runCtx context.Context
 
 	running atomic.Bool
@@ -112,12 +120,19 @@ type LocalHarnessController struct {
 	cycleSeq   atomic.Int64
 	triggerSeq atomic.Int64
 
+	// triggerPending is set to true by TriggerAgent and cleared at the start
+	// of each tick's escalation check. Used so an explicit trigger always
+	// fires the LLM path even when providers are green.
+	triggerPendingMu sync.Mutex
+	triggerPending   bool
+
 	startOnce sync.Once
 
 	mu              sync.RWMutex
 	lastObservation string
 	lastModel       string
 	lastCycle       *localHarnessCycleRecord
+	lastLLMCycle    time.Time // wall-clock time of the last LLM assess call
 	history         []localHarnessCycleRecord
 }
 
@@ -149,6 +164,13 @@ func NewLocalHarnessController(cfg *Config, nucleus *Nucleus, process *Process, 
 	}, nil
 }
 
+// SetBusSessionManager wires in the kernel's bus layer so that each autonomic
+// tick emits a KernelHealthSnapshot to bus_kernel_proprio. Optional: nil is
+// a safe no-op (snapshots are computed but not persisted).
+func (c *LocalHarnessController) SetBusSessionManager(mgr *BusSessionManager) {
+	c.busSessions = mgr
+}
+
 func (c *LocalHarnessController) Start(ctx context.Context) {
 	c.startOnce.Do(func() {
 		c.runCtx = ctx
@@ -158,6 +180,16 @@ func (c *LocalHarnessController) Start(ctx context.Context) {
 	})
 }
 
+// runTicker is the autonomic control loop. Each tick:
+//
+//  1. Probes all Reconcilables (deterministic, near-zero cost).
+//  2. Emits a KernelHealthSnapshot to bus_kernel_proprio.
+//  3. Evaluates the escalation predicate.
+//  4. Only calls tryStartCycle (→ LLM assess+execute) when the predicate fires.
+//
+// When the registry is empty or all providers are green and no explicit trigger
+// is pending and the idle re-checkin window hasn't elapsed, the tick completes
+// with zero LLM calls.
 func (c *LocalHarnessController) runTicker(ctx context.Context) {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
@@ -167,9 +199,48 @@ func (c *LocalHarnessController) runTicker(ctx context.Context) {
 			c.stopped.Store(true)
 			return
 		case <-ticker.C:
-			c.tryStartCycle("ticker", 0, nil)
+			c.autonomicTick(ctx)
 		}
 	}
+}
+
+// autonomicTick is the per-tick unit of the autonomic control loop.
+// It probes providers, emits a snapshot, and conditionally escalates.
+func (c *LocalHarnessController) autonomicTick(ctx context.Context) {
+	// 1. Probe all Reconcilables — cheap, deterministic.
+	snap := buildKernelHealthSnapshot(ctx)
+
+	// 2. Emit snapshot to bus regardless of health state.
+	emitHealthSnapshot(ctx, c.busSessions, snap)
+
+	// 3. Consume the triggerPending flag atomically.
+	c.triggerPendingMu.Lock()
+	triggerPending := c.triggerPending
+	c.triggerPending = false
+	c.triggerPendingMu.Unlock()
+
+	// 4. Evaluate escalation predicate.
+	c.mu.RLock()
+	lastLLM := c.lastLLMCycle
+	c.mu.RUnlock()
+
+	reason := shouldEscalate(snap, triggerPending, lastLLM, c.autonomicCfg)
+	if reason == "" {
+		// All green, no trigger, idle window not elapsed — pure deterministic tick.
+		slog.Debug("autonomic: tick complete, no escalation",
+			"providers", len(snap.Providers),
+			"healthy", snap.Counts.Healthy,
+		)
+		return
+	}
+
+	slog.Info("autonomic: escalating to LLM cycle",
+		"reason", string(reason),
+		"providers", len(snap.Providers),
+		"degraded", snap.Counts.Degraded,
+		"missing", snap.Counts.Missing,
+	)
+	c.tryStartCycle(string(reason), 0, nil)
 }
 
 func (c *LocalHarnessController) tryStartCycle(reason string, triggerSeq int64, waiter chan<- localHarnessCycleOutcome) bool {
@@ -287,6 +358,12 @@ func (c *LocalHarnessController) finishCycle(record localHarnessCycleRecord) {
 	c.lastObservation = record.Observation
 	c.lastModel = record.Model
 	c.lastCycle = &record
+	// Record the wall-clock time of this LLM cycle so the idle re-checkin
+	// predicate knows when we last ran. Error-state cycles still count —
+	// the LLM was called even if it returned an error.
+	if record.Action != "" {
+		c.lastLLMCycle = record.Timestamp
+	}
 	c.history = append(c.history, record)
 	if len(c.history) > localHarnessHistoryLimit {
 		c.history = append([]localHarnessCycleRecord(nil), c.history[len(c.history)-localHarnessHistoryLimit:]...)
@@ -519,6 +596,11 @@ func (c *LocalHarnessController) TriggerAgent(ctx context.Context, id string, re
 	seq := c.triggerSeq.Add(1)
 	if !wait {
 		if !c.tryStartCycle(reason, seq, nil) {
+			// Cycle is already running; set triggerPending so the next
+			// autonomic tick picks this up even if providers are green.
+			c.triggerPendingMu.Lock()
+			c.triggerPending = true
+			c.triggerPendingMu.Unlock()
 			return &AgentTriggerResult{
 				Triggered:  false,
 				AgentID:    id,
@@ -536,6 +618,11 @@ func (c *LocalHarnessController) TriggerAgent(ctx context.Context, id string, re
 
 	waiter := make(chan localHarnessCycleOutcome, 1)
 	if !c.tryStartCycle(reason, seq, waiter) {
+		// Cycle is already running; set triggerPending so the next
+		// autonomic tick picks this up.
+		c.triggerPendingMu.Lock()
+		c.triggerPending = true
+		c.triggerPendingMu.Unlock()
 		return &AgentTriggerResult{
 			Triggered:  false,
 			AgentID:    id,
