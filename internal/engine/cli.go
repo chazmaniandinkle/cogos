@@ -137,6 +137,12 @@ func runServeCmd(args []string, defaultWorkspace string, defaultPort int, defaul
 }
 
 func runServe(workspace string, port int, bindAddr string) {
+	// Register production Reconcilable providers before anything else.
+	// RegisterProviders is set by cmd/cogos/providers_wire.go; nil in tests.
+	if RegisterProviders != nil {
+		RegisterProviders()
+	}
+
 	setupLogger()
 	slog.Info("cogos-v3: starting", "build", BuildTime)
 
