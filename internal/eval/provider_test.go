@@ -357,7 +357,19 @@ func TestComputePlan_FullLive(t *testing.T) {
 			{"sp-1 / td-1-current", "task-1"}: &passed,
 		},
 	}
+	// Include a recent trial so isBaselineStale sees a non-stale run timestamp.
+	// Without this, the pin is set but latestRunAt is "" → stale → refresh_baseline planned.
+	recentTimestamp := time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339)
 	ls := &EvalLiveState{
+		Trials: []TrialRecord{
+			{
+				TrialID:      "exp-001__sp-1+td-1__task-1",
+				ExperimentID: "exp-001",
+				TaskID:       "task-1",
+				Passed:       true,
+				Timestamp:    recentTimestamp,
+			},
+		},
 		Scorecards: map[string]*Scorecard{"exp-001": sc},
 	}
 

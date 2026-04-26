@@ -32,6 +32,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,6 +71,7 @@ func SetWorkspaceRoot(root string) {
 func init() {
 	reconcile.RegisterProvider("agent", &agentProvider{})
 	reconcile.RegisterProvider("discord", &discordProvider{})
+	reconcile.RegisterProvider("eval", &evalProvider{})
 	reconcile.RegisterProvider("mcp-tools", &mcpToolsProvider{})
 	reconcile.RegisterProvider("openclaw-agents", &openclawAgentsProvider{})
 	reconcile.RegisterProvider("openclaw-cron", &openclawCronProvider{})
@@ -279,6 +281,78 @@ func (p *openclawGatewayProvider) Health() reconcile.ResourceStatus {
 		}
 	}
 	return reconcile.NewResourceStatus(reconcile.SyncStatusUnknown, reconcile.HealthHealthy)
+}
+
+// ─── eval ─────────────────────────────────────────────────────────────────────
+
+// evalProvider surfaces eval harness health for the daemon's proprioception block.
+//
+// Health() reads two state files from .cog/state/ that the eval harness writes:
+//   - eval-baselines.json        — which experiments have a pinned baseline
+//   - eval-dispatch-triggers.json — pending on-demand run requests
+//
+// Full plan/apply lives in the workspace-root CLI binary (eval_wiring.go);
+// the daemon only needs Health() to contribute to the foveated context block.
+type evalProvider struct{ stubMethods }
+
+func (p *evalProvider) Type() string { return "eval" }
+
+func (p *evalProvider) Health() reconcile.ResourceStatus {
+	root, bad := resolveRoot()
+	if bad != nil {
+		return *bad
+	}
+
+	stateDir := filepath.Join(root, ".cog", "state")
+
+	// Read baseline pins — presence indicates experiments are being tracked.
+	pinsPath := filepath.Join(stateDir, "eval-baselines.json")
+	pinnedCount := 0
+	if data, err := os.ReadFile(pinsPath); err == nil {
+		var pins map[string]string
+		if json.Unmarshal(data, &pins) == nil {
+			pinnedCount = len(pins)
+		}
+	}
+
+	// Read pending dispatch triggers — non-empty means a run was requested but
+	// the reconcile cycle hasn't consumed it yet.
+	triggersPath := filepath.Join(stateDir, "eval-dispatch-triggers.json")
+	pendingCount := 0
+	if data, err := os.ReadFile(triggersPath); err == nil {
+		var triggers map[string]bool
+		if json.Unmarshal(data, &triggers) == nil {
+			pendingCount = len(triggers)
+		}
+	}
+
+	// Check for the experiments directory — its presence signals eval is configured.
+	experimentsDir := filepath.Join(root, ".cog", "mem", "semantic", "architecture", "tournament", "experiments")
+	_, expDirErr := os.Stat(experimentsDir)
+
+	switch {
+	case expDirErr != nil:
+		return reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusUnknown,
+			Health:    reconcile.HealthMissing,
+			Operation: reconcile.OperationIdle,
+			Message:   "no tournament experiments directory — eval not configured",
+		}
+	case pendingCount > 0:
+		return reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusOutOfSync,
+			Health:    reconcile.HealthProgressing,
+			Operation: reconcile.OperationSyncing,
+			Message:   fmt.Sprintf("%d pending trigger(s), %d pinned baseline(s)", pendingCount, pinnedCount),
+		}
+	default:
+		return reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusUnknown,
+			Health:    reconcile.HealthHealthy,
+			Operation: reconcile.OperationIdle,
+			Message:   fmt.Sprintf("%d pinned baseline(s); full plan/apply via cog CLI", pinnedCount),
+		}
+	}
 }
 
 // ─── service ─────────────────────────────────────────────────────────────────

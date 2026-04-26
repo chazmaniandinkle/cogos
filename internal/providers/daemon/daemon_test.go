@@ -1,9 +1,9 @@
-// daemon_test.go — verifies that importing this package registers all 8
+// daemon_test.go — verifies that importing this package registers all 9
 // expected Reconcilable providers with pkg/reconcile.
 //
 // This is the canonical test for verification gate 3: "after the
 // engine.Main-equivalent boot path runs, reconcile.ListProviders() returns
-// the 8 expected names."
+// the 9 expected names."
 //
 // We don't start a server or invoke engine.Main() — we only confirm that
 // the package's init() side-effect wired the providers. This is sufficient
@@ -17,7 +17,7 @@ import (
 
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 
-	// Blank import fires daemon.init(), registering all 8 providers.
+	// Blank import fires daemon.init(), registering all 9 providers.
 	_ "github.com/cogos-dev/cogos/internal/providers/daemon"
 )
 
@@ -25,6 +25,7 @@ var expectedProviders = []string{
 	"agent",
 	"component",
 	"discord",
+	"eval",
 	"mcp-tools",
 	"openclaw-agents",
 	"openclaw-cron",
@@ -32,7 +33,7 @@ var expectedProviders = []string{
 	"service",
 }
 
-func TestDaemonInit_RegistersAll8Providers(t *testing.T) {
+func TestDaemonInit_RegistersAll9Providers(t *testing.T) {
 	got := reconcile.ListProviders()
 	sort.Strings(got)
 
