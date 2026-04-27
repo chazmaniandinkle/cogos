@@ -15,10 +15,13 @@ import (
 // h.httpClient.Timeout (180s) so the inner HTTP call is the actual cap.
 const dispatchTimeoutDefault = 30
 
-// dispatchTimeoutMax caps the per-slot budget. 120s lines up with the
-// existing AgentController.TriggerAgent wait limit (90s) plus a buffer for
-// degraded-network / 26B routing.
-const dispatchTimeoutMax = 120
+// dispatchTimeoutMax caps the per-slot budget. 300s accommodates cold-start
+// load of larger local models (gemma4:e4b at ~110s on M4 Pro) plus the
+// localHarnessCycleTimeout (300s) for tool-loop dispatches that run multiple
+// Ollama round-trips. The previous 120s cap was lifted from the legacy
+// TriggerAgent wait limit, but eval sweeps and Reconcilable-driven
+// dispatches need headroom for cold cycles.
+const dispatchTimeoutMax = 300
 
 // dispatchNDefault is the parallel fan-out when 0 is passed. Mirrors the
 // "single dispatch" baseline so a minimal call shape behaves like a normal
