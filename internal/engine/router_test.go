@@ -282,3 +282,137 @@ routing:
 		t.Errorf("ollama model = %q; want gemma4:e2b", pcfg.Providers["ollama"].Model)
 	}
 }
+
+// TestLoadProvidersConfigDeepMergesLocalYAML verifies that providers.local.yaml
+// is deep-merged over providers.yaml — node-specific endpoints, env-var-backed
+// API keys, and additional providers all land in the merged config without
+// requiring the user to copy the entire defaults file.
+func TestLoadProvidersConfigDeepMergesLocalYAML(t *testing.T) {
+	t.Parallel()
+
+	root := makeWorkspace(t)
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  ollama:
+    type: ollama
+    enabled: true
+    endpoint: "http://localhost:11434"
+    model: "gemma4:e4b"
+    timeout: 60
+  claude-code:
+    type: claude-code
+    model: sonnet
+    timeout: 300
+routing:
+  default: claude-code
+  fallback_chain: [claude-code, ollama]
+  process_state_routing:
+    active: claude-code
+    receptive: ollama
+`)
+
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.local.yaml"), `providers:
+  ollama:
+    context_window: 32768
+  lmstudio-mlx:
+    type: openai
+    endpoint: http://localhost:1234
+    model: gemma-mlx-id
+    api_key_env: LMS_API_KEY
+    options:
+      is_local: true
+routing:
+  fallback_chain: [claude-code, lmstudio-mlx, ollama]
+  process_state_routing:
+    consolidating: lmstudio-mlx
+`)
+
+	cfg, err := LoadConfig(root, 0)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	pcfg, err := loadProvidersConfig(cfg)
+	if err != nil {
+		t.Fatalf("loadProvidersConfig: %v", err)
+	}
+
+	// Existing provider field-level merge: ollama keeps base type/endpoint,
+	// gains context_window from overlay.
+	ollama := pcfg.Providers["ollama"]
+	if ollama.Type != "ollama" {
+		t.Errorf("ollama type = %q; want preserved 'ollama'", ollama.Type)
+	}
+	if ollama.Endpoint != "http://localhost:11434" {
+		t.Errorf("ollama endpoint changed unexpectedly: %q", ollama.Endpoint)
+	}
+	if ollama.ContextWindow != 32768 {
+		t.Errorf("ollama context_window = %d; want 32768 from overlay", ollama.ContextWindow)
+	}
+
+	// New provider added wholesale.
+	lms, ok := pcfg.Providers["lmstudio-mlx"]
+	if !ok {
+		t.Fatalf("lmstudio-mlx not added by overlay; providers=%v", keysOf(pcfg.Providers))
+	}
+	if lms.Type != "openai" || lms.Endpoint != "http://localhost:1234" || lms.APIKeyEnv != "LMS_API_KEY" {
+		t.Errorf("lmstudio-mlx fields wrong: %+v", lms)
+	}
+	if v, ok := lms.Options["is_local"].(bool); !ok || !v {
+		t.Errorf("lmstudio-mlx options.is_local not preserved: %v", lms.Options)
+	}
+
+	// Routing merged: fallback_chain replaced, process_state_routing extended
+	// (active/receptive preserved from base, consolidating added by overlay).
+	if got := pcfg.Routing.FallbackChain; len(got) != 3 || got[1] != "lmstudio-mlx" {
+		t.Errorf("fallback_chain = %v; want overlay value", got)
+	}
+	if pcfg.Routing.ProcessStateRouting["active"] != "claude-code" {
+		t.Error("process_state_routing.active lost during merge")
+	}
+	if pcfg.Routing.ProcessStateRouting["consolidating"] != "lmstudio-mlx" {
+		t.Errorf("process_state_routing.consolidating = %q; want overlay value",
+			pcfg.Routing.ProcessStateRouting["consolidating"])
+	}
+
+	// Untouched provider preserved.
+	if pcfg.Providers["claude-code"].Type != "claude-code" {
+		t.Error("claude-code provider lost during merge")
+	}
+}
+
+// TestLoadProvidersConfigSkipsMissingLocalYAML verifies that a missing
+// providers.local.yaml is not an error — the base config is returned as-is.
+func TestLoadProvidersConfigSkipsMissingLocalYAML(t *testing.T) {
+	t.Parallel()
+
+	root := makeWorkspace(t)
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  ollama:
+    type: ollama
+    model: gemma4:e4b
+routing:
+  default: ollama
+`)
+	// Deliberately do NOT write providers.local.yaml.
+
+	cfg, err := LoadConfig(root, 0)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	pcfg, err := loadProvidersConfig(cfg)
+	if err != nil {
+		t.Fatalf("loadProvidersConfig: %v", err)
+	}
+	if pcfg.Providers["ollama"].Model != "gemma4:e4b" {
+		t.Errorf("base config not returned cleanly: %+v", pcfg.Providers["ollama"])
+	}
+}
+
+func keysOf(m map[string]ProviderConfig) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}

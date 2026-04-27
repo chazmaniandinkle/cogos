@@ -72,6 +72,28 @@ func (r *SimpleRouter) DeregisterProvider(name string) {
 	r.providers = updated
 }
 
+// ProviderForModel returns the registered provider name whose Name() or
+// Model() matches `model`. Name match takes precedence over model match so
+// callers can target a specific provider instance even when multiple
+// providers serve the same underlying model. Returns ("", false) when no
+// provider matches.
+func (r *SimpleRouter) ProviderForModel(model string) (string, bool) {
+	if model == "" {
+		return "", false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if p, ok := r.byName[model]; ok {
+		return p.Name(), true
+	}
+	for _, p := range r.providers {
+		if p.Model() == model {
+			return p.Name(), true
+		}
+	}
+	return "", false
+}
+
 // Route selects the best available provider for the request.
 func (r *SimpleRouter) Route(ctx context.Context, req *CompletionRequest) (Provider, *RoutingDecision, error) {
 	start := time.Now()
@@ -305,8 +327,8 @@ func WithProcessManager(pm *ProcessManager) BuildRouterOption {
 }
 
 func loadProvidersConfig(cfg *Config) (ProvidersConfig, error) {
-	path := filepath.Join(cfg.CogDir, "config", "providers.yaml")
-	data, err := os.ReadFile(path)
+	basePath := filepath.Join(cfg.CogDir, "config", "providers.yaml")
+	data, err := os.ReadFile(basePath)
 	if err != nil {
 		return ProvidersConfig{}, err
 	}
@@ -314,8 +336,118 @@ func loadProvidersConfig(cfg *Config) (ProvidersConfig, error) {
 	if err := yaml.Unmarshal(data, &pcfg); err != nil {
 		return ProvidersConfig{}, fmt.Errorf("parse providers.yaml: %w", err)
 	}
+
+	// Deep-merge providers.local.yaml on top if present. The local file is
+	// gitignored and holds node-specific endpoints, API key env-var names, and
+	// fallback overrides. Documented since the file shipped; this is the
+	// implementation that backs the documentation.
+	localPath := filepath.Join(cfg.CogDir, "config", "providers.local.yaml")
+	if localData, lerr := os.ReadFile(localPath); lerr == nil {
+		var local ProvidersConfig
+		if perr := yaml.Unmarshal(localData, &local); perr != nil {
+			slog.Warn("router: providers.local.yaml parse error, ignoring overlay", "err", perr)
+		} else {
+			pcfg = mergeProvidersConfig(pcfg, local)
+			slog.Info("router: providers.local.yaml merged",
+				"providers_added", len(local.Providers),
+				"path", localPath,
+			)
+		}
+	} else if !os.IsNotExist(lerr) {
+		slog.Warn("router: providers.local.yaml read error, ignoring overlay", "err", lerr)
+	}
+
 	applyLocalModelConfig(cfg, &pcfg)
 	return pcfg, nil
+}
+
+// mergeProvidersConfig deep-merges overlay onto base and returns the result.
+// Per-provider entries are field-level merged (overlay non-zero values win,
+// zero values keep base). Routing uses the same shape. New providers in the
+// overlay are added; the base map is preserved for keys not in overlay.
+func mergeProvidersConfig(base, overlay ProvidersConfig) ProvidersConfig {
+	if overlay.Providers != nil {
+		if base.Providers == nil {
+			base.Providers = make(map[string]ProviderConfig, len(overlay.Providers))
+		}
+		for name, oc := range overlay.Providers {
+			if existing, ok := base.Providers[name]; ok {
+				base.Providers[name] = mergeProviderConfig(existing, oc)
+			} else {
+				base.Providers[name] = oc
+			}
+		}
+	}
+	base.Routing = mergeRoutingConfig(base.Routing, overlay.Routing)
+	return base
+}
+
+func mergeProviderConfig(base, overlay ProviderConfig) ProviderConfig {
+	if overlay.Type != "" {
+		base.Type = overlay.Type
+	}
+	if overlay.APIKeyEnv != "" {
+		base.APIKeyEnv = overlay.APIKeyEnv
+	}
+	if overlay.Endpoint != "" {
+		base.Endpoint = overlay.Endpoint
+	}
+	if overlay.Model != "" {
+		base.Model = overlay.Model
+	}
+	if overlay.ContextWindow != 0 {
+		base.ContextWindow = overlay.ContextWindow
+	}
+	if overlay.MaxTokens != 0 {
+		base.MaxTokens = overlay.MaxTokens
+	}
+	if overlay.Timeout != 0 {
+		base.Timeout = overlay.Timeout
+	}
+	if overlay.Enabled != nil {
+		base.Enabled = overlay.Enabled
+	}
+	if len(overlay.Headers) > 0 {
+		if base.Headers == nil {
+			base.Headers = make(map[string]string, len(overlay.Headers))
+		}
+		for k, v := range overlay.Headers {
+			base.Headers[k] = v
+		}
+	}
+	if len(overlay.Options) > 0 {
+		if base.Options == nil {
+			base.Options = make(map[string]interface{}, len(overlay.Options))
+		}
+		for k, v := range overlay.Options {
+			base.Options[k] = v
+		}
+	}
+	return base
+}
+
+func mergeRoutingConfig(base, overlay RoutingConfig) RoutingConfig {
+	if overlay.Default != "" {
+		base.Default = overlay.Default
+	}
+	if overlay.LocalThreshold != 0 {
+		base.LocalThreshold = overlay.LocalThreshold
+	}
+	if len(overlay.FallbackChain) > 0 {
+		base.FallbackChain = overlay.FallbackChain
+	}
+	if overlay.MaxCostPerDayUSD != 0 {
+		base.MaxCostPerDayUSD = overlay.MaxCostPerDayUSD
+	}
+	if len(overlay.ProcessStateRouting) > 0 {
+		if base.ProcessStateRouting == nil {
+			base.ProcessStateRouting = make(map[string]string, len(overlay.ProcessStateRouting))
+		}
+		for k, v := range overlay.ProcessStateRouting {
+			base.ProcessStateRouting[k] = v
+		}
+	}
+	return base
 }
 
 func applyLocalModelConfig(cfg *Config, pcfg *ProvidersConfig) {

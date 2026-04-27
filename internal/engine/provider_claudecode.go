@@ -95,6 +95,9 @@ func NewClaudeCodeProvider(name string, cfg ProviderConfig, procMgr *ProcessMana
 // Name returns the provider identifier.
 func (p *ClaudeCodeProvider) Name() string { return p.name }
 
+// Model returns the configured model identifier (e.g. "sonnet", "haiku").
+func (p *ClaudeCodeProvider) Model() string { return p.model }
+
 // Available checks that the claude binary exists and is authenticated.
 func (p *ClaudeCodeProvider) Available(ctx context.Context) bool {
 	path, err := exec.LookPath(p.cliBinary)

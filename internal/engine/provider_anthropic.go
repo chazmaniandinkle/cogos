@@ -76,6 +76,9 @@ func NewAnthropicProvider(name string, cfg ProviderConfig) *AnthropicProvider {
 // Name returns the provider identifier.
 func (p *AnthropicProvider) Name() string { return p.name }
 
+// Model returns the configured model identifier.
+func (p *AnthropicProvider) Model() string { return p.model }
+
 // Available reports whether an API key is configured.
 // For cloud providers we avoid a network round-trip on every health check —
 // the presence of a non-empty API key is the availability signal.

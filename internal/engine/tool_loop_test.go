@@ -327,7 +327,8 @@ func (p *scriptedToolLoopProvider) Stream(context.Context, *CompletionRequest) (
 	return ch, nil
 }
 
-func (p *scriptedToolLoopProvider) Name() string { return p.name }
+func (p *scriptedToolLoopProvider) Name() string  { return p.name }
+func (p *scriptedToolLoopProvider) Model() string { return "test" }
 
 func (p *scriptedToolLoopProvider) Available(context.Context) bool { return true }
 

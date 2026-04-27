@@ -725,8 +725,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	case "ollama":
 		creq.Metadata.PreferProvider = "ollama"
 	default:
-		// Pass through as model override (e.g. "opus", "haiku", "gpt-5.4")
+		// Pass through as model override (e.g. "opus", "haiku", "gpt-5.4").
 		creq.ModelOverride = req.Model
+		// If a registered provider's name or configured model matches, prefer
+		// it explicitly so the request lands at the provider serving that
+		// model rather than falling through to the process-state default.
+		// This is what makes `model: lmstudio-mlx` or
+		// `model: gemma-4-e4b-agentic-opus-reasoning-geminicli-mlx` route
+		// to the LMS-MLX provider instead of claude-code (the active default).
+		if name, ok := s.router.ProviderForModel(req.Model); ok {
+			creq.Metadata.PreferProvider = name
+		}
 	}
 
 	var pkg *ContextPackage

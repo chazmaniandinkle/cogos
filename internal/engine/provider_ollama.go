@@ -84,7 +84,8 @@ func NewOllamaProvider(name string, cfg ProviderConfig) *OllamaProvider {
 }
 
 // Name returns the provider identifier.
-func (p *OllamaProvider) Name() string { return p.name }
+func (p *OllamaProvider) Name() string  { return p.name }
+func (p *OllamaProvider) Model() string { return p.model }
 
 // Available checks if Ollama is running and the configured model is loaded.
 func (p *OllamaProvider) Available(ctx context.Context) bool {
