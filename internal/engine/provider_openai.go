@@ -75,6 +75,9 @@ func NewOpenAICompatProvider(name string, cfg ProviderConfig) *OpenAICompatProvi
 // Name returns the provider identifier.
 func (p *OpenAICompatProvider) Name() string { return p.name }
 
+// Model returns the configured model identifier.
+func (p *OpenAICompatProvider) Model() string { return p.model }
+
 // Available checks if the server is reachable and has at least one model.
 func (p *OpenAICompatProvider) Available(ctx context.Context) bool {
 	models, err := p.listModels(ctx)

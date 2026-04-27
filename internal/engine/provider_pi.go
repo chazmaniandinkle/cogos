@@ -80,7 +80,8 @@ func NewPiProvider(name string, cfg ProviderConfig, procMgr *ProcessManager) *Pi
 	}
 }
 
-func (p *PiProvider) Name() string { return p.name }
+func (p *PiProvider) Name() string  { return p.name }
+func (p *PiProvider) Model() string { return p.model }
 
 func (p *PiProvider) Available(ctx context.Context) bool {
 	path, err := exec.LookPath(p.piBinary)

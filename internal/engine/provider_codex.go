@@ -88,7 +88,8 @@ func NewCodexProvider(name string, cfg ProviderConfig) *CodexProvider {
 	}
 }
 
-func (p *CodexProvider) Name() string { return p.name }
+func (p *CodexProvider) Name() string  { return p.name }
+func (p *CodexProvider) Model() string { return p.model }
 
 func (p *CodexProvider) resolveBinary() (string, error) {
 	if path, err := codexLookPath(p.binary); err == nil && path != "" {

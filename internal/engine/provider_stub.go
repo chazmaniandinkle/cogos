@@ -44,9 +44,10 @@ func NewStubProvider(name, response string) *StubProvider {
 	}
 }
 
-func (s *StubProvider) Name() string                              { return s.name }
-func (s *StubProvider) Available(_ context.Context) bool          { return s.available }
-func (s *StubProvider) Capabilities() ProviderCapabilities        { return s.capabilities }
+func (s *StubProvider) Name() string                       { return s.name }
+func (s *StubProvider) Model() string                      { return "" }
+func (s *StubProvider) Available(_ context.Context) bool   { return s.available }
+func (s *StubProvider) Capabilities() ProviderCapabilities { return s.capabilities }
 
 func (s *StubProvider) Ping(_ context.Context) (time.Duration, error) {
 	if s.err != nil {

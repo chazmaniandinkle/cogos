@@ -32,6 +32,12 @@ type Provider interface {
 	// Name returns the provider identifier (e.g. "ollama", "anthropic").
 	Name() string
 
+	// Model returns the configured model identifier for this provider
+	// (e.g. "gemma4:e4b", "sonnet", "gemma-4-e4b-agentic-opus-reasoning-geminicli-mlx").
+	// Used by the router to resolve OpenAI-compat `model: X` requests to the
+	// provider serving X. Empty string means "no specific model" (stubs/tests).
+	Model() string
+
 	// Available reports whether the provider is ready to serve requests.
 	// For local providers: checks the model server is running and model loaded.
 	Available(ctx context.Context) bool
@@ -310,6 +316,12 @@ type Router interface {
 
 	// DeregisterProvider removes a provider.
 	DeregisterProvider(name string)
+
+	// ProviderForModel returns the registered provider name whose Name() or
+	// Model() matches the requested model string. Used by the OpenAI-compat
+	// chat handler to resolve `model: X` to the provider serving X. Returns
+	// ("", false) when no match. Name match takes precedence over model match.
+	ProviderForModel(model string) (string, bool)
 
 	// Stats returns routing statistics.
 	Stats() RouterStats
