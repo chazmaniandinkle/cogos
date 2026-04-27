@@ -29,7 +29,7 @@ var defaultLocalHarnessToolScope = []string{
 
 const (
 	localHarnessHistoryLimit   = 24
-	localHarnessCycleTimeout   = 90 * time.Second
+	localHarnessCycleTimeout   = 5 * time.Minute
 	localHarnessAssessMaxToks  = 256
 	localHarnessExecuteMaxToks = 1024
 )

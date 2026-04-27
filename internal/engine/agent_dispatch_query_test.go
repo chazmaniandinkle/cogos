@@ -61,8 +61,8 @@ func TestQueryDispatchToHarness_ClampsRanges(t *testing.T) {
 	if disp.lastReq.N != 4 {
 		t.Errorf("N not clamped to 4, got %d", disp.lastReq.N)
 	}
-	if disp.lastReq.TimeoutSeconds != 120 {
-		t.Errorf("TimeoutSeconds not clamped to 120, got %d", disp.lastReq.TimeoutSeconds)
+	if disp.lastReq.TimeoutSeconds != 300 {
+		t.Errorf("TimeoutSeconds not clamped to 300, got %d", disp.lastReq.TimeoutSeconds)
 	}
 }
 
