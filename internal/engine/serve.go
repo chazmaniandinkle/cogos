@@ -725,16 +725,25 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	case "ollama":
 		creq.Metadata.PreferProvider = "ollama"
 	default:
-		// Pass through as model override (e.g. "opus", "haiku", "gpt-5.4").
-		creq.ModelOverride = req.Model
-		// If a registered provider's name or configured model matches, prefer
-		// it explicitly so the request lands at the provider serving that
-		// model rather than falling through to the process-state default.
-		// This is what makes `model: lmstudio-mlx` or
-		// `model: gemma-4-e4b-agentic-opus-reasoning-geminicli-mlx` route
-		// to the LMS-MLX provider instead of claude-code (the active default).
-		if name, ok := s.router.ProviderForModel(req.Model); ok {
+		// First check: is req.Model a provider alias (exact name match)? If so,
+		// route to that provider with NO ModelOverride — the provider knows its
+		// own configured model and we shouldn't second-guess it. This is what
+		// makes `model: mlx-gemma` resolve to the mlx-gemma provider's
+		// preloaded path instead of forwarding "mlx-gemma" upstream as a model
+		// id (which mlx_lm.server would try to fetch from HuggingFace).
+		if name, byName := s.router.ProviderForName(req.Model); byName {
 			creq.Metadata.PreferProvider = name
+			// No ModelOverride; provider uses its configured model.
+		} else {
+			// Pass through as model override (e.g. "opus", "haiku", "gpt-5.4",
+			// or a full HF model id). If a provider's configured Model()
+			// matches, prefer it so the request lands at the provider serving
+			// that model rather than falling through to the process-state
+			// default.
+			creq.ModelOverride = req.Model
+			if name, ok := s.router.ProviderForModel(req.Model); ok {
+				creq.Metadata.PreferProvider = name
+			}
 		}
 	}
 

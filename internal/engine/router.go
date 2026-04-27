@@ -72,6 +72,22 @@ func (r *SimpleRouter) DeregisterProvider(name string) {
 	r.providers = updated
 }
 
+// ProviderForName returns the registered provider name when `name` is an
+// exact match for a provider's Name(). Used to detect provider aliases so
+// callers can target a specific provider without forwarding the alias as a
+// ModelOverride. Returns ("", false) when no provider matches.
+func (r *SimpleRouter) ProviderForName(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if p, ok := r.byName[name]; ok {
+		return p.Name(), true
+	}
+	return "", false
+}
+
 // ProviderForModel returns the registered provider name whose Name() or
 // Model() matches `model`. Name match takes precedence over model match so
 // callers can target a specific provider instance even when multiple
