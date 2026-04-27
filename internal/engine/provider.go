@@ -317,6 +317,13 @@ type Router interface {
 	// DeregisterProvider removes a provider.
 	DeregisterProvider(name string)
 
+	// ProviderForName returns the registered provider name when `name` is an
+	// exact match for a provider's Name(). Used to detect provider aliases
+	// in OpenAI-compat `model: X` requests so callers can target a specific
+	// provider without forwarding the alias as a ModelOverride. Returns
+	// ("", false) when no provider matches.
+	ProviderForName(name string) (string, bool)
+
 	// ProviderForModel returns the registered provider name whose Name() or
 	// Model() matches the requested model string. Used by the OpenAI-compat
 	// chat handler to resolve `model: X` to the provider serving X. Returns
