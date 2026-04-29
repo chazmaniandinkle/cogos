@@ -25,7 +25,7 @@ func (c *Constellation) Search(query string, limit int) ([]Node, error) {
 		SELECT d.id, d.path, d.title, d.type, d.sector, d.status, d.content,
 		       bm25(documents_fts) AS rank
 		FROM documents_fts
-		JOIN documents d ON d.id = documents_fts.id
+		JOIN documents d ON d.rowid = documents_fts.rowid
 		WHERE documents_fts MATCH ?
 		  AND d.status != 'deprecated'
 		ORDER BY rank
@@ -123,7 +123,7 @@ func (c *Constellation) QueryRelevantWithSubstance(anchor, goal string, maxCandi
 		       COALESCE(d.substance_ratio, 0.0) AS substance_ratio,
 		       COALESCE(d.ref_count, 0) AS ref_count
 		FROM documents_fts
-		JOIN documents d ON d.id = documents_fts.id
+		JOIN documents d ON d.rowid = documents_fts.rowid
 		WHERE documents_fts MATCH ?
 		  AND d.status != 'deprecated'
 		ORDER BY rank
@@ -233,7 +233,7 @@ func (c *Constellation) QueryRelevantWithEmbedding(anchor, goal string, maxCandi
 		       COALESCE(d.ref_count, 0) AS ref_count,
 		       d.embedding_128
 		FROM documents_fts
-		JOIN documents d ON d.id = documents_fts.id
+		JOIN documents d ON d.rowid = documents_fts.rowid
 		WHERE documents_fts MATCH ?
 		  AND d.status != 'deprecated'
 		ORDER BY rank
@@ -359,7 +359,7 @@ func (c *Constellation) SearchWithFilters(query string, types []string, sector s
 		SELECT d.id, d.path, d.title, d.type, d.sector, d.status, d.content,
 		       bm25(fts) AS rank
 		FROM documents_fts fts
-		JOIN documents d ON d.id = fts.id
+		JOIN documents d ON d.rowid = fts.rowid
 		WHERE %s
 		ORDER BY rank
 		LIMIT ?
