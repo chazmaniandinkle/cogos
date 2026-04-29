@@ -252,9 +252,8 @@ type Experiment struct {
 	Tags []string `json:"tags,omitempty"`
 	// AutoReconcile, when true, allows the metabolic cycle to run this
 	// experiment automatically. Defaults false (on-demand only).
-	//
-	// TODO(Phase C): wire this from frontmatter key "auto_reconcile: true".
-	// When false, the experiment only runs via explicit cog_run_experiment MCP call.
+	// Wired from the cogdoc frontmatter key "auto_reconcile: true";
+	// when false the experiment only runs via explicit cog_run_experiment.
 	AutoReconcile bool `json:"auto_reconcile,omitempty"`
 	// BaselinePinned is the run ID of the pinned baseline, if any.
 	// Set externally via cog_pin_baseline MCP tool (see design memo Q10).

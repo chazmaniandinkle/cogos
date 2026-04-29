@@ -89,9 +89,14 @@ func buildHealthBlock(ctx context.Context) *ContextBlock {
 	return &block
 }
 
-// probeAllProviders probes every named provider in parallel-friendly fashion
-// (each in its own goroutine with an independent timeout). The kernel's
-// registry mutex is only held briefly to fetch the provider reference.
+// probeAllProviders probes every named provider sequentially. Each probeOne
+// call runs Health() in its own goroutine (so a misbehaving provider can't
+// block the foveated handler past healthProbeTimeout), but the outer loop
+// is sequential — worst-case wall-clock latency is N × healthProbeTimeout.
+// The kernel's registry mutex is only held briefly to fetch the provider
+// reference. If provider count grows large enough that N × timeout becomes
+// noticeable, this loop can be fanned out with a WaitGroup; today's N keeps
+// it simple.
 func probeAllProviders(ctx context.Context, names []string) []healthSample {
 	sort.Strings(names)
 	samples := make([]healthSample, len(names))
