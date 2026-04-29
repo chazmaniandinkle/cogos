@@ -42,11 +42,32 @@ const (
 // AttentionalField holds the current salience map for the memory corpus.
 // It is safe for concurrent reads (serve goroutine) and periodic writes
 // (consolidation goroutine).
+//
+// The field maintains two parallel views over the same set of paths:
+//
+//   - base:     pure salience score, no inbox-status boosts.
+//     This is the chat-read view — what the foveated assembler sees
+//     when it asks "is this CogDoc relevant to the current query?".
+//     Bulk-imported inbox files do not get a free pass into chat context.
+//
+//   - observer: base + inbox boosts (raw / enriched).
+//     This is the observer-loop view — "what needs the substrate's
+//     attention?". Inbox items deliberately spike here so the
+//     enrichment/integration pipeline notices them.
+//
+// Both views are populated in the same scan (Update / deltaUpdate). Transient
+// recency boosts via Boost() apply to both views — a freshly-read or
+// freshly-attended CogDoc is relevant to chat *and* observer.
 type AttentionalField struct {
 	mu sync.RWMutex
 
-	// scores maps absolute file path → salience score.
-	scores map[string]float64
+	// base maps absolute file path → salience score with no inbox boosts.
+	// This is the chat-read view.
+	base map[string]float64
+
+	// observer maps absolute file path → base + inbox boosts.
+	// This is the observer-loop view.
+	observer map[string]float64
 
 	// lastUpdated is when the field was last fully recomputed.
 	lastUpdated time.Time
@@ -65,9 +86,10 @@ type AttentionalField struct {
 // NewAttentionalField constructs an empty field. Call Update() to populate it.
 func NewAttentionalField(cfg *Config) *AttentionalField {
 	return &AttentionalField{
-		scores: make(map[string]float64),
-		cfg:    cfg,
-		salCfg: DefaultSalienceConfig(),
+		base:     make(map[string]float64),
+		observer: make(map[string]float64),
+		cfg:      cfg,
+		salCfg:   DefaultSalienceConfig(),
 	}
 }
 
@@ -81,7 +103,7 @@ func (f *AttentionalField) Update() error {
 	currentHEAD := resolveHEAD(f.cfg.WorkspaceRoot)
 	f.mu.RLock()
 	cached := f.lastHEAD
-	hasScores := len(f.scores) > 0
+	hasScores := len(f.base) > 0
 	f.mu.RUnlock()
 
 	// Mode 1: nothing changed.
@@ -115,19 +137,24 @@ func (f *AttentionalField) Update() error {
 		return fmt.Errorf("rank files: %w", err)
 	}
 
-	fresh := make(map[string]float64, len(ranked))
+	freshBase := make(map[string]float64, len(ranked))
 	for _, fs := range ranked {
-		fresh[fs.Path] = fs.Score
+		freshBase[fs.Path] = fs.Score
 	}
-	applyInboxBoosts(fresh)
+	freshObserver := make(map[string]float64, len(ranked))
+	for path, score := range freshBase {
+		freshObserver[path] = score
+	}
+	applyInboxBoosts(freshObserver)
 
 	f.mu.Lock()
-	f.scores = fresh
+	f.base = freshBase
+	f.observer = freshObserver
 	f.lastUpdated = time.Now()
 	f.lastHEAD = currentHEAD
 	f.mu.Unlock()
 
-	slog.Info("field: full scan complete", "files", len(fresh))
+	slog.Info("field: full scan complete", "files", len(freshBase))
 	return nil
 }
 
@@ -162,7 +189,8 @@ func (f *AttentionalField) deltaUpdate(oldHEAD, newHEAD string) (int, error) {
 		}
 		if _, err := os.Stat(absPath); os.IsNotExist(err) {
 			f.mu.Lock()
-			delete(f.scores, absPath)
+			delete(f.base, absPath)
+			delete(f.observer, absPath)
 			f.mu.Unlock()
 			updated++
 			continue
@@ -171,17 +199,19 @@ func (f *AttentionalField) deltaUpdate(oldHEAD, newHEAD string) (int, error) {
 		if err != nil || score == nil {
 			continue
 		}
-		val := score.Total
+		baseVal := score.Total
+		observerVal := baseVal
 		if strings.Contains(absPath, inboxPathFragment) {
 			switch readInboxStatus(absPath) {
 			case "raw":
-				val += inboxRawBoost
+				observerVal += inboxRawBoost
 			case "enriched":
-				val += inboxEnrichedBoost
+				observerVal += inboxEnrichedBoost
 			}
 		}
 		f.mu.Lock()
-		f.scores[absPath] = val
+		f.base[absPath] = baseVal
+		f.observer[absPath] = observerVal
 		f.mu.Unlock()
 		updated++
 	}
@@ -250,14 +280,32 @@ func resolveHEAD(workspaceRoot string) string {
 	return ref.Hash().String()
 }
 
-// Fovea returns the top n files by salience score (the "focal" context).
+// Fovea returns the top n files by observer salience score (the "focal"
+// context — what currently has the substrate's attention, including inbox
+// urgency). Surfaces this view via constellation/fovea, MCP field resources,
+// and the substrate health panels.
+//
+// For the chat-read view (no inbox boosts), use BaseFovea.
+//
 // If n <= 0, all files are returned.
 func (f *AttentionalField) Fovea(n int) []FileScore {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	return topN(f.observer, n)
+}
 
-	all := make([]FileScore, 0, len(f.scores))
-	for path, score := range f.scores {
+// BaseFovea returns the top n files by base salience (no inbox boosts),
+// the chat-read view. Currently unused outside tests/diagnostics, but
+// kept symmetric with Fovea for callers that want the unboosted ranking.
+func (f *AttentionalField) BaseFovea(n int) []FileScore {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return topN(f.base, n)
+}
+
+func topN(scores map[string]float64, n int) []FileScore {
+	all := make([]FileScore, 0, len(scores))
+	for path, score := range scores {
 		all = append(all, FileScore{Path: path, Score: score})
 	}
 	sort.Slice(all, func(i, j int) bool {
@@ -269,19 +317,36 @@ func (f *AttentionalField) Fovea(n int) []FileScore {
 	return all
 }
 
-// Score returns the current salience score for a single file.
-// Returns 0.0 if the file is not in the field.
+// Score returns the base salience score for a single file (no inbox boosts).
+// This is the chat-read view: the foveated assembler uses Score to decide
+// which CogDocs are relevant to the user's current query, without bulk
+// inbox imports flooding the context. Returns 0.0 if the file is not in
+// the field.
+//
+// For the observer view (base + inbox boosts), use ObserverScore.
 func (f *AttentionalField) Score(path string) float64 {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.scores[path]
+	return f.base[path]
+}
+
+// ObserverScore returns the observer salience score for a single file
+// (base + inbox boosts). This is the observer-loop view: "what needs
+// the substrate's attention right now?". Inbox items with status: raw
+// or status: enriched receive a flat-add boost so the enrichment and
+// integration pipelines notice them. Returns 0.0 if the file is not
+// in the field.
+func (f *AttentionalField) ObserverScore(path string) float64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.observer[path]
 }
 
 // Len returns the number of files currently in the field.
 func (f *AttentionalField) Len() int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return len(f.scores)
+	return len(f.base)
 }
 
 // LastUpdated returns when the field was last recomputed.
@@ -291,22 +356,47 @@ func (f *AttentionalField) LastUpdated() time.Time {
 	return f.lastUpdated
 }
 
-// Boost adds delta to the score for path. Used by attention signals to
-// apply a transient recency boost without a full field recomputation.
-// The boost is overwritten on the next Update() call.
+// Boost adds delta to the score for path in both the base and observer
+// views. Used by attention signals (CogDoc reads, MCP attention emits,
+// observer warming/attenuation) to apply a transient recency boost
+// without a full field recomputation. The boost is overwritten on the
+// next Update() call.
+//
+// Recency reflects actual user/agent activity, so it should influence
+// chat-read salience just as it does observer salience — a freshly-read
+// CogDoc is relevant to the current turn.
 func (f *AttentionalField) Boost(path string, delta float64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.scores[path] += delta
+	f.base[path] += delta
+	f.observer[path] += delta
 }
 
-// AllScores returns a copy of the full path→score map.
+// AllScores returns a copy of the full path→observer-score map (the
+// observer view, including inbox boosts). Used by the observer loop
+// and substrate-health surfaces (MCP field resources, adjacency).
+//
+// For the chat-read view (no inbox boosts), use AllBaseScores.
+//
 // Safe for external iteration (callers get a snapshot, not a live map).
 func (f *AttentionalField) AllScores() map[string]float64 {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	out := make(map[string]float64, len(f.scores))
-	for k, v := range f.scores {
+	return copyScoreMap(f.observer)
+}
+
+// AllBaseScores returns a copy of the full path→base-score map (no
+// inbox boosts). Currently unused outside tests/diagnostics, but kept
+// symmetric with AllScores.
+func (f *AttentionalField) AllBaseScores() map[string]float64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return copyScoreMap(f.base)
+}
+
+func copyScoreMap(m map[string]float64) map[string]float64 {
+	out := make(map[string]float64, len(m))
+	for k, v := range m {
 		out[k] = v
 	}
 	return out
@@ -321,8 +411,13 @@ func (f *AttentionalField) AllScores() map[string]float64 {
 //   - status: enriched → +inboxEnrichedBoost  (needs integration)
 //   - status: integrated or missing → no boost (already processed)
 //
-// This ensures newly ingested items spike the attentional field so the
-// observer loop notices them without requiring a separate registration step.
+// This ensures newly ingested items spike the observer view of the
+// attentional field so the enrichment/integration pipeline notices them
+// without requiring a separate registration step.
+//
+// Caller MUST pass the observer map only. The base map (chat-read view)
+// is intentionally left untouched — chat assemblers should not see bulk
+// inbox imports as high-salience candidates.
 func applyInboxBoosts(scores map[string]float64) {
 	for path, score := range scores {
 		if !strings.Contains(path, inboxPathFragment) {
