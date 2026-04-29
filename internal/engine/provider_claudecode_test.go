@@ -1,15 +1,20 @@
 package engine
 
 import (
+	"context"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fixture lines are captured Anthropic stream-json NDJSON events.
 // Each string is one NDJSON line as emitted by `claude --output-format stream-json`.
 
 // toolUseFixture exercises the full tool_use event sequence:
-//   content_block_start (tool_use) → content_block_delta (input_json_delta) × N → content_block_stop → result
+//
+//	content_block_start (tool_use) → content_block_delta (input_json_delta) × N → content_block_stop → result
 var toolUseFixture = []string{
 	// system init
 	`{"type":"system","subtype":"init","session_id":"test-session","tools":[],"mcp_servers":[]}`,
@@ -328,5 +333,75 @@ func TestParseStreamLine_ErrorResult(t *testing.T) {
 	}
 	if !strings.Contains(chunk.Error.Error(), "something went wrong") {
 		t.Errorf("error message wrong: %v", chunk.Error)
+	}
+}
+
+// ── Context-cancel / subprocess-kill tests ───────────────────────────────────
+
+// TestComplete_ContextCancel_KillsSubprocess verifies that cancelling the
+// context actually kills the subprocess instead of leaving cmd.Wait() stuck in
+// waitpid(2). This is the regression test for cogos-dev/cogos#79.
+//
+// Strategy: point cliBinary at a tiny shell wrapper that ignores all its
+// arguments and just sleeps for 30 s. Cancel the context after 50 ms and
+// assert that Complete() returns well within the 10 s WaitDelay grace period
+// (we allow 12 s total for headroom). The test would time out or take ≥30 s
+// without the fix.
+func TestComplete_ContextCancel_KillsSubprocess(t *testing.T) {
+	// Write a shell wrapper to a temp file. The wrapper ignores all arguments
+	// (the claude flags injected by buildArgs) and just sleeps so we can observe
+	// the kill behaviour.
+	script, err := os.CreateTemp(t.TempDir(), "fake-claude-*.sh")
+	if err != nil {
+		t.Fatalf("create temp script: %v", err)
+	}
+	fmt.Fprintln(script, "#!/bin/sh")
+	fmt.Fprintln(script, "sleep 30")
+	script.Close()
+	if err := os.Chmod(script.Name(), 0o755); err != nil {
+		t.Fatalf("chmod temp script: %v", err)
+	}
+
+	procMgr := NewProcessManager(ProcessManagerConfig{})
+	p := &ClaudeCodeProvider{
+		name:      "test",
+		model:     "sonnet",
+		cliBinary: script.Name(),
+		procMgr:   procMgr,
+	}
+
+	req := &CompletionRequest{
+		Messages: []ProviderMessage{
+			{Role: "user", Content: "hello"},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel context after a short delay to let the subprocess start.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, callErr := p.Complete(ctx, req)
+	elapsed := time.Since(start)
+
+	// Complete() must return — this is the essential assertion.
+	// Without the fix, cmd.Wait() sits in waitpid(2) indefinitely.
+
+	// Must return in time: well under the 30 s sleep but allowing for the 10 s
+	// WaitDelay escalation window plus scheduling slack.
+	const deadline = 12 * time.Second
+	if elapsed > deadline {
+		t.Errorf("Complete() took %v; expected < %v — subprocess was not killed on cancel", elapsed, deadline)
+	}
+
+	// Must report a cancellation error.
+	if callErr == nil {
+		t.Error("Complete() returned nil error; expected cancellation error")
+	} else if !strings.Contains(callErr.Error(), "cancel") && !strings.Contains(callErr.Error(), "context") {
+		t.Errorf("Complete() error %q does not mention cancellation", callErr)
 	}
 }
