@@ -542,38 +542,94 @@ func evictForBudgetModeWithEstimator(docs []FovealDoc, conv []ScoredMessage, bud
 		)
 	}
 
-	// Phase 2: Fill remaining with conversation history (newest first).
-	// We want to keep recent turns, so iterate from newest to oldest,
-	// then reverse to restore chronological order.
-	var keptConv []ScoredMessage
-	if remaining > 0 && len(conv) > 0 {
-		// Iterate newest to oldest.
-		for i := len(conv) - 1; i >= 0; i-- {
-			if remaining <= 0 {
-				break
+	// Phase 2: Fill remaining with conversation history.
+	// Selection prefers high-CombinedScore turns; on ties (e.g. when scoring
+	// inputs are absent), prefer newer turns. User/assistant pairs are kept
+	// together. Output is restored to chronological order.
+	keptConv := selectConversationTurns(conv, remaining)
+
+	return keptDocs, keptConv
+}
+
+// selectConversationTurns picks turns to retain under a token budget.
+//
+// Selection ordering: highest CombinedScore first; ties broken by newer
+// turn (higher TurnIndex). User/assistant adjacent pairs are evaluated as
+// a unit (pair score = max of the two CombinedScores) and admitted or
+// rejected together. Standalone messages (system, tool_result, or an
+// unpaired user/assistant) are evaluated individually.
+//
+// The returned slice is in chronological (TurnIndex) order.
+func selectConversationTurns(conv []ScoredMessage, budget int) []ScoredMessage {
+	if budget <= 0 || len(conv) == 0 {
+		return nil
+	}
+
+	// Build admission units: either a (user, assistant) pair or a standalone.
+	type unit struct {
+		indices []int   // indexes into conv, in chronological order
+		tokens  int     // total token cost
+		score   float64 // priority score (max CombinedScore among members)
+		newest  int     // newest conv index in the unit, for tie-break
+	}
+
+	var units []unit
+	for i := 0; i < len(conv); i++ {
+		m := conv[i]
+		// Detect adjacent user→assistant pair.
+		if m.Role == "user" && i+1 < len(conv) && conv[i+1].Role == "assistant" {
+			a := conv[i+1]
+			score := m.CombinedScore
+			if a.CombinedScore > score {
+				score = a.CombinedScore
 			}
-			m := conv[i]
-			if m.Role == "assistant" && i > 0 && conv[i-1].Role == "user" {
-				pairTokens := conv[i-1].Tokens + m.Tokens
-				if pairTokens <= remaining {
-					keptConv = append(keptConv, m, conv[i-1])
-					remaining -= pairTokens
-				}
-				i--
-				continue
-			}
-			if m.Tokens <= remaining {
-				keptConv = append(keptConv, m)
-				remaining -= m.Tokens
-			}
+			units = append(units, unit{
+				indices: []int{i, i + 1},
+				tokens:  m.Tokens + a.Tokens,
+				score:   score,
+				newest:  i + 1,
+			})
+			i++
+			continue
 		}
-		// Reverse to restore chronological order.
-		for i, j := 0, len(keptConv)-1; i < j; i, j = i+1, j-1 {
-			keptConv[i], keptConv[j] = keptConv[j], keptConv[i]
+		units = append(units, unit{
+			indices: []int{i},
+			tokens:  m.Tokens,
+			score:   m.CombinedScore,
+			newest:  i,
+		})
+	}
+
+	// Sort units: highest score first, then newer conv position (tie-break).
+	sort.SliceStable(units, func(i, j int) bool {
+		if units[i].score != units[j].score {
+			return units[i].score > units[j].score
+		}
+		return units[i].newest > units[j].newest
+	})
+
+	remaining := budget
+	keptIdx := make([]int, 0, len(conv))
+	for _, u := range units {
+		if remaining <= 0 {
+			break
+		}
+		if u.tokens <= remaining {
+			keptIdx = append(keptIdx, u.indices...)
+			remaining -= u.tokens
 		}
 	}
 
-	return keptDocs, keptConv
+	// Restore chronological order.
+	sort.Ints(keptIdx)
+	out := make([]ScoredMessage, 0, len(keptIdx))
+	for _, idx := range keptIdx {
+		out = append(out, conv[idx])
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // messageRelevance scores a message's content against query keywords.

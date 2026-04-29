@@ -472,3 +472,124 @@ func containsStr(s, sub string) bool {
 	}
 	return false
 }
+
+// ── conversation combined-score (issue #92) ─────────────────────────────────
+
+// TestScoreConversationPopulatesCombinedScore guards against the regression in
+// issue #92: any turn with non-zero recency or relevance must have a non-zero
+// CombinedScore. A flat-zero CombinedScore degrades eviction to position-based.
+func TestScoreConversationPopulatesCombinedScore(t *testing.T) {
+	t.Parallel()
+	history := []ProviderMessage{
+		{Role: "user", Content: "tell me about eigenforms"},
+		{Role: "assistant", Content: "eigenforms are fixed points of cognition"},
+		{Role: "user", Content: "and what about the weather"},
+	}
+	keywords := extractKeywords("eigenforms")
+	scored := scoreConversation(history, keywords)
+	if len(scored) == 0 {
+		t.Fatalf("expected scored turns")
+	}
+	for i, m := range scored {
+		if m.RecencyScore > 0 || m.RelevanceScore > 0 {
+			if m.CombinedScore <= 0 {
+				t.Errorf("turn %d: recency=%.3f relevance=%.3f but combined=%.3f; want > 0",
+					i, m.RecencyScore, m.RelevanceScore, m.CombinedScore)
+			}
+		}
+	}
+}
+
+// TestEvictForBudgetPrefersHighCombinedScore exercises the eviction loop's use
+// of CombinedScore. Two pairs of identical token cost are presented; only one
+// pair fits. The pair with higher CombinedScore must be retained regardless of
+// chronological position.
+func TestEvictForBudgetPrefersHighCombinedScore(t *testing.T) {
+	t.Parallel()
+
+	// Two user/assistant pairs, identical token cost (10 tokens each).
+	// Pair A is older but has high relevance (combined ≈ 0.6).
+	// Pair B is newer but has low relevance (combined ≈ 0.4).
+	// Wait — recency favors B (newer = higher recency). To make the test
+	// unambiguous about CombinedScore (not recency or position), set
+	// scores explicitly so A's combined > B's combined.
+	conv := []ScoredMessage{
+		{Role: "user", Content: "old question", Tokens: 4, TurnIndex: 0,
+			RecencyScore: 0.25, RelevanceScore: 1.0, CombinedScore: 0.85},
+		{Role: "assistant", Content: "old answer with key info", Tokens: 6, TurnIndex: 1,
+			RecencyScore: 0.50, RelevanceScore: 1.0, CombinedScore: 0.90},
+		{Role: "user", Content: "newer chitchat", Tokens: 4, TurnIndex: 2,
+			RecencyScore: 0.75, RelevanceScore: 0.0, CombinedScore: 0.45},
+		{Role: "assistant", Content: "newer chitchat reply", Tokens: 6, TurnIndex: 3,
+			RecencyScore: 1.00, RelevanceScore: 0.0, CombinedScore: 0.60},
+	}
+
+	// Budget fits exactly one pair (10 tokens).
+	_, kept := evictForBudget(nil, conv, 10, t.TempDir())
+
+	if len(kept) != 2 {
+		t.Fatalf("kept len = %d; want 2 (one pair)", len(kept))
+	}
+	// Expect the higher-CombinedScore pair (A: "old question" / "old answer").
+	if kept[0].Content != "old question" || kept[1].Content != "old answer with key info" {
+		t.Errorf("kept = [%q, %q]; want the high-CombinedScore pair",
+			kept[0].Content, kept[1].Content)
+	}
+}
+
+// TestEvictForBudgetSingletonsPreferHighCombinedScore exercises the same
+// invariant for standalone messages (no user/assistant pair binding).
+func TestEvictForBudgetSingletonsPreferHighCombinedScore(t *testing.T) {
+	t.Parallel()
+
+	conv := []ScoredMessage{
+		{Role: "system", Content: "low-value note", Tokens: 5, TurnIndex: 0,
+			CombinedScore: 0.10},
+		{Role: "tool_result", Content: "high-value tool output", Tokens: 5, TurnIndex: 1,
+			CombinedScore: 0.95},
+		{Role: "system", Content: "another low-value note", Tokens: 5, TurnIndex: 2,
+			CombinedScore: 0.20},
+	}
+
+	// Budget fits one item.
+	_, kept := evictForBudget(nil, conv, 5, t.TempDir())
+
+	if len(kept) != 1 {
+		t.Fatalf("kept len = %d; want 1", len(kept))
+	}
+	if kept[0].Content != "high-value tool output" {
+		t.Errorf("kept = %q; want the high-CombinedScore standalone", kept[0].Content)
+	}
+}
+
+// TestDebugZoneItemExposesCombinedScore verifies the debug-snapshot pipeline
+// surfaces CombinedScore on conversation zone items so the /v1/debug/last
+// endpoint can render it instead of defaulting to 0.00.
+func TestDebugZoneItemExposesCombinedScore(t *testing.T) {
+	t.Parallel()
+
+	pkg := &ContextPackage{
+		Conversation: []ScoredMessage{
+			{Role: "user", Content: "hello", Tokens: 1,
+				RecencyScore: 0.5, RelevanceScore: 0.5, CombinedScore: 0.5},
+		},
+	}
+	view := buildContextView(pkg)
+
+	var convZone *DebugZone
+	for i := range view.Zones {
+		if view.Zones[i].Zone == "conversation" {
+			convZone = &view.Zones[i]
+			break
+		}
+	}
+	if convZone == nil {
+		t.Fatalf("expected conversation zone in debug view")
+	}
+	if len(convZone.Items) != 1 {
+		t.Fatalf("conv items = %d; want 1", len(convZone.Items))
+	}
+	if got := convZone.Items[0].CombinedScore; got != 0.5 {
+		t.Errorf("DebugZoneItem.CombinedScore = %v; want 0.5", got)
+	}
+}
