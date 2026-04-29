@@ -139,13 +139,16 @@ func captureDebugSnapshot(
 		snap.Engine = DebugEngineInfo{
 			NucleusTokens:         estTokens(pkg.NucleusText),
 			ClientSystemTokens:    estTokens(pkg.ClientSystem),
+			CogDocsScored:         pkg.CandidateCount,
 			CogDocsInjected:       len(pkg.FovealDocs),
 			CogDocsInjectedPaths:  pkg.InjectedPaths,
 			ConversationTurnsIn:   conversationTurnsIn,
 			ConversationTurnsKept: len(pkg.Conversation),
 			CurrentMessageTokens:  currentTokens,
 			TotalTokens:           pkg.TotalTokens,
+			Budget:                pkg.Budget,
 			OutputReserve:         pkg.OutputReserve,
+			FlexBudgetUsed:        pkg.FlexBudgetUsed,
 		}
 
 		// Build context zone view.
@@ -195,13 +198,19 @@ func buildContextView(pkg *ContextPackage) DebugContextView {
 			if preview == "" {
 				preview = doc.Summary
 			}
+			// Report the raw relevance the classifier saw alongside the reason
+			// it assigned. Previously the snapshot left Relevance unset (== 0)
+			// while still surfacing Reason="both", which made every "both"
+			// item look mislabeled. The two fields are now drawn from the same
+			// classification step.
 			docZone.Items = append(docZone.Items, DebugZoneItem{
-				ID:       doc.URI,
-				Title:    doc.Title,
-				Tokens:   doc.Tokens,
-				Salience: doc.Salience,
-				Reason:   doc.Reason,
-				Preview:  truncate(preview, 100),
+				ID:        doc.URI,
+				Title:     doc.Title,
+				Tokens:    doc.Tokens,
+				Salience:  doc.Salience,
+				Relevance: doc.Relevance,
+				Reason:    doc.Reason,
+				Preview:   truncate(preview, 100),
 			})
 			docZone.Tokens += doc.Tokens
 		}
@@ -241,7 +250,10 @@ func buildContextView(pkg *ContextPackage) DebugContextView {
 		used += z.Tokens
 	}
 
-	budget := 32768 // default
+	budget := pkg.Budget
+	if budget <= 0 {
+		budget = 32768 // default fallback when the assembler didn't record one
+	}
 	reserve := pkg.OutputReserve
 	if reserve == 0 {
 		reserve = 4096
