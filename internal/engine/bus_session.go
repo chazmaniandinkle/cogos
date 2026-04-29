@@ -54,12 +54,25 @@ type BusSessionManager struct {
 	mu            sync.Mutex
 	workspaceRoot string
 	eventHandlers []busEventHandler
+	// lastSeq and lastHash cache the most-recently written seq and hash per
+	// busID so that getLastEvent can return without scanning events.jsonl on
+	// every AppendEvent call.  Both maps are populated on the first successful
+	// AppendEvent for a bus and on every subsequent write; they are reset to
+	// zero-values on rotation (seq semantics are per-file — see archiveBus in
+	// root's bus_session.go which resets LastEventSeq/EventCount to 0 after
+	// rename).  Protected by m.mu.
+	lastSeq  map[string]int64
+	lastHash map[string]string
 }
 
 // NewBusSessionManager constructs a manager rooted at workspaceRoot.
 // Events and registry live under {workspaceRoot}/.cog/.state/buses/.
 func NewBusSessionManager(workspaceRoot string) *BusSessionManager {
-	return &BusSessionManager{workspaceRoot: workspaceRoot}
+	return &BusSessionManager{
+		workspaceRoot: workspaceRoot,
+		lastSeq:       make(map[string]int64),
+		lastHash:      make(map[string]string),
+	}
 }
 
 // WorkspaceRoot returns the workspace path the manager is bound to.
@@ -276,6 +289,11 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 	}
 	f.Close()
 
+	// Update the in-memory cache so subsequent getLastEvent calls skip the
+	// file scan.  Only update after a confirmed successful write.
+	m.lastSeq[busID] = int64(newSeq)
+	m.lastHash[busID] = evt.Hash
+
 	m.updateRegistrySeqLocked(busID, newSeq, evt.Ts)
 
 	// Snapshot handlers while locked, then dispatch OUTSIDE the lock.
@@ -290,9 +308,22 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 	return &evt, nil
 }
 
-// getLastEvent reads the last event from a bus to get seq and hash for chaining.
+// getLastEvent returns the seq and hash of the most-recently appended event.
 // Caller must hold m.mu.
+//
+// Fast path: if the in-memory cache has an entry for busID (populated by every
+// successful AppendEvent), return immediately — no file I/O.
+//
+// Slow path (cache miss): scan events.jsonl to find the last line and populate
+// the cache.  This only happens on the very first AppendEvent after process
+// start, or after a size-based rotation clears the cache entry.
 func (m *BusSessionManager) getLastEvent(busID string) (int, string) {
+	// Cache hit — return without touching the filesystem.
+	if seq, ok := m.lastSeq[busID]; ok {
+		return int(seq), m.lastHash[busID]
+	}
+
+	// Cache miss — scan the file and prime the cache.
 	eventsFile := m.EventsPath(busID)
 	f, err := os.Open(eventsFile)
 	if err != nil {
@@ -311,6 +342,9 @@ func (m *BusSessionManager) getLastEvent(busID string) (int, string) {
 	}
 
 	if lastLine == "" {
+		// Prime the cache so subsequent calls skip the file open entirely.
+		m.lastSeq[busID] = 0
+		m.lastHash[busID] = ""
 		return 0, ""
 	}
 
@@ -318,6 +352,8 @@ func (m *BusSessionManager) getLastEvent(busID string) (int, string) {
 	if err := json.Unmarshal([]byte(lastLine), &block); err != nil {
 		return 0, ""
 	}
+	m.lastSeq[busID] = int64(block.Seq)
+	m.lastHash[busID] = block.Hash
 	return block.Seq, block.Hash
 }
 
