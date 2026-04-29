@@ -751,6 +751,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// model. Eventually this aliases the kernel-managed in-host harness;
 		// see .cog/scratch/audit-inference-paths/REPORT.md.
 		creq.Metadata.PreferProvider = "ollama"
+		// Auto-inject the kernel's MCP tool registry when the client did not
+		// supply tools of its own. Closes cogos-dev/cogos#89: the dashboard's
+		// chat path constructs `{model, messages, stream}` with no `tools`
+		// array, so the model receives zero tool definitions and promises
+		// tool calls that never fire. Advertising the kernel surface lets
+		// the provider emit real tool_use events the kernel can route via
+		// MCP. We only inject when the client truly sent nothing — any
+		// explicit (even empty-but-present) tools array from the caller
+		// wins, since BrowserOS-style flows manage their own surface.
+		if len(creq.Tools) == 0 && s.mcpServer != nil {
+			injectKernelAgentTools(creq, s.mcpServer)
+		}
 	default:
 		// First check: is req.Model a provider alias (exact name match)? If so,
 		// route to that provider with NO ModelOverride — the provider knows its

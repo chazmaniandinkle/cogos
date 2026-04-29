@@ -72,6 +72,15 @@ type MCPServer struct {
 	// read by handleManifest. Frozen after registerTools returns, so
 	// lock-free reads are safe.
 	toolMeta []mcpToolMeta
+
+	// toolDefs is the cached snapshot of MCP tools as kernel-side
+	// [ToolDefinition] values, suitable for direct injection onto a
+	// [CompletionRequest.Tools] slice. Populated once at construction by
+	// snapshotToolDefinitions (which does an in-process ListTools); read
+	// by handleChat when the kernel-agent path needs to advertise its own
+	// tools. Frozen after construction returns — read-only afterwards.
+	// See mcp_tool_defs.go and cogos-dev/cogos#89.
+	toolDefs []ToolDefinition
 }
 
 // channelSessionBackend is the narrow surface the mod3 session-family MCP
@@ -112,6 +121,14 @@ func NewMCPServerWithAgentController(cfg *Config, nucleus *Nucleus, process *Pro
 
 	m.registerTools()
 	m.registerResources()
+
+	// Snapshot the registered tool list as kernel-side ToolDefinitions so the
+	// chat path can auto-advertise the kernel's MCP tool surface to the
+	// inference provider when the request targets the kernel-agent route
+	// without supplying its own tools (cogos-dev/cogos#89). Best-effort: a
+	// snapshot failure logs a warning and leaves m.toolDefs nil — chat falls
+	// back to the previous behavior (no tools advertised) without breaking.
+	m.toolDefs = snapshotToolDefinitions(server)
 
 	m.handler = mcp.NewStreamableHTTPHandler(
 		func(r *http.Request) *mcp.Server { return server },
