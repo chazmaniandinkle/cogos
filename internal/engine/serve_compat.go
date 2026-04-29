@@ -85,8 +85,8 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 			{
-				"id":   "claude-opus-4-6",
-				"name": "Claude Opus 4.6",
+				"id":   "claude-opus-4-7",
+				"name": "Claude Opus 4.7",
 				"limits": map[string]int{
 					"context": 1000000,
 					"output":  32000,
@@ -139,7 +139,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		ID         string            `json:"id"`
 		Object     string            `json:"object"`
 		Created    int64             `json:"created"`
-		OwnedBy   string            `json:"owned_by"`
+		OwnedBy    string            `json:"owned_by"`
 		Permission []modelPermission `json:"permission"`
 	}
 	type response struct {
@@ -166,7 +166,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		Object: "list",
 		Data: []model{
 			mkModel("claude-sonnet-4-6", "anthropic"),
-			mkModel("claude-opus-4-6", "anthropic"),
+			mkModel("claude-opus-4-7", "anthropic"),
 			mkModel("local", "cogos"),
 		},
 	})

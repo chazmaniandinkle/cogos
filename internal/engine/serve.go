@@ -722,13 +722,32 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Map OpenClaw model names to provider routing.
 	// "claude", "codex", "ollama" are provider aliases, not model names.
 	switch req.Model {
-	case "", "local":
-		// use default routing
+	case "":
+		// empty model: use default routing
+	case "local":
+		// Pin to a local provider explicitly. Prefer ollama (always-resident
+		// baseline), then any other provider with IsLocal=true. If no local
+		// provider is registered, fall through to default routing and warn so
+		// operators notice (silent cloud routing under a "local" alias is the
+		// bug this fixes; see cogos-dev/cogos#75).
+		if name, ok := s.router.ProviderForName("ollama"); ok {
+			creq.Metadata.PreferProvider = name
+		} else if name, ok := s.router.FirstLocalProvider(); ok {
+			creq.Metadata.PreferProvider = name
+		} else {
+			slog.Warn("chat: model=local requested but no local provider registered; falling back to default routing",
+				"request_id", creq.Metadata.RequestID,
+			)
+		}
 	case "claude":
 		creq.Metadata.PreferProvider = "claude-code"
 	case "codex":
 		creq.Metadata.PreferProvider = "codex"
-	case "ollama":
+	case "ollama", "kernel-agent":
+		// "kernel-agent" is the canonical alias for "the same harness the
+		// dispatch tool uses" — currently Ollama with the default kernel-core
+		// model. Eventually this aliases the kernel-managed in-host harness;
+		// see .cog/scratch/audit-inference-paths/REPORT.md.
 		creq.Metadata.PreferProvider = "ollama"
 	default:
 		// First check: is req.Model a provider alias (exact name match)? If so,
