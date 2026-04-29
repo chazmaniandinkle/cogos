@@ -156,9 +156,17 @@ func (p *ClaudeCodeProvider) Complete(ctx context.Context, req *CompletionReques
 	)
 
 	cmd := exec.CommandContext(ctx, p.cliBinary, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {
-		return cmd.Process.Signal(syscall.SIGTERM)
+		if cmd.Process == nil {
+			return nil
+		}
+		// Signal the whole process group so any helpers `claude` spawned
+		// die too. Without Setpgid+negative-PID kill, dash-style shells
+		// orphan their children on SIGTERM, the orphans keep stdout open,
+		// and our drainStreamJSON read blocks until they exit naturally.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
 	cmd.Stdin = strings.NewReader(prompt)
 
@@ -253,9 +261,17 @@ func (p *ClaudeCodeProvider) Stream(ctx context.Context, req *CompletionRequest)
 	)
 
 	cmd := exec.CommandContext(ctx, p.cliBinary, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {
-		return cmd.Process.Signal(syscall.SIGTERM)
+		if cmd.Process == nil {
+			return nil
+		}
+		// Signal the whole process group so any helpers `claude` spawned
+		// die too. Without Setpgid+negative-PID kill, dash-style shells
+		// orphan their children on SIGTERM, the orphans keep stdout open,
+		// and our drainStreamJSON read blocks until they exit naturally.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
 	cmd.Stdin = strings.NewReader(prompt)
 
@@ -708,9 +724,17 @@ func (p *ClaudeCodeProvider) SpawnBackground(opts BackgroundTaskOpts) (string, e
 	}
 
 	cmd := exec.CommandContext(ctx, p.cliBinary, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {
-		return cmd.Process.Signal(syscall.SIGTERM)
+		if cmd.Process == nil {
+			return nil
+		}
+		// Signal the whole process group so any helpers `claude` spawned
+		// die too. Without Setpgid+negative-PID kill, dash-style shells
+		// orphan their children on SIGTERM, the orphans keep stdout open,
+		// and our drainStreamJSON read blocks until they exit naturally.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
 	cmd.Stdin = strings.NewReader(opts.Prompt)
 	if opts.WorkDir != "" {
