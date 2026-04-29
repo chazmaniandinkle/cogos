@@ -25,8 +25,15 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 )
+
+// claudeCodeKillGrace is the time we wait for the claude subprocess to exit
+// after sending SIGTERM before exec.Cmd escalates to SIGKILL automatically.
+// 10 s is enough for a graceful shutdown but short enough to unblock the kernel
+// well within the 5-minute autonomic-cycle timeout.
+const claudeCodeKillGrace = 10 * time.Second
 
 // ClaudeCodeProvider implements Provider by spawning claude CLI processes.
 type ClaudeCodeProvider struct {
@@ -149,6 +156,10 @@ func (p *ClaudeCodeProvider) Complete(ctx context.Context, req *CompletionReques
 	)
 
 	cmd := exec.CommandContext(ctx, p.cliBinary, args...)
+	cmd.WaitDelay = claudeCodeKillGrace
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdout, err := cmd.StdoutPipe()
@@ -242,6 +253,10 @@ func (p *ClaudeCodeProvider) Stream(ctx context.Context, req *CompletionRequest)
 	)
 
 	cmd := exec.CommandContext(ctx, p.cliBinary, args...)
+	cmd.WaitDelay = claudeCodeKillGrace
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdout, err := cmd.StdoutPipe()
@@ -472,8 +487,8 @@ type ccStreamEvent struct {
 	} `json:"content_block"`
 	// Delta is populated for content_block_delta events.
 	Delta struct {
-		Type      string `json:"type"`       // "text_delta" or "input_json_delta"
-		Text      string `json:"text"`       // populated for text_delta
+		Type        string `json:"type"`         // "text_delta" or "input_json_delta"
+		Text        string `json:"text"`         // populated for text_delta
 		PartialJSON string `json:"partial_json"` // populated for input_json_delta
 	} `json:"delta"`
 }
@@ -693,6 +708,10 @@ func (p *ClaudeCodeProvider) SpawnBackground(opts BackgroundTaskOpts) (string, e
 	}
 
 	cmd := exec.CommandContext(ctx, p.cliBinary, args...)
+	cmd.WaitDelay = claudeCodeKillGrace
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
 	cmd.Stdin = strings.NewReader(opts.Prompt)
 	if opts.WorkDir != "" {
 		cmd.Dir = opts.WorkDir
