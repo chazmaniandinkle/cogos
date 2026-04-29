@@ -116,6 +116,21 @@ func (r *SimpleRouter) ProviderForModel(model string) (string, bool) {
 	return "", false
 }
 
+// FirstLocalProvider returns the name of the first registered provider whose
+// Capabilities().IsLocal is true. Providers are iterated in registration
+// order (alphabetically sorted by Name). Returns ("", false) when none is
+// registered.
+func (r *SimpleRouter) FirstLocalProvider() (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, p := range r.providers {
+		if p.Capabilities().IsLocal {
+			return p.Name(), true
+		}
+	}
+	return "", false
+}
+
 // Route selects the best available provider for the request.
 func (r *SimpleRouter) Route(ctx context.Context, req *CompletionRequest) (Provider, *RoutingDecision, error) {
 	start := time.Now()

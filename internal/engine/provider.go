@@ -330,6 +330,12 @@ type Router interface {
 	// ("", false) when no match. Name match takes precedence over model match.
 	ProviderForModel(model string) (string, bool)
 
+	// FirstLocalProvider returns the name of the first registered provider
+	// whose Capabilities().IsLocal is true. Used by the "local" model alias
+	// to pin requests to an on-device provider. Returns ("", false) when no
+	// local provider is registered.
+	FirstLocalProvider() (string, bool)
+
 	// Stats returns routing statistics.
 	Stats() RouterStats
 }
