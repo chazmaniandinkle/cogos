@@ -190,6 +190,29 @@ func NewKernelToolRegistry(mcpSrv *MCPServer) *KernelToolRegistry {
 			),
 			executor: makeExecutor(mcpSrv, mcpSrv.toolIngest, ingestInput{}),
 		},
+		// Audit-scope tools — read-only filesystem access within the workspace root.
+		// Listed here so they are in the full kernel registry; they are only
+		// visible to harness dispatches when scope="audit" (or a superset).
+		{
+			name:        "cog_read_file",
+			description: "Read an arbitrary file within the workspace root. Returns line-numbered content with optional offset/limit. Rejects paths outside the workspace root.",
+			schema: mergeSchemas(
+				requiredSchema("path", "string", "Absolute path within workspace root"),
+				optionalSchema("offset", "integer", "Line offset (0-based, default 0)"),
+				optionalSchema("limit", "integer", "Maximum lines to return (default 500)"),
+			),
+			executor: makeExecutor(mcpSrv, mcpSrv.toolReadFile, readFileInput{}),
+		},
+		{
+			name:        "cog_grep_files",
+			description: "Regex search over files within the workspace root (ripgrep-style). Returns matching lines with path and line number. Rejects search paths outside the workspace root.",
+			schema: mergeSchemas(
+				requiredSchema("pattern", "string", "Regular expression pattern to search for"),
+				optionalSchema("path", "string", "Directory or file to search (defaults to workspace root)"),
+				optionalSchema("max_results", "integer", "Maximum matches to return (default 50)"),
+			),
+			executor: makeExecutor(mcpSrv, mcpSrv.toolGrepFiles, grepFilesInput{}),
+		},
 	}
 
 	for _, t := range tools {

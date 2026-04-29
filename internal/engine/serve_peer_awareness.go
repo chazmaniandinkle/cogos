@@ -40,7 +40,7 @@ import (
 // registerPeerAwarenessRoutes attaches the one route this file owns onto
 // mux. Called from NewServer alongside the other registerXxxRoutes helpers.
 func (s *Server) registerPeerAwarenessRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/peer-awareness", s.handlePeerAwareness)
+	s.route(mux, "GET /v1/peer-awareness", s.handlePeerAwareness)
 }
 
 // handlePeerAwareness dispatches to RenderPeerAwarenessPacket and marshals

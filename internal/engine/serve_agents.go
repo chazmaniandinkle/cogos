@@ -25,15 +25,15 @@ type agentStatusCompat struct {
 }
 
 func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/agents", s.handleAgentsList)
-	mux.HandleFunc("GET /v1/agents/{id}", s.handleAgentGet)
-	mux.HandleFunc("POST /v1/agents/{id}/tick", s.handleAgentTick)
-	mux.HandleFunc("POST /v1/agents/{id}/dispatch", s.handleAgentDispatch)
+	s.route(mux, "GET /v1/agents", s.handleAgentsList)
+	s.route(mux, "GET /v1/agents/{id}", s.handleAgentGet)
+	s.route(mux, "POST /v1/agents/{id}/tick", s.handleAgentTick)
+	s.route(mux, "POST /v1/agents/{id}/dispatch", s.handleAgentDispatch)
 
 	// Legacy dashboard routes.
-	mux.HandleFunc("GET /v1/agent/status", s.handleAgentStatusCompat)
-	mux.HandleFunc("GET /v1/agent/traces", s.handleAgentTracesCompat)
-	mux.HandleFunc("POST /v1/agent/trigger", s.handleAgentTriggerCompat)
+	s.route(mux, "GET /v1/agent/status", s.handleAgentStatusCompat)
+	s.route(mux, "GET /v1/agent/traces", s.handleAgentTracesCompat)
+	s.route(mux, "POST /v1/agent/trigger", s.handleAgentTriggerCompat)
 }
 
 func (s *Server) handleAgentsList(w http.ResponseWriter, r *http.Request) {

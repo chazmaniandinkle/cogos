@@ -98,6 +98,11 @@ type Server struct {
 	// slice. Populated at startup only — reads are lock-free because the
 	// slice is frozen by the time Start returns.
 	httpRoutes []routeMeta
+
+	// spanEmitter is wired to busSessions at startup so that withSpan
+	// closures can emit KernelHandlerSpan events to bus_traces. Nil-safe:
+	// withSpan is a no-op wrapper when spanEmitter is nil.
+	spanEmitter spanEmitter
 }
 
 // NewServer constructs a Server bound to the configured port.
@@ -108,6 +113,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// handlers don't need nil-safety for the common case; tests can
 	// override via the exported fields if they want an isolated fixture.
 	s.busSessions = NewBusSessionManager(cfg.WorkspaceRoot)
+	s.spanEmitter = &serverSpanEmitter{bus: s.busSessions}
 	s.busBroker = NewBusEventBroker()
 	s.busConsumers = NewConsumerRegistry(
 		// Match root's persistence path: .cog/run/bus/{bus_id}.cursors.jsonl

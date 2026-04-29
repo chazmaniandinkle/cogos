@@ -58,9 +58,15 @@ type DispatchRequest struct {
 	// Required and non-empty.
 	Task string
 
+	// Scope selects the named tool scope for this dispatch. Empty string
+	// means "use the harness's default scope" (consolidation). Unknown scope
+	// names are rejected before the dispatch runs. The Tools field, if set,
+	// further narrows within the resolved scope.
+	Scope string
+
 	// Tools is the optional allowlist for this dispatch. nil or empty means
-	// "use the harness's default tool registry". Names that don't match any
-	// registered tool surface as an error in the result, not silent drop.
+	// "use the full scope set". Names that don't match any tool in the
+	// chosen scope surface as an error rather than silently dropping.
 	Tools []string
 
 	// Model selects the inference backend. Unknown values default to e4b.
