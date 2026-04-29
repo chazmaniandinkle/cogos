@@ -376,7 +376,7 @@ CogOS is one piece of a larger system. Each component is its own repo with indep
 | Repo | Purpose | Status |
 |------|---------|--------|
 | **[cogos](https://github.com/cogos-dev/cogos)** | The daemon -- this repo | Active |
-| [constellation](https://github.com/cogos-dev/constellation) | Distributed identity and workspace sync (BEP-based) | Active |
+| [constellation](https://github.com/cogos-dev/constellation) | L1 trust-node protocol for the Constellation substrate. Git-backed hash-chained ledger, ECDSA P-256 identity, EMA-weighted peer trust. Consumed via the kernel's `ConstellationBridge` seam. | Active |
 | [mod3](https://github.com/cogos-dev/mod3) | Modality bus -- voice I/O, TTS, channel multiplexing | Active |
 | [skills](https://github.com/cogos-dev/skills) | Agent skill library (Claude Code compatible) | Active |
 | [charts](https://github.com/cogos-dev/charts) | Helm charts and Docker Compose for deployment | Active |
