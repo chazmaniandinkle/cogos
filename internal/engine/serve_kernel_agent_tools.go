@@ -1,7 +1,8 @@
 // serve_kernel_agent_tools.go — auto-injection of the kernel's MCP tool
 // registry on the kernel-agent chat route.
 //
-// Closes cogos-dev/cogos#89.
+// Closes cogos-dev/cogos#89 (auto-injection) and #94 (server-side execution
+// of injected cog_* tools instead of client forwarding).
 //
 // Background: when a chat request lands on the kernel-agent route, the
 // inference provider receives whatever ToolDefinitions the caller chose to
@@ -51,16 +52,26 @@ func injectKernelAgentTools(creq *CompletionRequest, m *MCPServer) {
 
 	// Partition by ownership the same way the OpenAI-compat path does:
 	// internal-ownership tools execute server-side; client-ownership tools
-	// are forwarded back as tool_calls to whoever sent the request. The
-	// classifyToolOwnership helper currently maps Bash/Read/Write/...
-	// to kernel and everything else to client; that means cog_* MCP tools
-	// land in ExternalTools today. That is consistent with the current
-	// dispatch path — extending kernel-side execution to cog_* tools is a
-	// separate, larger change tracked by the audit Tier-2 work.
+	// are forwarded back as tool_calls to whoever sent the request.
+	//
+	// Two ownership pools count as internal here:
+	//   1. classifyToolOwnership returns ToolOwnershipKernel — Bash/Read/...
+	//      built-ins routed via the existing claude-CLI/MCP-bridge path.
+	//   2. m.IsInternalTool(name) — every tool the MCP server itself
+	//      registered (cog_*, mod3_*, plus anything an extension wired in).
+	//      The chat handler executes these in-process via [MCPServer.CallTool]
+	//      and appends the tool_result back into the conversation; closes #94.
+	//
+	// Anything left over (browser_*, agent-defined tools, etc.) is forwarded
+	// to the client as tool_calls — the BrowserOS-style passthrough path.
 	for _, t := range tools {
-		if classifyToolOwnership(t.Name) == ToolOwnershipClient {
-			creq.ExternalTools = append(creq.ExternalTools, t)
+		if classifyToolOwnership(t.Name) == ToolOwnershipKernel {
+			continue
 		}
+		if m.IsInternalTool(t.Name) {
+			continue
+		}
+		creq.ExternalTools = append(creq.ExternalTools, t)
 	}
 
 	slog.Info("chat: kernel-agent auto-injected MCP tool registry",

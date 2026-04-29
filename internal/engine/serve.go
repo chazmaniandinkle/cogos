@@ -680,11 +680,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Convert OpenAI-format tool definitions to internal ToolDefinition and
-	// partition by ownership. Internal tools (Bash/Read/Write/...) are
-	// executed server-side via Claude CLI or the MCP bridge; external
-	// tools (browser_*, etc.) are forwarded to the model as tool
-	// definitions but their tool_use events come back to the client as
-	// OpenAI `tool_calls` for client-side execution.
+	// partition by ownership. Three ownership pools:
+	//   - Bash/Read/Write/... — kernel via classifyToolOwnership (claude-CLI
+	//     / MCP-bridge path, unchanged).
+	//   - cog_*, mod3_*, etc. — kernel via MCPServer.CallTool when the model
+	//     emits a tool_use for them (closes #94).
+	//   - everything else (browser_*, agent-defined tools) — forwarded to
+	//     the client as OpenAI tool_calls for client-side execution.
 	if len(req.Tools) > 0 {
 		creq.Tools = make([]ToolDefinition, 0, len(req.Tools))
 		for _, t := range req.Tools {
@@ -697,9 +699,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				InputSchema: t.Function.Parameters,
 			}
 			creq.Tools = append(creq.Tools, td)
-			if classifyToolOwnership(t.Function.Name) == ToolOwnershipClient {
-				creq.ExternalTools = append(creq.ExternalTools, td)
+			if classifyToolOwnership(t.Function.Name) == ToolOwnershipKernel {
+				continue
 			}
+			if s.mcpServer != nil && s.mcpServer.IsInternalTool(t.Function.Name) {
+				continue
+			}
+			creq.ExternalTools = append(creq.ExternalTools, td)
 		}
 	}
 
@@ -953,6 +959,87 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 			},
 		})
 		return
+	}
+
+	// Server-side execution of MCP-internal tools (cog_*, mod3_*, ...).
+	// When the provider emits a tool_use for a tool the kernel itself owns
+	// (per MCPServer.IsInternalTool), execute it in-process, append the
+	// assistant's tool_calls + a tool_result message to the conversation,
+	// and re-issue Complete so the model can either fire another internal
+	// tool or produce a final assistant reply. Closes #94.
+	//
+	// Tools we don't own (browser_*, etc.) fall through unchanged — they
+	// surface to the caller as OpenAI tool_calls below.
+	if s.mcpServer != nil {
+		const maxInternalHops = 8
+		for hop := 0; hop < maxInternalHops; hop++ {
+			internal, external := splitToolCallsByOwnership(resp.ToolCalls, s.mcpServer)
+			if len(internal) == 0 {
+				break
+			}
+			// If the provider mixed internal + external tool_use in the same
+			// turn we still service the internal ones, but keep the external
+			// ones queued for the response so the client gets them.
+			req.Messages = appendToolHopMessages(req.Messages, resp, internal)
+			for _, tc := range internal {
+				s.executeInternalToolCall(ctx, provider.Name(), tc)
+				resultText, isErr, callErr := s.mcpServer.CallTool(ctx, tc.Name, []byte(tc.Arguments))
+				if callErr != nil {
+					slog.Warn("chat: internal MCP tool call failed",
+						"tool", tc.Name, "err", callErr,
+						"request_id", req.Metadata.RequestID,
+					)
+					resultText = "tool error: " + callErr.Error()
+					isErr = true
+				}
+				s.process.resolvePendingToolCall(tc.ID, resultText)
+				req.Messages = append(req.Messages, ProviderMessage{
+					Role:       "tool",
+					Content:    resultText,
+					Name:       tc.Name,
+					ToolCallID: tc.ID,
+				})
+				if turn != nil {
+					rec := ToolCallRecord{
+						ID:        tc.ID,
+						Name:      tc.Name,
+						Arguments: tc.Arguments,
+						Result:    truncateForTurn(resultText),
+					}
+					if isErr {
+						rec.Rejected = true
+						rec.RejectReason = "tool reported error"
+					}
+					turn.ToolCalls = append(turn.ToolCalls, rec)
+				}
+			}
+			// Preserve any external tool_calls for the next iteration's
+			// response so we don't drop them on the floor.
+			next, nerr := provider.Complete(ctx, req)
+			if nerr != nil {
+				slog.Warn("chat: complete after internal tool exec failed", "err", nerr)
+				if turn != nil {
+					turn.Status = "error"
+					turn.Error = nerr.Error()
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]any{
+						"message": sanitizeErrorMessage(nerr.Error()),
+						"type":    "server_error",
+					},
+				})
+				return
+			}
+			// If the prior turn carried external tool_use events alongside
+			// the internal ones, surface them by merging into next.ToolCalls
+			// so the client still sees them in the final response.
+			if len(external) > 0 {
+				next.ToolCalls = append(next.ToolCalls, external...)
+			}
+			resp = next
+		}
 	}
 	if turn != nil {
 		turn.Response = resp.Content
