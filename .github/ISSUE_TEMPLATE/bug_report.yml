@@ -1,0 +1,179 @@
+name: Bug report
+description: Report a defect in the kernel or supporting tooling.
+title: "<one-line description of the defect, not the symptom on your machine>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing. Before you start: the bug is in the **code**. Your
+        machine helped you find it, but it isn't the bug. The sections below
+        are structured to keep those two things separate — code-level
+        reproduction and acceptance criteria up top, your local environment
+        cordoned off at the bottom.
+
+        Worked examples that meet this standard: #75, #79, #80, #81.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: |
+        One paragraph describing what the bug is, in terms of code behavior —
+        not "X happened on my machine," but "the kernel does Y when it should
+        do Z." If you don't yet know the cause, that's fine; describe the
+        observable defect.
+      placeholder: |
+        The kernel's /v1/models endpoint advertises stale model IDs that no
+        longer match the canonical names declared in CLAUDE.md.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: |
+        Concrete artifacts: log lines, HTTP responses, source-file:line
+        references, output of small commands. Quote them, don't paraphrase.
+        If a single command reproduces the evidence, paste the command and
+        its output.
+      placeholder: |
+        ```
+        $ curl -s http://localhost:6931/v1/models | jq '.data[].id'
+        "claude-sonnet-4-6"
+        "claude-opus-4-6"
+        "local"
+        ```
+
+        Source: `internal/engine/serve_compat.go:165-172` hardcodes these IDs.
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: |
+        Numbered steps that reproduce the bug on **any** system meeting the
+        project's supported config. Don't include paths or PIDs from your
+        machine here — those go in the Environment section below.
+      placeholder: |
+        1. Start the kernel: `cogos-v3 serve --port 6931`
+        2. Send: `curl -s http://localhost:6931/v1/models`
+        3. Observe: response includes `claude-opus-4-6` (stale).
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should the code do instead? If a spec, ADR, or RFC defines the correct behavior, link it.
+      placeholder: |
+        `/v1/models` should advertise the canonical model IDs. Per the
+        workspace CLAUDE.md, current canonical Opus is `claude-opus-4-7`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: |
+        Who or what is affected. Be specific about user-visible behavior
+        ("clients enumerating /v1/models see X") rather than abstract risk.
+    validations:
+      required: true
+
+  - type: textarea
+    id: hypotheses
+    attributes:
+      label: Hypotheses or proposed cause (optional)
+      description: |
+        If you have a guess at the root cause, share it — but mark it as a
+        hypothesis. If you're confident, cite file:line. If you don't know,
+        leave this blank or say "I don't know yet."
+      placeholder: |
+        Likely cause: the model list in `serve_compat.go:165-172` is a static
+        slice that was last updated when 4-6 shipped and was never made
+        config-driven.
+
+  - type: textarea
+    id: proposed_fix
+    attributes:
+      label: Proposed fix (optional)
+      description: |
+        What 1-3 changes would resolve this? File:line specifics if you have
+        them. Don't propose architecture rewrites unless the bug genuinely
+        warrants one.
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance checklist
+      description: |
+        What must be true for this issue to be considered fixed? Each item
+        should be testable. Reviewers will use this to scope the PR.
+      value: |
+        - [ ]
+        - [ ] Test added that would have caught this regression.
+        - [ ] Documentation updated if behavior changed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: related
+    attributes:
+      label: Related
+      description: |
+        Linked issues, PRs, ADRs, RFCs. Use #N for this repo, full URLs for
+        cross-repo references.
+      placeholder: |
+        - Adjacent: #51 (same subsystem)
+        - Context: #75 (filed earlier, related routing logic)
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        ## Local Environment
+
+        **This section is informational only and is not load-bearing for the
+        fix.** Reproduction steps and acceptance criteria above must hold on
+        any system meeting the project's stated supported config. Anything
+        you put below should not appear in the sections above.
+
+        Don't put paths from your machine, your PIDs, your specific
+        dashboard process names, or your local config overrides in any
+        section other than this one.
+
+  - type: input
+    id: env_os
+    attributes:
+      label: OS / kernel
+      placeholder: macOS 15.4 (darwin/arm64) or Ubuntu 24.04 (linux/amd64)
+    validations:
+      required: true
+
+  - type: input
+    id: env_build
+    attributes:
+      label: cogos-v3 build / commit
+      description: Output of `cogos-v3 --version` or the build timestamp from `kernel.log.jsonl`.
+      placeholder: 2026-04-27T23:09:52Z (build timestamp) or commit 72f2161
+
+  - type: textarea
+    id: env_other
+    attributes:
+      label: Anything else specific to your environment
+      description: |
+        Workspace path (if relevant), active local services running on
+        ports the kernel touches, providers configured in
+        `providers.local.yaml`, anything else that's specific to your setup
+        rather than the project's defaults.
+      placeholder: |
+        - Workspace: ~/workspaces/cog
+        - Active local providers: claude-code, ollama (gemma4:e4b)
+        - Other services on adjacent ports: BrowserOS dashboard on :7000

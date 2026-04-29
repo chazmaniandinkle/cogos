@@ -33,28 +33,58 @@ Key areas:
 - `docs/` -- Specifications and architecture documents
 - `scripts/` -- Build tooling, setup scripts, experiment harnesses
 
+## Reporting issues
+
+Use the templates in `.github/ISSUE_TEMPLATE/`. They aren't optional formality -- they encode the project's standard for what an actionable issue looks like.
+
+The single most important rule: **the bug is in the code, not on your machine.** Your environment helped you find the defect, but your paths, PIDs, dashboard processes, and local config overrides are not the bug. Keep them in the "Local Environment" section at the bottom of the bug template, and keep them out of the Summary, Evidence, Reproduction, Impact, and Acceptance sections.
+
+A reviewer in a different environment must be able to:
+
+- Read the Summary and understand what defect exists in the code.
+- Run the Reproduction steps on a fresh checkout (no machine-specific setup beyond the project's stated supported config).
+- Use the Acceptance checklist as a definition of done.
+
+If your reproduction depends on a specific local arrangement (a particular provider configured, a particular dashboard process running), describe the *class* of arrangement in Reproduction ("a kernel running with at least one chronically-degraded provider") and note your specific instantiation in the Local Environment section.
+
+### Examples that meet this standard
+
+- [#75](https://github.com/cogos-dev/cogos/issues/75) -- model advertisement staleness + routing semantics. Three sub-bugs in one issue with shared fix surface, each cited at file:line.
+- [#79](https://github.com/cogos-dev/cogos/issues/79) -- kernel hang RCA. Filed with hypotheses honestly marked as hypotheses, then updated with a follow-up RCA that named the actual root cause.
+- [#80](https://github.com/cogos-dev/cogos/issues/80), [#81](https://github.com/cogos-dev/cogos/issues/81) -- companion issues cross-linked so a reader entering through any one can find the others.
+
 ## Submitting changes
 
 1. Fork the repo and create a branch from `main`
 2. Make your changes
 3. Run `make test` and ensure all tests pass
-4. Write a clear commit message describing what changed and why
-5. Open a pull request
+4. Open a pull request using `.github/PULL_REQUEST_TEMPLATE.md`
+
+The bar for "ready for review":
+
+- The PR links the issue it fixes.
+- At least one acceptance checklist item from the linked issue is ticked, or you've said why none are yet.
+- Test evidence is concrete: new tests are named, command output is pasted, CI status is linked. "Tests pass" by itself doesn't count.
+- Out-of-scope is stated. Reviewers should never have to guess whether you intentionally left something for a follow-up or just forgot.
+
+## RFCs and ADRs
+
+For substantial design changes -- new subsystems, protocol changes, breaking behavior, or anything that touches the kernel's persistence or routing -- open an RFC before opening a PR:
+
+```sh
+./scripts/cog rfc new "<title>"
+```
+
+ADRs document decisions that have been made; RFCs gather input on decisions that are still open. RFC-004 covers the workflow.
 
 ## Code style
 
 - Follow standard Go conventions (`gofmt`, `go vet`)
 - Tests go in `*_test.go` files alongside the code they test
 - Error messages should be lowercase and not end with punctuation (Go convention)
-
-## Reporting issues
-
-Open an issue on GitHub. Include:
-
-- What you expected to happen
-- What actually happened
-- Steps to reproduce
-- Go version and OS
+- Default to no comments. Add one only when the *why* is non-obvious.
+- Don't add error-handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees.
+- Don't add abstractions for hypothetical future requirements.
 
 ## License
 
