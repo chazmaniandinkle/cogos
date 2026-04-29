@@ -68,22 +68,6 @@ type BusEmitter interface {
 	EmitCogBlock(ctx context.Context, channelName string, block any) error
 }
 
-// CogdocReader reads raw cogdoc files from the workspace by cog:// URI or
-// absolute path. Used by LoadConfig to enumerate experiment cogdocs and by
-// FetchLive's variant loader.
-//
-// TODO(Phase C): align with workspace.Reader or the resolved path from
-// internal/engine.ResolveURI (uri.go). The mem:// projection resolves to
-// .cog/mem/ — see uri.go line 51.
-type CogdocReader interface {
-	// ReadCogdoc reads a single .cog.md file, returning raw bytes.
-	// path may be an absolute filesystem path or a cog:// URI.
-	ReadCogdoc(path string) ([]byte, error)
-	// GlobCogdocs returns all .cog.md file paths under the given cog:// URI
-	// prefix or filesystem directory (non-recursive subdirs included).
-	GlobCogdocs(prefix string) ([]string, error)
-}
-
 // ---------------------------------------------------------------------------
 // Dispatch shims (shape-compatible with internal/engine, locally redeclared)
 // ---------------------------------------------------------------------------
@@ -520,8 +504,6 @@ type EvalProvider struct {
 	dispatcher AgentDispatcher
 	// emitter handles CogBlock emission to bus_tournament. Set by boot path.
 	emitter BusEmitter
-	// reader reads cogdoc files. Set by boot path.
-	reader CogdocReader
 	// busReader reads events from bus_tournament. Added in Phase C for FetchLive.
 	// May be nil when the kernel is not running; FetchLive degrades gracefully.
 	busReader BusReader
@@ -535,7 +517,7 @@ type EvalProvider struct {
 var (
 	// NewEvalProvider constructs a wired EvalProvider. Set by wiring layer.
 	// TODO(Phase C wiring): replace with direct constructor call from kernel boot.
-	NewEvalProvider func(dispatcher AgentDispatcher, emitter BusEmitter, reader CogdocReader) *EvalProvider
+	NewEvalProvider func(dispatcher AgentDispatcher, emitter BusEmitter) *EvalProvider
 	// NowISO returns the current UTC time in ISO-8601. Set by wiring layer
 	// (same sentinel as component_provider.go).
 	NowISO func() string
@@ -544,7 +526,7 @@ var (
 // New constructs an EvalProvider with the given dependencies.
 // Any dependency may be nil; the provider degrades gracefully.
 // This is the preferred constructor over the NewEvalProvider function variable.
-func New(dispatcher AgentDispatcher, emitter BusEmitter, reader CogdocReader) *EvalProvider {
+func New(dispatcher AgentDispatcher, emitter BusEmitter) *EvalProvider {
 	return &EvalProvider{
 		dispatcher: dispatcher,
 		emitter:    emitter,
@@ -558,9 +540,9 @@ func New(dispatcher AgentDispatcher, emitter BusEmitter, reader CogdocReader) *E
 }
 
 // NewWithReader constructs an EvalProvider with a BusReader for FetchLive.
-// The reader reads bus events; the emitter sends them.
-func NewWithReader(dispatcher AgentDispatcher, emitter BusEmitter, reader CogdocReader, busReader BusReader) *EvalProvider {
-	p := New(dispatcher, emitter, reader)
+// The busReader reads bus events; the emitter sends them.
+func NewWithReader(dispatcher AgentDispatcher, emitter BusEmitter, busReader BusReader) *EvalProvider {
+	p := New(dispatcher, emitter)
 	p.busReader = busReader
 	return p
 }
