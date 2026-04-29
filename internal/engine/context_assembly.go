@@ -266,6 +266,11 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 	keywords := extractKeywords(query)
 	cogIdx := p.Index()
 
+	// Read gating knobs once at request start so a concurrent PATCH cannot
+	// half-apply mid-assembly. See .cog/scratch/audit-dashboard-context/REPORT.md
+	// §4 — without these the chat path admits every doc above zero salience.
+	maxFovealDocs, salienceFloor := p.cfg.ContextGating()
+
 	var docCandidates []FovealDoc
 	usedTRM := false
 
@@ -276,13 +281,22 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 			usedTRM = true
 			// Build doc candidates from TRM results, using TRM score as primary ranking.
 			for _, tr := range trmResults {
+				score := float64(tr.TRMScore)
+				if score < salienceFloor {
+					continue
+				}
 				docCandidates = append(docCandidates, FovealDoc{
 					URI:      "cog://chunks/" + tr.IndexResult.ChunkMeta.ChunkID,
 					Path:     tr.IndexResult.ChunkMeta.Path,
 					Title:    tr.IndexResult.ChunkMeta.Title,
-					Salience: float64(tr.TRMScore),
+					Salience: score,
 					Reason:   "trm",
 				})
+			}
+			// TRM results arrive pre-sorted by score; truncate after the floor
+			// so the cap and the floor compose correctly.
+			if maxFovealDocs > 0 && len(docCandidates) > maxFovealDocs {
+				docCandidates = docCandidates[:maxFovealDocs]
 			}
 			slog.Debug("context: TRM scored candidates", "count", len(docCandidates))
 		}
@@ -305,6 +319,11 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 				continue
 			}
 
+			combined := relevance*2.0 + salience
+			if combined < salienceFloor {
+				continue
+			}
+
 			reason := "high-salience"
 			switch {
 			case relevance > 0 && salience > 0:
@@ -317,13 +336,17 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 				URI:      doc.URI,
 				Path:     doc.Path,
 				Title:    doc.Title,
-				Salience: relevance*2.0 + salience,
+				Salience: combined,
 				Reason:   reason,
 			})
 		}
 		sort.Slice(docCandidates, func(i, j int) bool {
 			return docCandidates[i].Salience > docCandidates[j].Salience
 		})
+		// Cap after sort so the highest-scoring docs survive.
+		if maxFovealDocs > 0 && len(docCandidates) > maxFovealDocs {
+			docCandidates = docCandidates[:maxFovealDocs]
+		}
 	}
 
 	// === Score conversation history ===

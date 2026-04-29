@@ -139,6 +139,8 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.route(mux, "GET /v1/cogdoc/read", s.handleCogDocRead)
 	s.route(mux, "GET /v1/debug/last", s.handleDebugLast)
 	s.route(mux, "GET /v1/debug/context", s.handleDebugContext)
+	s.route(mux, "GET /v1/settings/context", s.handleGetContextSettings)
+	s.route(mux, "PATCH /v1/settings/context", s.handlePatchContextSettings)
 	s.route(mux, "POST /v1/chat/completions", s.handleChat)
 	s.route(mux, "POST /v1/messages", s.handleAnthropicMessages)
 	s.route(mux, "GET /v1/proprioceptive", s.handleProprioceptive)
@@ -1287,6 +1289,9 @@ func (s *Server) handleDebugLast(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDebugContext returns the current context window as stability-ordered zones.
+//
+// Decorated with the active foveated-gating knobs so dashboards can show
+// operators which floor/cap the assembler is currently using (issue #88).
 func (s *Server) handleDebugContext(w http.ResponseWriter, r *http.Request) {
 	snap := s.debug.Load()
 	if snap == nil {
@@ -1295,10 +1300,73 @@ func (s *Server) handleDebugContext(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "no requests yet"})
 		return
 	}
+
+	maxDocs, floor := s.cfg.ContextGating()
+	resp := map[string]interface{}{
+		"zones":  snap.Context.Zones,
+		"budget": snap.Context.Budget,
+		"gating": map[string]interface{}{
+			"max_foveal_docs": maxDocs,
+			"salience_floor":  floor,
+		},
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(snap.Context)
+	_ = enc.Encode(resp)
+}
+
+// handleGetContextSettings returns the current foveated-gating knobs.
+//
+//	GET /v1/settings/context
+//	200 → { max_foveal_docs, salience_floor }
+func (s *Server) handleGetContextSettings(w http.ResponseWriter, r *http.Request) {
+	maxDocs, floor := s.cfg.ContextGating()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"max_foveal_docs": maxDocs,
+		"salience_floor":  floor,
+	})
+}
+
+// handlePatchContextSettings hot-updates foveated-gating knobs. Request body
+// is JSON with optional fields max_foveal_docs (int) and salience_floor (float).
+// Returns the post-update snapshot.
+//
+//	PATCH /v1/settings/context  { "salience_floor": 0.5 }
+//	200 → { max_foveal_docs, salience_floor }
+//	400 → malformed JSON or out-of-range value
+func (s *Server) handlePatchContextSettings(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		MaxFovealDocs *int     `json:"max_foveal_docs"`
+		SalienceFloor *float64 `json:"salience_floor"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("decode body: %v", err)})
+		return
+	}
+	if body.MaxFovealDocs != nil && *body.MaxFovealDocs < 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "max_foveal_docs must be >= 0"})
+		return
+	}
+	if body.SalienceFloor != nil && *body.SalienceFloor < 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "salience_floor must be >= 0"})
+		return
+	}
+
+	maxDocs, floor := s.cfg.SetContextGating(body.MaxFovealDocs, body.SalienceFloor)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"max_foveal_docs": maxDocs,
+		"salience_floor":  floor,
+	})
 }
 
 // handleProprioceptive returns the last 50 entries from the proprioceptive JSONL log
