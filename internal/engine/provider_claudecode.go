@@ -219,9 +219,6 @@ func (p *ClaudeCodeProvider) drainStreamJSON(r io.Reader) (content string, toolC
 			}
 		}
 		if done {
-			if chunk != nil {
-				stopReason = chunk.StopReason
-			}
 			break
 		}
 	}
