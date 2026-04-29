@@ -648,7 +648,7 @@ func TestMCP_HandoffRoundTrip(t *testing.T) {
 
 	// 2. src offers a handoff.
 	offerResult, _, err := mcpSrv.toolOfferHandoff(ctx, nil, offerHandoffInput{
-		FromSession: "mcp-src-session",
+		FromSession:     "mcp-src-session",
 		BootstrapPrompt: "bp",
 		Task: map[string]interface{}{
 			"title": "T", "goal": "G", "next_steps": []interface{}{"step1"},
@@ -774,7 +774,10 @@ func TestRegistryUnchangedOnBusAppendFailure(t *testing.T) {
 	t.Parallel()
 	now := time.Now().UTC()
 	appendErr := errors.New("simulated bus append failure")
-	failFn := func() error { return appendErr }
+	// failFn matches ApplyRegister's updated signature: func(time.Time) error.
+	failFn := func(_ time.Time) error { return appendErr }
+	// failFnSimple matches ApplyHeartbeat/ApplyEnd/ApplyOffer/ApplyClaim/ApplyComplete: func() error.
+	failFnSimple := func() error { return appendErr }
 
 	t.Run("register on empty registry stays empty", func(t *testing.T) {
 		reg := NewSessionRegistry()
@@ -827,7 +830,7 @@ func TestRegistryUnchangedOnBusAppendFailure(t *testing.T) {
 		}
 		before, _ := reg.Get("bus-fail-heartbeat")
 		later := now.Add(30 * time.Second)
-		_, ok, err := reg.ApplyHeartbeat("bus-fail-heartbeat", 0.42, "busy", "task", later, failFn)
+		_, ok, err := reg.ApplyHeartbeat("bus-fail-heartbeat", 0.42, "busy", "task", later, failFnSimple)
 		if !ok {
 			t.Fatal("heartbeat saw unregistered session")
 		}
@@ -853,7 +856,7 @@ func TestRegistryUnchangedOnBusAppendFailure(t *testing.T) {
 		if _, _, err := reg.ApplyRegister(state, time.Minute, now, nil); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
-		_, known, err := reg.ApplyEnd("bus-fail-endsess", "because", "", now.Add(time.Second), failFn)
+		_, known, err := reg.ApplyEnd("bus-fail-endsess", "because", "", now.Add(time.Second), failFnSimple)
 		if !known {
 			t.Fatal("end saw unknown session")
 		}
@@ -872,7 +875,7 @@ func TestRegistryUnchangedOnBusAppendFailure(t *testing.T) {
 			HandoffID: "ho-fail-offer-1", FromSession: "a-b-c",
 			TTLSeconds: 60, CreatedAt: now,
 		}
-		_, err := hreg.ApplyOffer(h, now, failFn)
+		_, err := hreg.ApplyOffer(h, now, failFnSimple)
 		if err == nil {
 			t.Fatal("expected err from failFn")
 		}
@@ -890,7 +893,7 @@ func TestRegistryUnchangedOnBusAppendFailure(t *testing.T) {
 		if _, err := hreg.ApplyOffer(h, now, nil); err != nil {
 			t.Fatalf("seed offer: %v", err)
 		}
-		result, err := hreg.ApplyClaim("ho-fail-claim-1", "claimant-x-y", now, failFn)
+		result, err := hreg.ApplyClaim("ho-fail-claim-1", "claimant-x-y", now, failFnSimple)
 		if err == nil {
 			t.Fatal("expected appendErr from failFn")
 		}
@@ -920,7 +923,7 @@ func TestRegistryUnchangedOnBusAppendFailure(t *testing.T) {
 			t.Fatalf("seed claim: %v", err)
 		}
 		_, reason, err := hreg.ApplyComplete("ho-fail-complete-1",
-			"claimant-x-y", "ok", "notes", "", now.Add(time.Second), failFn)
+			"claimant-x-y", "ok", "notes", "", now.Add(time.Second), failFnSimple)
 		if err == nil {
 			t.Fatal("expected appendErr from failFn")
 		}
@@ -1100,19 +1103,19 @@ func TestReplay_OutOfOrderSeq(t *testing.T) {
 	evts := []BusBlock{
 		{ // seq 3 — end
 			V: 2, BusID: BusSessions, Seq: 3,
-			Ts: time.Now().UTC().Add(2 * time.Second).Format(time.RFC3339Nano),
+			Ts:   time.Now().UTC().Add(2 * time.Second).Format(time.RFC3339Nano),
 			From: "order-test-session", Type: EvtSessionEnd,
 			Payload: map[string]interface{}{"session_id": "order-test-session", "reason": "r3"},
 		},
 		{ // seq 1 — register
 			V: 2, BusID: BusSessions, Seq: 1,
-			Ts: time.Now().UTC().Format(time.RFC3339Nano),
+			Ts:   time.Now().UTC().Format(time.RFC3339Nano),
 			From: "order-test-session", Type: EvtSessionRegister,
 			Payload: map[string]interface{}{"session_id": "order-test-session", "workspace": "w", "role": "r"},
 		},
 		{ // seq 2 — heartbeat
 			V: 2, BusID: BusSessions, Seq: 2,
-			Ts: time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano),
+			Ts:   time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano),
 			From: "order-test-session", Type: EvtSessionHeartbeat,
 			Payload: map[string]interface{}{"session_id": "order-test-session", "status": "working"},
 		},
@@ -1155,7 +1158,7 @@ func TestReplay_DuplicateSeqWithConflictingPayload(t *testing.T) {
 	evts := []BusBlock{
 		{ // seq 1, first occurrence — wins per first-write-wins de-dup
 			V: 2, BusID: BusSessions, Seq: 1,
-			Ts: time.Now().UTC().Format(time.RFC3339Nano),
+			Ts:   time.Now().UTC().Format(time.RFC3339Nano),
 			From: "dup-test-session", Type: EvtSessionRegister,
 			Payload: map[string]interface{}{
 				"session_id": "dup-test-session", "workspace": "w", "role": "r",
@@ -1164,7 +1167,7 @@ func TestReplay_DuplicateSeqWithConflictingPayload(t *testing.T) {
 		},
 		{ // seq 1, second occurrence with conflicting payload — should be ignored
 			V: 2, BusID: BusSessions, Seq: 1,
-			Ts: time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano),
+			Ts:   time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano),
 			From: "dup-test-session", Type: EvtSessionRegister,
 			Payload: map[string]interface{}{
 				"session_id": "dup-test-session", "workspace": "w2", "role": "r2",
@@ -1378,5 +1381,107 @@ func writeBusLinesForTest(t *testing.T, path string, evts []BusBlock) {
 		if _, err := f.Write(append(line, '\n')); err != nil {
 			t.Fatalf("write: %v", err)
 		}
+	}
+}
+
+// ─── 27. TestRegister_PreservesRegisteredAtAcrossReRegister (#44) ────────────
+//
+// Regression guard for issue #44: on re-register of an active session the
+// bus event payload must carry the ORIGINAL registered_at (T1), not the
+// current wall-clock time (T2). Before the fix, the payload was baked with
+// `now` before ApplyRegister had a chance to preserve the lineage, so the
+// bus and the in-memory SessionState disagreed. After a restart the registry
+// would replay from the bus and lose T1.
+//
+// Asserts:
+//  1. First registration → in-memory RegisteredAt = T1.
+//  2. Re-registration → in-memory RegisteredAt still = T1 (preserved).
+//  3. Re-registration → bus event seq=2 payload.registered_at = T1 (the fix).
+//  4. Cold-restart replay → replayed RegisteredAt = T1 (no lineage loss).
+func TestRegister_PreservesRegisteredAtAcrossReRegister(t *testing.T) {
+	t.Parallel()
+	srv, ts := newSessionsTestServer(t)
+
+	// First register — capture the initial registered_at from the response.
+	r1 := postJSON(t, ts.URL+"/v1/sessions/register", map[string]any{
+		"session_id": "lineage-test-session",
+		"workspace":  "w",
+		"role":       "r",
+		"task":       "initial",
+	})
+	var resp1 sessionWriteResponse
+	decodeJSON(t, r1, &resp1)
+	if !resp1.OK {
+		t.Fatalf("first register failed: %+v", resp1)
+	}
+	t1 := resp1.Session.RegisteredAt
+
+	// Pause to ensure wall clock advances (sub-millisecond races on fast machines).
+	time.Sleep(5 * time.Millisecond)
+
+	// Re-register the same session.
+	r2 := postJSON(t, ts.URL+"/v1/sessions/register", map[string]any{
+		"session_id": "lineage-test-session",
+		"workspace":  "w",
+		"role":       "r",
+		"task":       "updated",
+	})
+	var resp2 sessionWriteResponse
+	decodeJSON(t, r2, &resp2)
+	if !resp2.OK {
+		t.Fatalf("re-register failed: %+v", resp2)
+	}
+
+	// Assert 1: in-memory RegisteredAt is preserved.
+	if !resp2.Session.RegisteredAt.Equal(t1) {
+		t.Errorf("in-memory RegisteredAt changed on re-register: was %v, got %v (want T1 preserved)",
+			t1, resp2.Session.RegisteredAt)
+	}
+
+	// Assert 2: bus seq=2 payload.registered_at = T1 (the fix for #44).
+	events, err := srv.busSessions.ReadEvents(BusSessions)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	if len(events) < 2 {
+		t.Fatalf("expected >=2 bus events, got %d", len(events))
+	}
+	var reRegEvt *BusBlock
+	for i := range events {
+		if events[i].Seq == 2 {
+			reRegEvt = &events[i]
+			break
+		}
+	}
+	if reRegEvt == nil {
+		t.Fatalf("no seq=2 event on bus")
+	}
+	busRA, _ := reRegEvt.Payload["registered_at"].(string)
+	if busRA == "" {
+		t.Fatalf("seq=2 event payload missing registered_at field")
+	}
+	busRATime, parseErr := time.Parse(time.RFC3339Nano, busRA)
+	if parseErr != nil {
+		t.Fatalf("parse bus registered_at %q: %v", busRA, parseErr)
+	}
+	if !busRATime.Equal(t1) {
+		t.Errorf("bus seq=2 registered_at = %v, want T1=%v (lineage not preserved in payload; refs #44)",
+			busRATime, t1)
+	}
+
+	// Assert 3: cold-restart replay produces RegisteredAt = T1.
+	root := srv.busSessions.WorkspaceRoot()
+	freshMgr := NewBusSessionManager(root)
+	freshReg := NewSessionRegistry()
+	if replayErr := ReplaySessionRegistry(freshMgr, freshReg); replayErr != nil {
+		t.Fatalf("replay: %v", replayErr)
+	}
+	replayed, ok := freshReg.Get("lineage-test-session")
+	if !ok {
+		t.Fatal("session not found after replay")
+	}
+	if !replayed.RegisteredAt.Equal(t1) {
+		t.Errorf("replayed RegisteredAt = %v, want T1=%v (lineage lost after restart; refs #44)",
+			replayed.RegisteredAt, t1)
 	}
 }
