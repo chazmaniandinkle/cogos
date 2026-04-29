@@ -7,18 +7,18 @@
 // enforce the state-machine invariants the bridge-only implementation was
 // doing by convention:
 //
-//   • session_id format validation (regex) on register
-//   • idempotent re-register = update-semantics (re-register a live session
+//   - session_id format validation (regex) on register
+//   - idempotent re-register = update-semantics (re-register a live session
 //     updates the in-memory row; re-register after end is allowed only if the
 //     prior session is ended or its heartbeat is outside the active window)
-//   • heartbeat/end refused against unknown sessions
-//   • end refused against already-ended sessions
-//   • handoff.offer → claim → complete state machine with:
-//       - first-wins claim (atomic check under handoff mutex)
-//       - TTL enforcement (offer rejected if now - created_at > ttl_seconds)
-//       - claim-before-offer rejection (phantom offers) as 404
-//       - complete-before-claim rejected as 409
-//   • on every rejected claim, emit a handoff.claim_rejected event on
+//   - heartbeat/end refused against unknown sessions
+//   - end refused against already-ended sessions
+//   - handoff.offer → claim → complete state machine with:
+//   - first-wins claim (atomic check under handoff mutex)
+//   - TTL enforcement (offer rejected if now - created_at > ttl_seconds)
+//   - claim-before-offer rejection (phantom offers) as 404
+//   - complete-before-claim rejected as 409
+//   - on every rejected claim, emit a handoff.claim_rejected event on
 //     bus_handoffs so operators have an audit trail (amendment #4 of the
 //     user-approved plan).
 //
@@ -71,8 +71,9 @@ const (
 // "exactly three tokens."
 //
 // Example: slowbro-laptop-cogos-gap-closure → passes.
-//          alpha-beta-gamma                 → passes (exactly 3 tokens).
-//          a-b                              → REJECTED (only 2 tokens).
+//
+//	alpha-beta-gamma                 → passes (exactly 3 tokens).
+//	a-b                              → REJECTED (only 2 tokens).
 var sessionIDPattern = regexp.MustCompile(`^[a-z0-9]+-[a-z0-9-]+-[a-z0-9-]+$`)
 
 // ValidateSessionID returns nil iff id matches the lowercase-hyphen format
@@ -193,9 +194,13 @@ func (r *SessionRegistry) Snapshot() []*SessionState {
 // outside the active window.
 //
 // If appendFn is non-nil it is invoked AFTER validation but BEFORE the
-// registry mutation is committed, while the registry lock is held. An error
-// from appendFn aborts the mutation and is returned verbatim — the registry
-// is left unchanged, preserving the bus-is-ground-truth invariant.
+// registry mutation is committed, while the registry lock is held. The
+// canonical RegisteredAt that will be stored on the row is passed to
+// appendFn so the caller can embed the correct lineage value in the bus
+// event payload — for a re-register of an active session this is the
+// original registration time (not `now`). An error from appendFn aborts
+// the mutation and is returned verbatim — the registry is left unchanged,
+// preserving the bus-is-ground-truth invariant.
 //
 // Returns the resulting state (copy), a flag indicating whether the registry
 // row was newly created vs updated, and an error.
@@ -203,7 +208,7 @@ func (r *SessionRegistry) ApplyRegister(
 	state SessionState,
 	activeWindow time.Duration,
 	now time.Time,
-	appendFn func() error,
+	appendFn func(canonicalRegisteredAt time.Time) error,
 ) (*SessionState, bool, error) {
 	if err := ValidateSessionID(state.SessionID); err != nil {
 		return nil, false, err
@@ -221,7 +226,9 @@ func (r *SessionRegistry) ApplyRegister(
 		// Live prior row — allow re-register only if heartbeat is stale.
 		if existing.IsActive(activeWindow, now) {
 			// Still active; accept as update. Preserve the original
-			// RegisteredAt to keep lineage.
+			// RegisteredAt to keep lineage. Fixes #44: the canonical value
+			// is passed to appendFn so the bus event payload also reflects
+			// the preserved timestamp rather than the caller's `now`.
 			state.RegisteredAt = existing.RegisteredAt
 		}
 	}
@@ -232,7 +239,7 @@ func (r *SessionRegistry) ApplyRegister(
 	state.EndHandoffID = ""
 	// Append to the bus FIRST — if that fails, the registry is unchanged.
 	if appendFn != nil {
-		if err := appendFn(); err != nil {
+		if err := appendFn(state.RegisteredAt); err != nil {
 			return nil, false, err
 		}
 	}
@@ -360,7 +367,7 @@ type HandoffState struct {
 	CompletedAt       time.Time `json:"completed_at,omitempty"`
 	CompletionOutcome string    `json:"outcome,omitempty"`
 	CompletionNotes   string    `json:"notes,omitempty"`
-	NextHandoffID    string    `json:"next_handoff_id,omitempty"`
+	NextHandoffID     string    `json:"next_handoff_id,omitempty"`
 }
 
 // IsExpired is true when TTL > 0 and now is past ExpiresAt.
@@ -457,7 +464,7 @@ func (r *HandoffRegistry) ApplyOffer(
 type ClaimRejection string
 
 const (
-	ClaimRejectedOfferNotFound ClaimRejection = "offer_not_found"
+	ClaimRejectedOfferNotFound  ClaimRejection = "offer_not_found"
 	ClaimRejectedAlreadyClaimed ClaimRejection = "already_claimed"
 	ClaimRejectedTTLExpired     ClaimRejection = "ttl_expired"
 	ClaimRejectedOutOfOrder     ClaimRejection = "out_of_order"
@@ -596,9 +603,22 @@ func ReplaySessionRegistry(mgr *BusSessionManager, reg *SessionRegistry) error {
 			if state == nil {
 				continue
 			}
-			if ts, err := parseBusTS(evt.Ts); err == nil {
-				state.RegisteredAt = ts
-				if state.LastSeen.IsZero() {
+			// Prefer the registered_at field embedded in the payload — after
+			// the #44 fix this value is the canonical preserved timestamp for
+			// re-registrations. Fall back to evt.Ts for events written before
+			// the fix (legacy shape: payload had registered_at=now, not T1).
+			if ra, _ := evt.Payload["registered_at"].(string); ra != "" {
+				if ts, err := parseBusTS(ra); err == nil {
+					state.RegisteredAt = ts
+				}
+			}
+			if state.RegisteredAt.IsZero() {
+				if ts, err := parseBusTS(evt.Ts); err == nil {
+					state.RegisteredAt = ts
+				}
+			}
+			if state.LastSeen.IsZero() {
+				if ts, err := parseBusTS(evt.Ts); err == nil {
 					state.LastSeen = ts
 				}
 			}

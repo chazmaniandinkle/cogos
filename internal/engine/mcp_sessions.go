@@ -189,12 +189,14 @@ func (m *MCPServer) toolRegisterSession(ctx context.Context, req *mcp.CallToolRe
 		ContextUsage: in.ContextUsage, Status: in.Status, CurrentTask: in.CurrentTask,
 		Extras: in.Extras, RegisteredAt: now, LastSeen: now,
 	}
+	// registered_at is written in the appendFn using the canonical value
+	// supplied by ApplyRegister — for a re-register of an active session
+	// this is the original time (T1), not `now`. Fixes #44.
 	payload := map[string]interface{}{
 		"session_id": in.SessionID, "workspace": in.Workspace, "role": in.Role,
 		"task": in.Task, "model": in.Model, "hostname": in.Hostname,
 		"status": in.Status, "current_task": in.CurrentTask,
 		"context_usage": in.ContextUsage,
-		"registered_at": now.Format(time.RFC3339Nano),
 	}
 	for k, v := range in.Extras {
 		if _, exists := payload[k]; !exists {
@@ -202,7 +204,8 @@ func (m *MCPServer) toolRegisterSession(ctx context.Context, req *mcp.CallToolRe
 		}
 	}
 	var evt *BusBlock
-	appendFn := func() error {
+	appendFn := func(canonicalRegisteredAt time.Time) error {
+		payload["registered_at"] = canonicalRegisteredAt.Format(time.RFC3339Nano)
 		var err error
 		evt, err = m.busSessions.AppendEvent(BusSessions, EvtSessionRegister, in.SessionID, payload)
 		return err

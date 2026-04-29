@@ -136,13 +136,11 @@ func (s *Server) handleSessionRegister(w http.ResponseWriter, r *http.Request) {
 		RegisteredAt: now,
 		LastSeen:     now,
 	}
-	// Build the bus payload up front so the appendFn closure can reference
-	// it. The registered_at field is derived from the final stored state's
-	// RegisteredAt (which may have been preserved from a prior re-register
-	// by ApplyRegister); since we don't yet know if this is a new row vs
-	// an update, we use `now` here and let ApplyRegister correct lineage
-	// internally. The bus event's ts field is authoritative for ordering
-	// anyway.
+	// Build the base payload. registered_at is intentionally omitted here;
+	// it is written inside the appendFn once ApplyRegister has determined
+	// the canonical value (which for a re-register of an active session is
+	// the original T1, not `now`). Fixes #44: bus event payload must agree
+	// with the in-memory SessionState.RegisteredAt.
 	payload := map[string]interface{}{
 		"session_id":    req.SessionID,
 		"workspace":     req.Workspace,
@@ -153,7 +151,6 @@ func (s *Server) handleSessionRegister(w http.ResponseWriter, r *http.Request) {
 		"status":        req.Status,
 		"current_task":  req.CurrentTask,
 		"context_usage": req.ContextUsage,
-		"registered_at": now.Format(time.RFC3339Nano),
 	}
 	if req.Extras != nil {
 		for k, v := range req.Extras {
@@ -166,7 +163,8 @@ func (s *Server) handleSessionRegister(w http.ResponseWriter, r *http.Request) {
 	// fields), so the only error ApplyRegister can return now is from
 	// appendFn — i.e. bus-append failure, which is always a 500.
 	var evt *BusBlock
-	appendFn := func() error {
+	appendFn := func(canonicalRegisteredAt time.Time) error {
+		payload["registered_at"] = canonicalRegisteredAt.Format(time.RFC3339Nano)
 		var err error
 		evt, err = s.busSessions.AppendEvent(BusSessions, EvtSessionRegister, req.SessionID, payload)
 		return err
