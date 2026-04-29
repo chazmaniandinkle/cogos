@@ -1,0 +1,70 @@
+name: Feature request / proposal
+description: Propose a new capability, behavior change, or design direction.
+title: "<one-line description of the proposal>"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For substantial changes (new subsystems, protocol changes, breaking
+        behavior), prefer opening an RFC first via `./scripts/cog rfc new`
+        and link it here once it exists. Small, contained features can use
+        this template directly.
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: |
+        What problem does this solve? Who is blocked or inconvenienced today,
+        and how? If this is responding to user feedback or an observed gap,
+        cite it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: |
+        What should change. Be concrete: API surface, file paths, behavior
+        contract, defaults. If multiple subsystems are affected, list each
+        one with its own contract change.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        What else did you consider, and why was this proposal preferred?
+        "I didn't consider alternatives" is a valid answer for small
+        features but is a yellow flag for anything substantial.
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Out of scope
+      description: |
+        What is intentionally NOT being changed by this proposal? This
+        prevents scope creep during implementation review.
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance checklist
+      value: |
+        - [ ] Behavior contract documented (in code comments or `docs/`).
+        - [ ] Tests cover the new behavior and the boundary cases.
+        - [ ] Existing callers updated (if behavior changed for them).
+        - [ ] Migration / deprecation path documented (if applicable).
+    validations:
+      required: true
+
+  - type: textarea
+    id: related
+    attributes:
+      label: Related
+      description: |
+        Linked issues, RFCs, ADRs, or upstream proposals.
