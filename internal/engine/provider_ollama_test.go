@@ -299,6 +299,142 @@ func TestOllamaStream(t *testing.T) {
 	}
 }
 
+// TestOllamaStreamCapturesEvalCount asserts the streamed response_tokens
+// value lands in the final chunk's Usage. Regression: issue #93 — the
+// snapshot reported 0 despite hundreds of tokens of real output.
+func TestOllamaStreamCapturesEvalCount(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/chat" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		chunks := []ollamaChatResponse{
+			{Message: ollamaMessage{Role: "assistant", Content: "alpha "}, Done: false},
+			{Message: ollamaMessage{Role: "assistant", Content: "beta "}, Done: false},
+			{Message: ollamaMessage{Role: "assistant", Content: "gamma"}, Done: false},
+			{Message: ollamaMessage{Role: "assistant", Content: ""}, Done: true,
+				PromptEvalCount: 11, EvalCount: 42},
+		}
+		for _, c := range chunks {
+			b, _ := json.Marshal(c)
+			_, _ = fmt.Fprintf(w, "%s\n", b)
+			w.(http.Flusher).Flush()
+		}
+	}))
+	defer srv.Close()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Endpoint: srv.URL, Model: "gemma4:e4b"})
+	ch, err := p.Stream(context.Background(), &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	var lastChunk StreamChunk
+	for sc := range ch {
+		if sc.Error != nil {
+			t.Fatalf("stream error: %v", sc.Error)
+		}
+		lastChunk = sc
+	}
+	if !lastChunk.Done {
+		t.Fatal("last chunk should have Done=true")
+	}
+	if lastChunk.Usage == nil {
+		t.Fatal("last chunk usage = nil; want populated")
+	}
+	if lastChunk.Usage.OutputTokens != 42 {
+		t.Errorf("OutputTokens = %d; want 42 (eval_count from final chunk)",
+			lastChunk.Usage.OutputTokens)
+	}
+	if lastChunk.Usage.InputTokens != 11 {
+		t.Errorf("InputTokens = %d; want 11", lastChunk.Usage.InputTokens)
+	}
+}
+
+// TestOllamaStreamFallbackChunkCount asserts that when the Ollama stream
+// completion record omits eval_count, we fall back to counting content
+// chunks instead of reporting zero.
+func TestOllamaStreamFallbackChunkCount(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		// Three content chunks then a final done chunk with no eval_count.
+		chunks := []ollamaChatResponse{
+			{Message: ollamaMessage{Role: "assistant", Content: "a"}, Done: false},
+			{Message: ollamaMessage{Role: "assistant", Content: "b"}, Done: false},
+			{Message: ollamaMessage{Role: "assistant", Content: "c"}, Done: false},
+			{Message: ollamaMessage{Role: "assistant", Content: ""}, Done: true},
+		}
+		for _, c := range chunks {
+			b, _ := json.Marshal(c)
+			_, _ = fmt.Fprintf(w, "%s\n", b)
+			w.(http.Flusher).Flush()
+		}
+	}))
+	defer srv.Close()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Endpoint: srv.URL, Model: "m"})
+	ch, err := p.Stream(context.Background(), &CompletionRequest{})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	var lastChunk StreamChunk
+	for sc := range ch {
+		if sc.Error != nil {
+			t.Fatalf("stream error: %v", sc.Error)
+		}
+		lastChunk = sc
+	}
+	if lastChunk.Usage == nil {
+		t.Fatal("usage should be populated even with no eval_count")
+	}
+	if lastChunk.Usage.OutputTokens != 3 {
+		t.Errorf("fallback OutputTokens = %d; want 3 (content chunk count)",
+			lastChunk.Usage.OutputTokens)
+	}
+}
+
+// TestOllamaCompleteCapturesEvalCount asserts that the non-streaming path
+// also surfaces eval_count as the response token count. Regression: issue #93.
+func TestOllamaCompleteCapturesEvalCount(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/chat" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ollamaChatResponse{
+			Model:           "gemma4:e4b",
+			Message:         ollamaMessage{Role: "assistant", Content: "hello world"},
+			Done:            true,
+			PromptEvalCount: 4,
+			EvalCount:       17,
+		})
+	}))
+	defer srv.Close()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Endpoint: srv.URL, Model: "gemma4:e4b"})
+	resp, err := p.Complete(context.Background(), &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if resp.Usage.OutputTokens != 17 {
+		t.Errorf("OutputTokens = %d; want 17 (eval_count)", resp.Usage.OutputTokens)
+	}
+	if resp.Usage.InputTokens != 4 {
+		t.Errorf("InputTokens = %d; want 4 (prompt_eval_count)", resp.Usage.InputTokens)
+	}
+}
+
 func TestOllamaStreamContextCancelled(t *testing.T) {
 	t.Parallel()
 	// Server that streams slowly — we cancel before it finishes.
