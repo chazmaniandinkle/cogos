@@ -33,6 +33,13 @@ import (
 	"github.com/cogos-dev/cogos/pkg/cogfield"
 )
 
+// eventsFileMaxBytes is the size threshold that triggers a size-based rotation
+// of events.jsonl.  When an append causes the file to reach or exceed this
+// limit the file is renamed to events.<timestamp>.jsonl and a fresh
+// events.jsonl is opened.  Exposed as a var (not const) so tests can override
+// it without build-tag gymnastics; reset to the default in t.Cleanup.
+var eventsFileMaxBytes int64 = 64 * 1024 * 1024 // 64 MB
+
 // BusBlock is the wire format for bus events. Alias to the canonical
 // pkg/cogfield.Block so the byte-compat JSON shape is guaranteed — the
 // root package uses the same type.
@@ -293,6 +300,27 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 	// file scan.  Only update after a confirmed successful write.
 	m.lastSeq[busID] = int64(newSeq)
 	m.lastHash[busID] = evt.Hash
+
+	// Size-based rotation: if events.jsonl has grown past the threshold,
+	// rename it to a timestamped archive and start a fresh file.
+	// Cache is cleared for this busID so the next getLastEvent call starts
+	// from a known-empty file (seq resets to 0; seq semantics are per-file,
+	// matching root's archiveBus which resets LastEventSeq/EventCount to 0).
+	if fi, statErr := os.Stat(eventsFile); statErr == nil && fi.Size() >= eventsFileMaxBytes {
+		ts := time.Now().UTC().Format("2006-01-02T150405Z")
+		archivePath := filepath.Join(m.BusesDir(), busID, "events."+ts+".jsonl")
+		if renameErr := os.Rename(eventsFile, archivePath); renameErr == nil {
+			// Create a fresh empty events.jsonl for subsequent appends.
+			if nf, createErr := os.Create(eventsFile); createErr == nil {
+				nf.Close()
+			}
+			// Reset cache: new file starts at seq 0.
+			m.lastSeq[busID] = 0
+			m.lastHash[busID] = ""
+		} else {
+			slog.Warn("bus: size-rotation rename failed", "err", renameErr, "bus_id", busID)
+		}
+	}
 
 	m.updateRegistrySeqLocked(busID, newSeq, evt.Ts)
 
