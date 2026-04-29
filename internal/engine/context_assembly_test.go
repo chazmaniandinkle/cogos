@@ -458,6 +458,79 @@ func TestAssembleContextManifestMode(t *testing.T) {
 	}
 }
 
+// ── foveated gating cap (issue #88) ──────────────────────────────────────────
+
+// TestAssembleContextRespectsMaxFovealDocs confirms that the MaxFovealDocs cap
+// from Config bounds the keyword/salience admission branch. Issue #88 acceptance:
+// MaxFovealDocs = 5 must result in len(pkg.FovealDocs) <= 5 even when the index
+// holds many more candidates.
+func TestAssembleContextRespectsMaxFovealDocs(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	cfg.MaxFovealDocs = 5
+	cfg.SalienceFloor = 0 // don't let the floor mask the cap behavior
+	p := NewProcess(cfg, makeNucleus("T", "r"))
+
+	memDir := filepath.Join(root, ".cog", "mem", "semantic")
+
+	// Plant 20 active CogDocs, all matching the query keyword to push them
+	// above zero relevance regardless of field salience.
+	for i := 0; i < 20; i++ {
+		body := "---\ntitle: Topic " +
+			string(rune('A'+i%26)) + string(rune('0'+i%10)) +
+			"\nstatus: active\ntags: [topic]\n---\n\ntopic body content for topic.\n"
+		path := filepath.Join(memDir, "topic-"+string(rune('a'+i%26))+string(rune('0'+i%10))+"-"+
+			string(rune('A'+i))+".cog.md")
+		writeTestFile(t, path, body)
+	}
+
+	idx, err := BuildIndex(root)
+	if err != nil {
+		t.Fatalf("BuildIndex: %v", err)
+	}
+	p.indexMu.Lock()
+	p.index = idx
+	p.indexMu.Unlock()
+
+	pkg, err := p.AssembleContext("topic", nil, 0)
+	if err != nil {
+		t.Fatalf("AssembleContext: %v", err)
+	}
+
+	if len(pkg.FovealDocs) > 5 {
+		t.Errorf("FovealDocs len = %d; MaxFovealDocs=5 should cap at 5", len(pkg.FovealDocs))
+	}
+	if len(pkg.FovealDocs) == 0 {
+		t.Errorf("FovealDocs len = 0; cap-of-5 should still admit some docs when 20 match")
+	}
+}
+
+// TestContextGatingDefaults exercises the Config.ContextGating accessor so the
+// hot-update contract is covered.
+func TestContextGatingDefaults(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{}
+	maxDocs, floor := cfg.ContextGating()
+	if maxDocs != DefaultMaxFovealDocs {
+		t.Errorf("default MaxFovealDocs = %d; want %d", maxDocs, DefaultMaxFovealDocs)
+	}
+	if floor != DefaultSalienceFloor {
+		t.Errorf("default SalienceFloor = %v; want %v", floor, DefaultSalienceFloor)
+	}
+
+	newMax := 3
+	newFloor := 0.55
+	gotMax, gotFloor := cfg.SetContextGating(&newMax, &newFloor)
+	if gotMax != 3 || gotFloor != 0.55 {
+		t.Errorf("SetContextGating returned (%d, %v); want (3, 0.55)", gotMax, gotFloor)
+	}
+	gotMax, gotFloor = cfg.ContextGating()
+	if gotMax != 3 || gotFloor != 0.55 {
+		t.Errorf("ContextGating after Set = (%d, %v); want (3, 0.55)", gotMax, gotFloor)
+	}
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func contains(s, substr string) bool {

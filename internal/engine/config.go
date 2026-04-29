@@ -5,8 +5,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"gopkg.in/yaml.v3"
+)
+
+// Default context-gating knobs for the foveated assembler.
+//
+// See .cog/scratch/audit-dashboard-context/REPORT.md §4 for the rationale —
+// without a max-docs cap or salience floor the chat-path admits every
+// indexed CogDoc with non-zero salience, which can fill a 32K budget with
+// 400+ inbox manifest entries and starve conversation history of room.
+const (
+	DefaultMaxFovealDocs = 10
+	DefaultSalienceFloor = 0.3
 )
 
 // hasUsableCogConfig reports whether dir looks like a real workspace root for
@@ -46,6 +58,23 @@ type Config struct {
 
 	// OutputReserve is tokens reserved for model generation (subtracted from budget).
 	OutputReserve int
+
+	// MaxFovealDocs caps the number of CogDocs admitted into the foveated
+	// context window after sorting. 0 means use DefaultMaxFovealDocs.
+	// Hot-tunable via PATCH /v1/settings/context; access through
+	// ContextGating()/SetContextGating() so concurrent chat requests see
+	// a consistent snapshot.
+	MaxFovealDocs int
+
+	// SalienceFloor is the minimum salience score a CogDoc must reach to
+	// be admitted by the keyword-and-field branch of the assembler. Drops
+	// inbox-only enrichment boosts (~0.2) while keeping ordinary workspace
+	// files. 0 means use DefaultSalienceFloor.
+	SalienceFloor float64
+
+	// gatingMu guards the two knobs above for hot-update via the
+	// /v1/settings/context endpoints.
+	gatingMu sync.RWMutex
 
 	// TRMWeightsPath is the path to the TRM binary weights file.
 	// If empty, TRM is disabled and keyword+salience scoring is used.
@@ -100,6 +129,8 @@ type kernelConfigSection struct {
 	HeartbeatInterval     int               `yaml:"heartbeat_interval"`
 	SalienceDaysWindow    int               `yaml:"salience_days_window"`
 	OutputReserve         int               `yaml:"output_reserve"`
+	MaxFovealDocs         int               `yaml:"max_foveal_docs"`
+	SalienceFloor         *float64          `yaml:"salience_floor"`
 	TRMWeightsPath        string            `yaml:"trm_weights_path"`
 	TRMEmbeddingsPath     string            `yaml:"trm_embeddings_path"`
 	TRMChunksPath         string            `yaml:"trm_chunks_path"`
@@ -145,6 +176,8 @@ func LoadConfig(workspaceRoot string, port int) (*Config, error) {
 		HeartbeatInterval:         60,
 		SalienceDaysWindow:        90,
 		OutputReserve:             4096,
+		MaxFovealDocs:             DefaultMaxFovealDocs,
+		SalienceFloor:             DefaultSalienceFloor,
 		ToolCallValidationEnabled: true,
 		LocalModel:                defaultOllamaModel,
 		DigestPaths:               make(map[string]string),
@@ -196,6 +229,12 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	if s.OutputReserve != 0 {
 		cfg.OutputReserve = s.OutputReserve
 	}
+	if s.MaxFovealDocs != 0 {
+		cfg.MaxFovealDocs = s.MaxFovealDocs
+	}
+	if s.SalienceFloor != nil {
+		cfg.SalienceFloor = *s.SalienceFloor
+	}
 	if s.TRMWeightsPath != "" {
 		cfg.TRMWeightsPath = s.TRMWeightsPath
 	}
@@ -232,6 +271,41 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	if s.Mod3URL != "" {
 		cfg.Mod3URL = s.Mod3URL
 	}
+}
+
+// ContextGating returns the current foveated-assembler gating knobs as a
+// consistent snapshot. Falls back to defaults when fields are zero so callers
+// don't need to repeat the defaulting logic.
+func (c *Config) ContextGating() (maxDocs int, salienceFloor float64) {
+	c.gatingMu.RLock()
+	defer c.gatingMu.RUnlock()
+	maxDocs = c.MaxFovealDocs
+	if maxDocs <= 0 {
+		maxDocs = DefaultMaxFovealDocs
+	}
+	salienceFloor = c.SalienceFloor
+	if salienceFloor <= 0 {
+		salienceFloor = DefaultSalienceFloor
+	}
+	return maxDocs, salienceFloor
+}
+
+// SetContextGating hot-updates the foveated-assembler gating knobs. Pass a
+// non-nil pointer for any field you wish to update; nil leaves that field
+// untouched. Returns the post-update snapshot via ContextGating().
+//
+// Used by PATCH /v1/settings/context to let operators tighten or loosen the
+// chat-path admission predicate without restarting the kernel.
+func (c *Config) SetContextGating(maxDocs *int, salienceFloor *float64) (int, float64) {
+	c.gatingMu.Lock()
+	if maxDocs != nil {
+		c.MaxFovealDocs = *maxDocs
+	}
+	if salienceFloor != nil {
+		c.SalienceFloor = *salienceFloor
+	}
+	c.gatingMu.Unlock()
+	return c.ContextGating()
 }
 
 // findWorkspaceRoot walks up from dir until it finds a directory containing a
