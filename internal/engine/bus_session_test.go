@@ -287,9 +287,13 @@ func TestBusSessionByteCompatJSONShape(t *testing.T) {
 //     because a 1000-event O(n²) scan at 182 MB would take seconds on any
 //     CI machine, while the O(n) path finishes in milliseconds.
 func TestAppendEvent_CacheAvoidsScan(t *testing.T) {
+	// Not parallel: sets eventsFileMaxBytes to prevent rotation interference.
 	root := t.TempDir()
 
 	// Ensure rotation does not trigger during the 1000-event bulk run.
+	original := eventsFileMaxBytes
+	eventsFileMaxBytes = 1 << 30 // 1 GiB — won't be reached in this test
+	t.Cleanup(func() { eventsFileMaxBytes = original })
 
 	mgr := NewBusSessionManager(root)
 
@@ -350,6 +354,163 @@ func TestAppendEvent_CacheAvoidsScan(t *testing.T) {
 		if ev.Seq != i+1 {
 			t.Errorf("event %d: seq=%d, want %d", i, ev.Seq, i+1)
 		}
+	}
+}
+
+// TestAppendEvent_RotatesAtThreshold verifies that events.jsonl is renamed to a
+// timestamped archive and a fresh file is created when the size threshold is
+// reached.
+func TestAppendEvent_RotatesAtThreshold(t *testing.T) {
+	// Not parallel: mutates package-level eventsFileMaxBytes.
+	root := t.TempDir()
+
+	// Lower the threshold so we don't need to write gigabytes.
+	original := eventsFileMaxBytes
+	eventsFileMaxBytes = 512
+	t.Cleanup(func() { eventsFileMaxBytes = original })
+
+	mgr := NewBusSessionManager(root)
+	busID := "rot-bus"
+
+	if err := mgr.EnsureBus(busID); err != nil {
+		t.Fatalf("EnsureBus: %v", err)
+	}
+
+	eventsFile := mgr.EventsPath(busID)
+	busDir := filepath.Join(mgr.BusesDir(), busID)
+
+	// Append events until the file has been rotated at least once.
+	rotated := false
+	for i := 0; i < 200; i++ {
+		if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"data": strings.Repeat("x", 20)}); err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+		// Check whether any rotated file exists yet.
+		entries, _ := os.ReadDir(busDir)
+		for _, e := range entries {
+			name := e.Name()
+			if name != "events.jsonl" && strings.HasPrefix(name, "events.") && strings.HasSuffix(name, ".jsonl") {
+				rotated = true
+			}
+		}
+		if rotated {
+			break
+		}
+	}
+
+	if !rotated {
+		t.Fatal("expected at least one rotation to occur, but none did")
+	}
+
+	// The live events.jsonl must still exist (created fresh after rotation).
+	if _, err := os.Stat(eventsFile); os.IsNotExist(err) {
+		t.Error("events.jsonl should exist after rotation (fresh file)")
+	}
+
+	// Verify the rotated archive has non-zero content.
+	entries, err := os.ReadDir(busDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var archivePaths []string
+	for _, e := range entries {
+		name := e.Name()
+		if name != "events.jsonl" && strings.HasPrefix(name, "events.") && strings.HasSuffix(name, ".jsonl") {
+			archivePaths = append(archivePaths, filepath.Join(busDir, name))
+		}
+	}
+	if len(archivePaths) == 0 {
+		t.Fatal("no archive file found after rotation")
+	}
+	for _, ap := range archivePaths {
+		fi, err := os.Stat(ap)
+		if err != nil {
+			t.Errorf("stat archive %s: %v", ap, err)
+			continue
+		}
+		if fi.Size() == 0 {
+			t.Errorf("archive %s is empty; expected rotated events to be present", ap)
+		}
+		// Verify the archive is valid JSONL (every line parses as a BusBlock).
+		data, _ := os.ReadFile(ap)
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if line == "" {
+				continue
+			}
+			var b BusBlock
+			if err := json.Unmarshal([]byte(line), &b); err != nil {
+				t.Errorf("archive %s: invalid JSON line: %v", ap, err)
+			}
+		}
+	}
+}
+
+// TestAppendEvent_SeqResetsAcrossRotation verifies that after a size-based
+// rotation the next event starts at seq=1 (per-file semantics).
+//
+// Seq semantics are per-file, confirmed by inspecting root/bus_session.go's
+// archiveBus function which explicitly sets LastEventSeq=0 and EventCount=0
+// after rename — matching the chat.reset genesis-event pattern (seq=1 on the
+// new file).  The engine package preserves these semantics: rotation clears
+// the cache (lastSeq[busID]=0, lastHash[busID]="") so the next AppendEvent
+// builds a new chain from seq=1.
+func TestAppendEvent_SeqResetsAcrossRotation(t *testing.T) {
+	// Not parallel: mutates package-level eventsFileMaxBytes.
+	root := t.TempDir()
+
+	original := eventsFileMaxBytes
+	eventsFileMaxBytes = 512
+	t.Cleanup(func() { eventsFileMaxBytes = original })
+
+	mgr := NewBusSessionManager(root)
+	busID := "seq-reset-bus"
+
+	if err := mgr.EnsureBus(busID); err != nil {
+		t.Fatalf("EnsureBus: %v", err)
+	}
+
+	busDir := filepath.Join(mgr.BusesDir(), busID)
+
+	// Append events until at least one rotation has occurred.
+	var lastBeforeRotation *BusBlock
+	for i := 0; i < 200; i++ {
+		evt, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"data": strings.Repeat("y", 20)})
+		if err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+
+		entries, _ := os.ReadDir(busDir)
+		rotated := false
+		for _, e := range entries {
+			name := e.Name()
+			if name != "events.jsonl" && strings.HasPrefix(name, "events.") && strings.HasSuffix(name, ".jsonl") {
+				rotated = true
+			}
+		}
+		if rotated && lastBeforeRotation == nil {
+			// Next append will be post-rotation.
+			lastBeforeRotation = evt
+			break
+		}
+	}
+
+	if lastBeforeRotation == nil {
+		t.Fatal("no rotation occurred; cannot test seq reset")
+	}
+
+	// First append after rotation must start a new chain at seq=1.
+	post, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"data": "post-rotation"})
+	if err != nil {
+		t.Fatalf("AppendEvent post-rotation: %v", err)
+	}
+	if post.Seq != 1 {
+		t.Errorf("post-rotation seq = %d, want 1 (per-file reset semantics)", post.Seq)
+	}
+	if post.PrevHash != "" {
+		t.Errorf("post-rotation PrevHash = %q, want empty (new chain)", post.PrevHash)
+	}
+	if len(post.Prev) != 0 {
+		t.Errorf("post-rotation Prev = %v, want empty (new chain)", post.Prev)
 	}
 }
 
