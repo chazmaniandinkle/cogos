@@ -1115,31 +1115,27 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 }
 
 // streamChat handles streaming chat completions via SSE.
-// The optional turn record accumulates the response text (and usage from
-// the final chunk) so the caller can persist the full turn via RecordTurn.
+//
+// When the inference Router emits tool_use events for kernel-internal MCP
+// tools (cog_*, mod3_*, …), we cannot just forward them to the SSE client
+// the way pre-#94 streamChat did — the dashboard has no executor for them
+// and the turn would end silently with finish_reason: tool_calls. Instead,
+// we mirror completeChat's #94 loop: drain the upstream stream into a
+// local buffer (text deltas + accumulated tool calls), partition the tool
+// calls by ownership, execute internal calls in-process via
+// MCPServer.CallTool, append tool_result messages to the conversation, and
+// re-issue Stream() up to maxStreamHops times. Only when the upstream
+// stream completes with no more internal tool_use events do we replay the
+// final hop's buffered chunks as SSE to the client — yielding a single
+// coherent assistant turn from the client's perspective. External tool
+// calls accumulated along the way are surfaced as tool_calls deltas on
+// the final replay so the client still receives them. Closes #95.
+//
+// The optional turn record accumulates the final response text (and usage
+// from the final chunk) so the caller can persist the full turn via
+// RecordTurn.
 func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *CompletionRequest,
 	provider Provider, respID, model string, streamOpts *oaiStreamOpts, turn *TurnRecord) {
-
-	chunks, err := provider.Stream(ctx, req)
-	if err != nil {
-		slog.Warn("chat: stream error", "err", err)
-		if turn != nil {
-			turn.Status = "error"
-			turn.Error = err.Error()
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"message": sanitizeErrorMessage(err.Error()),
-				"type":    "server_error",
-				"param":   nil,
-				"code":    nil,
-			},
-		})
-		return
-	}
-	var respBuf strings.Builder
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1154,137 +1150,347 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 			flusher.Flush()
 		}
 	}
-
 	writeSSE := func(data []byte) {
 		_, _ = fmt.Fprintf(bw, "data: %s\n\n", data)
 		flush()
 	}
+	writeStreamErr := func(e error) {
+		// Headers may already be sent; surface the error as a final SSE
+		// chunk with finish_reason:error and a clear stop. The dashboard
+		// renders this as a failed turn rather than a hung stream.
+		slog.Warn("chat: stream error", "err", e)
+		if turn != nil {
+			turn.Status = "error"
+			turn.Error = e.Error()
+		}
+		fr := "error"
+		data := oaiChatResponse{
+			ID:      respID,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   model,
+			Choices: []oaiChoice{{Index: 0, FinishReason: &fr}},
+		}
+		b, _ := json.Marshal(data)
+		writeSSE(b)
+	}
 
-	// Track whether any tool calls were streamed (affects finish_reason).
-	sawToolCall := false
+	const maxStreamHops = 8
 
-	for sc := range chunks {
-		if sc.Error != nil {
-			slog.Warn("chat: stream chunk error", "err", sc.Error)
-			if turn != nil {
-				turn.Status = "error"
-				turn.Error = sc.Error.Error()
-			}
+	// Carry-forward state across hops:
+	//   carriedExternal  — external (client-owned) tool calls observed on
+	//     prior hops that we still owe the client. These are emitted as
+	//     deltas on the final replay so a model that mixes internal +
+	//     external tool_use in a single turn doesn't lose the externals.
+	//   firstStream      — channel from the very first provider.Stream call,
+	//     opened upfront so a Stream() error returns the conventional 500.
+	//     Subsequent hops re-open the stream from inside the loop.
+	var carriedExternal []ToolCall
+
+	firstStream, err := provider.Stream(ctx, req)
+	if err != nil {
+		// No SSE has been sent yet — return the same 500 shape the
+		// non-streaming path uses. The dashboard treats this as a hard
+		// failure.
+		slog.Warn("chat: stream error", "err", err)
+		if turn != nil {
+			turn.Status = "error"
+			turn.Error = err.Error()
+		}
+		// Replace the SSE headers we set above with a JSON error response.
+		// (httptest.ResponseRecorder lets this through; net/http only
+		// honours the first WriteHeader, so a header overwrite here is
+		// safe before any body bytes have been written.)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": sanitizeErrorMessage(err.Error()),
+				"type":    "server_error",
+				"param":   nil,
+				"code":    nil,
+			},
+		})
+		return
+	}
+
+	chunks := firstStream
+	for hop := 0; hop < maxStreamHops; hop++ {
+		hopBuf, hopErr := drainStreamHop(chunks)
+		if hopErr != nil {
+			writeStreamErr(hopErr)
 			break
 		}
 
-		if sc.Done {
-			// Final chunk: emit finish_reason.
-			// Prefer the provider-reported stop reason, falling back to heuristic.
-			finishReason := mapStopReasonToOpenAI(sc.StopReason)
-			if finishReason == "" {
-				finishReason = "stop"
-				if sawToolCall {
-					finishReason = "tool_calls"
-				}
-			}
-			// Populate the turn record with accumulated response + final usage.
-			if turn != nil {
-				turn.Response = respBuf.String()
-				if sc.Usage != nil {
-					turn.Usage = TurnUsage{
-						InputTokens:  sc.Usage.InputTokens,
-						OutputTokens: sc.Usage.OutputTokens,
-						TotalTokens:  sc.Usage.InputTokens + sc.Usage.OutputTokens,
-					}
-				}
-			}
-			data := oaiChatResponse{
-				ID:      respID,
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Model:   model,
-				Choices: []oaiChoice{{Index: 0, FinishReason: &finishReason}},
-			}
-			// When stream_options.include_usage is set, include usage in the final chunk.
-			if streamOpts != nil && streamOpts.IncludeUsage && sc.Usage != nil {
-				data.Usage = &oaiUsage{
-					PromptTokens:     sc.Usage.InputTokens,
-					CompletionTokens: sc.Usage.OutputTokens,
-					TotalTokens:      sc.Usage.InputTokens + sc.Usage.OutputTokens,
-				}
-			}
-			b, _ := json.Marshal(data)
-			writeSSE(b)
+		// Partition the accumulated tool calls. If there's no MCPServer
+		// snapshot wired (legacy / test paths), splitToolCallsByOwnership
+		// treats everything as external — same behaviour as completeChat.
+		toolCalls := hopBuf.assembledToolCalls()
+		internal, external := splitToolCallsByOwnership(toolCalls, s.mcpServer)
+
+		// External tool calls observed on this hop are owed to the client.
+		// We don't drop them even if the same hop also produced internal
+		// calls we'll service in-process.
+		carriedExternal = append(carriedExternal, external...)
+
+		// Terminal hop: no internal tool_use → flush this hop's buffered
+		// content + any carried-forward external tool_calls to the client
+		// and exit.
+		if len(internal) == 0 {
+			s.flushStreamHop(hopBuf, carriedExternal, provider, respID, model, streamOpts, turn, writeSSE)
 			break
 		}
 
-		// Tool call delta — wrap in OpenAI streaming tool_calls format.
-		if sc.ToolCallDelta != nil {
-			sawToolCall = true
-			tc := oaiStreamToolCall{
-				Index: sc.ToolCallDelta.Index,
+		// Hop has internal tool calls. Execute them in-process, append the
+		// tool_result messages to the conversation, then start a fresh
+		// upstream stream. Match completeChat's message-shape contract so
+		// the model sees an identical transcript whether the client
+		// streams or not.
+		req.Messages = appendToolHopMessages(req.Messages, &CompletionResponse{
+			Content:    hopBuf.content.String(),
+			ToolCalls:  toolCalls,
+			StopReason: hopBuf.stopReason,
+		}, internal)
+		for _, tc := range internal {
+			s.executeInternalToolCall(ctx, provider.Name(), tc)
+			resultText, isErr, callErr := s.mcpServer.CallTool(ctx, tc.Name, []byte(tc.Arguments))
+			if callErr != nil {
+				slog.Warn("chat: internal MCP tool call failed (stream)",
+					"tool", tc.Name, "err", callErr,
+					"request_id", req.Metadata.RequestID,
+				)
+				resultText = "tool error: " + callErr.Error()
+				isErr = true
 			}
-			if sc.ToolCallDelta.ID != "" {
-				tc.ID = sc.ToolCallDelta.ID
-				tc.Type = "function"
-				// Emit tool.call on the first delta that carries an ID.
-				// Arguments arrive incrementally in later deltas; for the
-				// ledger row we record what we have at announcement time
-				// (typically just the name — arguments accumulate client-
-				// side). The paired tool.result will still fire on the
-				// follow-up role=tool message.
-				s.process.emitToolCall(ToolCallEvent{
-					CallID:    sc.ToolCallDelta.ID,
-					ToolName:  sc.ToolCallDelta.Name,
-					Source:    ToolSourceOpenAI,
-					Ownership: ToolOwnershipClient,
-					Provider:  provider.Name(),
-					SessionID: s.process.SessionID(),
-				})
-				s.process.registerPendingToolCall(sc.ToolCallDelta.ID, sc.ToolCallDelta.Name, ToolSourceOpenAI, 0)
+			s.process.resolvePendingToolCall(tc.ID, resultText)
+			req.Messages = append(req.Messages, ProviderMessage{
+				Role:       "tool",
+				Content:    resultText,
+				Name:       tc.Name,
+				ToolCallID: tc.ID,
+			})
+			if turn != nil {
+				rec := ToolCallRecord{
+					ID:        tc.ID,
+					Name:      tc.Name,
+					Arguments: tc.Arguments,
+					Result:    truncateForTurn(resultText),
+				}
+				if isErr {
+					rec.Rejected = true
+					rec.RejectReason = "tool reported error"
+				}
+				turn.ToolCalls = append(turn.ToolCalls, rec)
 			}
-			// Always create Function — OpenAI spec requires it on every tool call
-			// delta, even the initial chunk where only Name is set and Arguments
-			// is empty. Omitting Function causes clients to see function: null.
-			tc.Function = &oaiToolCallFunc{
-				Name:      sc.ToolCallDelta.Name,
-				Arguments: sc.ToolCallDelta.ArgsDelta,
-			}
-			tcRaw, _ := json.Marshal([]oaiStreamToolCall{tc})
-			// Content left nil → serialises as "content": null (OpenAI spec for tool-call-only deltas).
-			delta := &oaiMessage{Role: "assistant", ToolCalls: json.RawMessage(tcRaw)}
-			data := oaiChatResponse{
-				ID:      respID,
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Model:   model,
-				Choices: []oaiChoice{{Index: 0, Delta: delta}},
-			}
-			b, _ := json.Marshal(data)
-			writeSSE(b)
-			continue
 		}
 
-		// Text delta.
-		if sc.Delta != "" {
-			if turn != nil {
-				respBuf.WriteString(sc.Delta)
-			}
-			delta := &oaiMessage{Role: "assistant", Content: mustMarshalString(sc.Delta)}
-			data := oaiChatResponse{
-				ID:      respID,
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Model:   model,
-				Choices: []oaiChoice{{Index: 0, Delta: delta}},
-			}
-			b, _ := json.Marshal(data)
-			writeSSE(b)
+		// Hop overflow guard: if the next hop would exceed the cap, surface
+		// a clean error rather than silently terminating after the loop.
+		if hop+1 >= maxStreamHops {
+			writeStreamErr(fmt.Errorf("stream tool-loop exceeded %d hops", maxStreamHops))
+			break
 		}
+
+		nextStream, nerr := provider.Stream(ctx, req)
+		if nerr != nil {
+			writeStreamErr(fmt.Errorf("stream after internal tool exec: %w", nerr))
+			break
+		}
+		chunks = nextStream
 	}
-	// Ensure the turn record picks up the response text even when the
-	// stream never sent a Done chunk (error mid-stream, client disconnect).
-	if turn != nil && turn.Response == "" {
-		turn.Response = respBuf.String()
-	}
+
 	_, _ = fmt.Fprint(bw, "data: [DONE]\n\n")
 	flush()
+}
+
+// streamHopBuffer collects everything one upstream stream emitted on a
+// single hop: ordered text deltas (so we can replay token-by-token on the
+// final hop), tool-call deltas reassembled by index/id, the provider's
+// final stop reason and usage, and any chunk-level error. Nothing here is
+// emitted to the client — the chat handler decides whether to flush this
+// to SSE (terminal hop) or feed it back into the conversation as a
+// tool_use turn (intermediate hop).
+type streamHopBuffer struct {
+	deltas     []string
+	content    strings.Builder
+	stopReason string
+	usage      *TokenUsage
+	// toolCalls maps streaming index → assembled call. Provider-side the
+	// index is stable across deltas for the same call; the ID typically
+	// arrives on the first delta and arguments accumulate after.
+	toolCalls map[int]*ToolCall
+	// toolOrder preserves first-seen index ordering so assembledToolCalls()
+	// returns calls in the order the provider emitted them.
+	toolOrder []int
+}
+
+func newStreamHopBuffer() *streamHopBuffer {
+	return &streamHopBuffer{toolCalls: make(map[int]*ToolCall)}
+}
+
+// assembledToolCalls returns the buffered tool calls in first-seen order.
+func (b *streamHopBuffer) assembledToolCalls() []ToolCall {
+	if len(b.toolOrder) == 0 {
+		return nil
+	}
+	out := make([]ToolCall, 0, len(b.toolOrder))
+	for _, idx := range b.toolOrder {
+		if tc, ok := b.toolCalls[idx]; ok {
+			out = append(out, *tc)
+		}
+	}
+	return out
+}
+
+// drainStreamHop consumes one upstream stream's chunks into a buffer. It
+// returns the first chunk-level error it sees (and a partially-populated
+// buffer) so the caller can surface a clean SSE error. A nil-error return
+// always implies the provider sent a Done chunk (terminating cleanly) or
+// closed the channel.
+func drainStreamHop(chunks <-chan StreamChunk) (*streamHopBuffer, error) {
+	buf := newStreamHopBuffer()
+	for sc := range chunks {
+		if sc.Error != nil {
+			return buf, sc.Error
+		}
+		if sc.Done {
+			buf.stopReason = sc.StopReason
+			buf.usage = sc.Usage
+			return buf, nil
+		}
+		if sc.ToolCallDelta != nil {
+			d := sc.ToolCallDelta
+			tc, ok := buf.toolCalls[d.Index]
+			if !ok {
+				tc = &ToolCall{}
+				buf.toolCalls[d.Index] = tc
+				buf.toolOrder = append(buf.toolOrder, d.Index)
+			}
+			if d.ID != "" {
+				tc.ID = d.ID
+			}
+			if d.Name != "" {
+				tc.Name = d.Name
+			}
+			if d.ArgsDelta != "" {
+				tc.Arguments += d.ArgsDelta
+			}
+			continue
+		}
+		if sc.Delta != "" {
+			buf.deltas = append(buf.deltas, sc.Delta)
+			buf.content.WriteString(sc.Delta)
+		}
+	}
+	// Channel closed without an explicit Done — treat as benign EOF.
+	return buf, nil
+}
+
+// flushStreamHop emits the terminal hop's buffered text deltas, any
+// carried-forward external tool_calls, and the final finish_reason chunk
+// to the SSE writer. This is the only place the streaming chat handler
+// writes deltas to the client; intermediate hops are buffered silently.
+func (s *Server) flushStreamHop(buf *streamHopBuffer, externalCalls []ToolCall,
+	provider Provider, respID, model string, streamOpts *oaiStreamOpts,
+	turn *TurnRecord, writeSSE func([]byte)) {
+
+	now := time.Now().Unix()
+
+	// Replay text deltas in order so the client sees token-by-token
+	// streaming on the final assistant turn.
+	for _, d := range buf.deltas {
+		delta := &oaiMessage{Role: "assistant", Content: mustMarshalString(d)}
+		data := oaiChatResponse{
+			ID:      respID,
+			Object:  "chat.completion.chunk",
+			Created: now,
+			Model:   model,
+			Choices: []oaiChoice{{Index: 0, Delta: delta}},
+		}
+		b, _ := json.Marshal(data)
+		writeSSE(b)
+	}
+
+	// Emit external tool_calls accumulated across all hops as a single
+	// delta so the client can dispatch them. We collapse multiple deltas
+	// per call into one (id + name + full arguments) — the streaming
+	// reassembly happened server-side, so re-fragmenting buys nothing.
+	if len(externalCalls) > 0 {
+		oaiCalls := make([]oaiStreamToolCall, len(externalCalls))
+		for i, tc := range externalCalls {
+			oaiCalls[i] = oaiStreamToolCall{
+				Index: i,
+				ID:    tc.ID,
+				Type:  "function",
+				Function: &oaiToolCallFunc{
+					Name:      tc.Name,
+					Arguments: tc.Arguments,
+				},
+			}
+			// Observability parity with completeChat: emit tool.call +
+			// register pending row for every client-bound tool we surface.
+			s.process.emitToolCall(ToolCallEvent{
+				CallID:    tc.ID,
+				ToolName:  tc.Name,
+				Arguments: json.RawMessage(tc.Arguments),
+				Source:    ToolSourceOpenAI,
+				Ownership: ToolOwnershipClient,
+				Provider:  provider.Name(),
+				SessionID: s.process.SessionID(),
+			})
+			s.process.registerPendingToolCall(tc.ID, tc.Name, ToolSourceOpenAI, 0)
+		}
+		tcRaw, _ := json.Marshal(oaiCalls)
+		delta := &oaiMessage{Role: "assistant", ToolCalls: json.RawMessage(tcRaw)}
+		data := oaiChatResponse{
+			ID:      respID,
+			Object:  "chat.completion.chunk",
+			Created: now,
+			Model:   model,
+			Choices: []oaiChoice{{Index: 0, Delta: delta}},
+		}
+		b, _ := json.Marshal(data)
+		writeSSE(b)
+	}
+
+	// Final chunk: finish_reason. Prefer the provider-reported reason; if
+	// we surfaced any external tool_calls and the provider didn't say so,
+	// upgrade to "tool_calls" so the client treats it as a tool turn.
+	finishReason := mapStopReasonToOpenAI(buf.stopReason)
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	if len(externalCalls) > 0 {
+		finishReason = "tool_calls"
+	}
+
+	if turn != nil {
+		turn.Response = buf.content.String()
+		if buf.usage != nil {
+			turn.Usage = TurnUsage{
+				InputTokens:  buf.usage.InputTokens,
+				OutputTokens: buf.usage.OutputTokens,
+				TotalTokens:  buf.usage.InputTokens + buf.usage.OutputTokens,
+			}
+		}
+	}
+
+	data := oaiChatResponse{
+		ID:      respID,
+		Object:  "chat.completion.chunk",
+		Created: now,
+		Model:   model,
+		Choices: []oaiChoice{{Index: 0, FinishReason: &finishReason}},
+	}
+	if streamOpts != nil && streamOpts.IncludeUsage && buf.usage != nil {
+		data.Usage = &oaiUsage{
+			PromptTokens:     buf.usage.InputTokens,
+			CompletionTokens: buf.usage.OutputTokens,
+			TotalTokens:      buf.usage.InputTokens + buf.usage.OutputTokens,
+		}
+	}
+	b, _ := json.Marshal(data)
+	writeSSE(b)
 }
 
 // handleToolCalls is the HTTP companion to cog_read_tool_calls.
