@@ -44,5 +44,8 @@ run/
 .cog/.state/
 .cog/ledger/
 
+# Built binary (root cmd output) — should never be committed
+/cog
+
 # Moved to standalone autoresearch repo (2026-04-20)
 autoresearch-foveated/
