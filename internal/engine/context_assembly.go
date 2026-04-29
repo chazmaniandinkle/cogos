@@ -58,6 +58,21 @@ type ContextPackage struct {
 
 	// InjectedPaths is the list of injected absolute file paths (for logging).
 	InjectedPaths []string
+
+	// CandidateCount is the number of CogDoc candidates considered before
+	// budget eviction (and any pre-truncation step). Equals len(docCandidates)
+	// at the moment of scoring; len(FovealDocs) is the post-eviction subset.
+	CandidateCount int
+
+	// Budget is the total context budget the assembler was invoked with
+	// (after defaulting). Surfaced in debug snapshots so operators can see
+	// the configured ceiling rather than a re-derived value.
+	Budget int
+
+	// FlexBudgetUsed is the sum of tokens spent on the flex zones (CogDocs
+	// + conversation history) after eviction. Equal to the original flex
+	// budget minus whatever remained unspent.
+	FlexBudgetUsed int
 }
 
 // FovealDoc is a single CogDoc selected for context injection.
@@ -68,9 +83,21 @@ type FovealDoc struct {
 	Content      string
 	Summary      string
 	SchemaIssues []string
-	Salience     float64
+	Salience     float64 // combined ranking score (relevance*2 + raw salience for keyword path; TRM score otherwise)
 	Tokens       int
-	Reason       string // "high-salience", "query-match", or "both"
+	Reason       string // "high-salience", "query-match", "both", or "trm"
+
+	// Relevance is the raw query-keyword relevance the classifier saw. Stored
+	// separately from Salience so the debug snapshot can report a value that
+	// agrees with Reason: a doc with Reason="query-match" or "both" must have
+	// Relevance > 0, and a doc with Reason="high-salience" must have
+	// Relevance == 0. Without this field the snapshot displayed Relevance: 0
+	// next to Reason: "both" because the raw value was thrown away after
+	// being folded into Salience.
+	Relevance float64
+	// RawSalience is the raw salience (field score) before being combined
+	// into Salience. Same rationale as Relevance: keeping the snapshot honest.
+	RawSalience float64
 }
 
 // ScoredMessage is a conversation turn scored for retention.
@@ -214,7 +241,7 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 		outputReserve = 4096
 	}
 
-	pkg := &ContextPackage{OutputReserve: outputReserve}
+	pkg := &ContextPackage{OutputReserve: outputReserve, Budget: budget}
 
 	// === Decompose client messages ===
 
@@ -277,11 +304,12 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 			// Build doc candidates from TRM results, using TRM score as primary ranking.
 			for _, tr := range trmResults {
 				docCandidates = append(docCandidates, FovealDoc{
-					URI:      "cog://chunks/" + tr.IndexResult.ChunkMeta.ChunkID,
-					Path:     tr.IndexResult.ChunkMeta.Path,
-					Title:    tr.IndexResult.ChunkMeta.Title,
-					Salience: float64(tr.TRMScore),
-					Reason:   "trm",
+					URI:         "cog://chunks/" + tr.IndexResult.ChunkMeta.ChunkID,
+					Path:        tr.IndexResult.ChunkMeta.Path,
+					Title:       tr.IndexResult.ChunkMeta.Title,
+					Salience:    float64(tr.TRMScore),
+					RawSalience: float64(tr.TRMScore),
+					Reason:      "trm",
 				})
 			}
 			slog.Debug("context: TRM scored candidates", "count", len(docCandidates))
@@ -314,11 +342,13 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 			}
 
 			docCandidates = append(docCandidates, FovealDoc{
-				URI:      doc.URI,
-				Path:     doc.Path,
-				Title:    doc.Title,
-				Salience: relevance*2.0 + salience,
-				Reason:   reason,
+				URI:         doc.URI,
+				Path:        doc.Path,
+				Title:       doc.Title,
+				Salience:    relevance*2.0 + salience,
+				Relevance:   relevance,
+				RawSalience: salience,
+				Reason:      reason,
 			})
 		}
 		sort.Slice(docCandidates, func(i, j int) bool {
@@ -330,20 +360,32 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 
 	scoredHistory := scoreConversationWithEstimator(history, keywords, estimateTokens)
 
+	// CandidateCount is the count of CogDocs that survived ranking but
+	// before any budget-driven eviction. This is what operators want to see
+	// in `engine.cogdocs_scored`: a faithful "we considered N candidates
+	// and chose K" record.
+	pkg.CandidateCount = len(docCandidates)
+
 	// === Evict to fit budget ===
 
 	pkg.FovealDocs, pkg.Conversation = evictForBudgetModeWithEstimator(docCandidates, scoredHistory, flexBudget, p.cfg.WorkspaceRoot, manifestMode, estimateTokens)
 
-	// Compute total tokens.
+	// Compute total tokens and flex usage. flex_budget_used is the sum of
+	// post-eviction CogDoc + conversation zone tokens (i.e. everything that
+	// landed in the flex zones).
 	total := nucleusTokens + clientSysTokens + currentMsgTokens
+	flexUsed := 0
 	for _, d := range pkg.FovealDocs {
 		total += d.Tokens
+		flexUsed += d.Tokens
 		pkg.InjectedPaths = append(pkg.InjectedPaths, d.Path)
 	}
 	for _, m := range pkg.Conversation {
 		total += m.Tokens
+		flexUsed += m.Tokens
 	}
 	pkg.TotalTokens = total
+	pkg.FlexBudgetUsed = flexUsed
 
 	// Record assembly event.
 	p.emitEvent("context.assembly", map[string]interface{}{
