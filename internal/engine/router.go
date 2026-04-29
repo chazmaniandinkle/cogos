@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,11 +52,16 @@ func NewSimpleRouter(cfg RoutingConfig) *SimpleRouter {
 }
 
 // RegisterProvider adds a provider to the pool.
+// Providers are kept sorted by Name() so that ProviderForModel iteration
+// is deterministic when multiple providers share the same Model() string.
 func (r *SimpleRouter) RegisterProvider(p Provider) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.byName[p.Name()] = p
 	r.providers = append(r.providers, p)
+	sort.Slice(r.providers, func(i, j int) bool {
+		return r.providers[i].Name() < r.providers[j].Name()
+	})
 }
 
 // DeregisterProvider removes a provider by name.
@@ -449,6 +455,8 @@ func mergeRoutingConfig(base, overlay RoutingConfig) RoutingConfig {
 	if overlay.LocalThreshold != 0 {
 		base.LocalThreshold = overlay.LocalThreshold
 	}
+	// FallbackChain is intentionally replaced wholesale (not element-merged) so the overlay
+	// can reorder or shrink the chain; element-wise merge would make removal impossible.
 	if len(overlay.FallbackChain) > 0 {
 		base.FallbackChain = overlay.FallbackChain
 	}

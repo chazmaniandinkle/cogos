@@ -416,3 +416,109 @@ func keysOf(m map[string]ProviderConfig) []string {
 	}
 	return out
 }
+
+// ── ProviderForName / ProviderForModel ───────────────────────────────────────
+
+// modelStub wraps a StubProvider but overrides Model() to return a fixed string.
+// Used to test ProviderForModel resolution without modifying StubProvider.
+type modelStub struct {
+	*StubProvider
+	model string
+}
+
+func (m *modelStub) Model() string { return m.model }
+
+// TestProviderForName_AliasHit verifies that when req.Model matches a registered
+// provider's Name(), ProviderForName returns (name, true) so the caller knows
+// NOT to set a ModelOverride — the provider already knows its configured model.
+func TestProviderForName_AliasHit(t *testing.T) {
+	t.Parallel()
+	r := NewSimpleRouter(RoutingConfig{Default: "mlx-gemma"})
+	r.RegisterProvider(NewStubProvider("mlx-gemma", ""))
+
+	name, ok := r.ProviderForName("mlx-gemma")
+	if !ok {
+		t.Fatal("ProviderForName: expected hit, got miss")
+	}
+	if name != "mlx-gemma" {
+		t.Errorf("ProviderForName: got %q; want mlx-gemma", name)
+	}
+}
+
+// TestProviderForName_Miss verifies that a string that is not a registered
+// provider name returns ("", false), so the caller falls through to ModelOverride.
+func TestProviderForName_Miss(t *testing.T) {
+	t.Parallel()
+	r := NewSimpleRouter(RoutingConfig{})
+	r.RegisterProvider(NewStubProvider("mlx-gemma", ""))
+
+	_, ok := r.ProviderForName("gemma-3-4b-it")
+	if ok {
+		t.Error("ProviderForName: expected miss for non-name model string, got hit")
+	}
+}
+
+// TestProviderForModel_HitSetsPreferProvider verifies that when req.Model is not
+// a provider alias (ProviderForName miss) but matches a provider's Model() string,
+// ProviderForModel returns (name, true) — the caller should set PreferProvider AND
+// ModelOverride so the targeted provider gets the explicit model id.
+func TestProviderForModel_HitSetsPreferProvider(t *testing.T) {
+	t.Parallel()
+	r := NewSimpleRouter(RoutingConfig{Default: "cloud"})
+	cloud := &modelStub{StubProvider: NewStubProvider("cloud", ""), model: "claude-opus-4"}
+	r.RegisterProvider(cloud)
+
+	name, ok := r.ProviderForModel("claude-opus-4")
+	if !ok {
+		t.Fatal("ProviderForModel: expected hit, got miss")
+	}
+	if name != "cloud" {
+		t.Errorf("ProviderForModel: got %q; want cloud", name)
+	}
+}
+
+// TestProviderForModel_Miss verifies ("", false) when no provider's Name or Model
+// matches — the caller should route via defaults with ModelOverride only.
+func TestProviderForModel_Miss(t *testing.T) {
+	t.Parallel()
+	r := NewSimpleRouter(RoutingConfig{})
+	r.RegisterProvider(NewStubProvider("ollama", ""))
+
+	_, ok := r.ProviderForModel("gpt-5")
+	if ok {
+		t.Error("ProviderForModel: expected miss for unknown model, got hit")
+	}
+}
+
+// TestProviderForModel_DeterministicTiebreak verifies that when two providers
+// declare the same Model() string, ProviderForModel always resolves to the same
+// one. Providers are sorted by Name() on registration, so the alphabetically first
+// name wins consistently regardless of registration order.
+func TestProviderForModel_DeterministicTiebreak(t *testing.T) {
+	t.Parallel()
+
+	const sharedModel = "gemma-3-4b-it"
+
+	// Register in reverse-alpha order to confirm sort, not insertion, governs.
+	r := NewSimpleRouter(RoutingConfig{Default: "zebra"})
+	r.RegisterProvider(&modelStub{StubProvider: NewStubProvider("zebra", ""), model: sharedModel})
+	r.RegisterProvider(&modelStub{StubProvider: NewStubProvider("alpha", ""), model: sharedModel})
+	r.RegisterProvider(&modelStub{StubProvider: NewStubProvider("mango", ""), model: sharedModel})
+
+	name, ok := r.ProviderForModel(sharedModel)
+	if !ok {
+		t.Fatal("ProviderForModel: expected hit, got miss")
+	}
+	// "alpha" sorts first — that should always win.
+	if name != "alpha" {
+		t.Errorf("ProviderForModel: got %q; want alpha (alphabetically first)", name)
+	}
+
+	// Call multiple times to confirm stability.
+	for range 10 {
+		got, _ := r.ProviderForModel(sharedModel)
+		if got != name {
+			t.Errorf("ProviderForModel: non-deterministic — got %q on repeat, want %q", got, name)
+		}
+	}
+}
