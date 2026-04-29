@@ -65,15 +65,16 @@ type DebugZone struct {
 }
 
 type DebugZoneItem struct {
-	ID        string  `json:"id,omitempty"`
-	Title     string  `json:"title,omitempty"`
-	Role      string  `json:"role,omitempty"`
-	Tokens    int     `json:"tokens"`
-	Salience  float64 `json:"salience,omitempty"`
-	Recency   float64 `json:"recency,omitempty"`
-	Relevance float64 `json:"relevance,omitempty"`
-	Reason    string  `json:"reason,omitempty"`
-	Preview   string  `json:"preview"`
+	ID            string  `json:"id,omitempty"`
+	Title         string  `json:"title,omitempty"`
+	Role          string  `json:"role,omitempty"`
+	Tokens        int     `json:"tokens"`
+	Salience      float64 `json:"salience,omitempty"`
+	Recency       float64 `json:"recency,omitempty"`
+	Relevance     float64 `json:"relevance,omitempty"`
+	CombinedScore float64 `json:"combined_score,omitempty"`
+	Reason        string  `json:"reason,omitempty"`
+	Preview       string  `json:"preview"`
 }
 
 type DebugBudget struct {
@@ -224,11 +225,12 @@ func buildContextView(pkg *ContextPackage) DebugContextView {
 		}
 		for _, m := range pkg.Conversation {
 			convZone.Items = append(convZone.Items, DebugZoneItem{
-				Role:      m.Role,
-				Tokens:    m.Tokens,
-				Recency:   m.RecencyScore,
-				Relevance: m.RelevanceScore,
-				Preview:   truncate(m.Content, 100),
+				Role:          m.Role,
+				Tokens:        m.Tokens,
+				Recency:       m.RecencyScore,
+				Relevance:     m.RelevanceScore,
+				CombinedScore: m.CombinedScore,
+				Preview:       truncate(m.Content, 100),
 			})
 			convZone.Tokens += m.Tokens
 		}
