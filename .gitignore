@@ -42,6 +42,7 @@ run/
 
 # CogOS state (runtime-generated, may contain personal data)
 .cog/.state/
+.cog/ledger/
 
 # Moved to standalone autoresearch repo (2026-04-20)
 autoresearch-foveated/
