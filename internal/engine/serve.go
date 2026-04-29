@@ -900,10 +900,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Capture debug snapshot (best-effort, non-blocking).
+	// Both completeChat and streamChat populate turn.Usage from the
+	// provider response (final chunk for streaming, response payload for
+	// non-streaming) — read it back here so the snapshot reports the
+	// actual completion-token count rather than a hard-coded zero.
+	responseTokens := turn.Usage.OutputTokens
+	snapshotLatency := time.Since(inferStart)
 	go func() {
 		snap := captureDebugSnapshot(
 			clientMsgs, query, req.Model, pkg, conversationTurnsIn,
-			provider.Name(), model, 0, time.Since(inferStart),
+			provider.Name(), model, responseTokens, snapshotLatency,
 		)
 		s.debug.Store(snap)
 	}()

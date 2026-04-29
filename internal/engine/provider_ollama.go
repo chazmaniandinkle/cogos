@@ -393,7 +393,15 @@ func (p *OllamaProvider) Stream(ctx context.Context, req *CompletionRequest) (<-
 		defer close(ch)
 		defer resp.Body.Close()
 
+		// Track a chunk-counting fallback in case the final record from Ollama
+		// doesn't surface eval_count (older servers, partial streams). Counts
+		// content-bearing chunks — coarse but vastly better than reporting 0.
+		contentChunks := 0
+
+		// bufio.Scanner has a 64KB default token limit; some Ollama chunks
+		// (long tool-call arguments) can exceed it. Allow up to 1 MiB.
 		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
 			if line == "" {
@@ -407,14 +415,23 @@ func (p *OllamaProvider) Stream(ctx context.Context, req *CompletionRequest) (<-
 				}
 				return
 			}
+			if !chunk.Done && chunk.Message.Content != "" {
+				contentChunks++
+			}
 			sc := StreamChunk{
 				Delta: chunk.Message.Content,
 				Done:  chunk.Done,
 			}
 			if chunk.Done {
+				outputTokens := chunk.EvalCount
+				if outputTokens == 0 {
+					// Fallback: Ollama didn't surface eval_count. Use the
+					// number of content-bearing chunks as an estimate.
+					outputTokens = contentChunks
+				}
 				sc.Usage = &TokenUsage{
 					InputTokens:  chunk.PromptEvalCount,
-					OutputTokens: chunk.EvalCount,
+					OutputTokens: outputTokens,
 				}
 				sc.ProviderMeta = &ProviderMeta{
 					Provider: p.name,
