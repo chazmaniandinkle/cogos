@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -65,17 +66,14 @@ type OllamaProvider struct {
 
 // NewOllamaProvider creates an OllamaProvider from a ProviderConfig.
 func NewOllamaProvider(name string, cfg ProviderConfig) *OllamaProvider {
-	endpoint := cfg.Endpoint
-	if endpoint == "" {
-		endpoint = "http://localhost:11434"
-	}
+	endpoint := ResolveLocalLLMEndpoint(cfg.Endpoint, localLLMDefaultEndpoint)
 	timeout := time.Duration(cfg.Timeout) * time.Second
 	if timeout == 0 {
 		timeout = 60 * time.Second
 	}
 	return &OllamaProvider{
 		name:          name,
-		endpoint:      normalizeLocalLLMEndpoint(endpoint),
+		endpoint:      endpoint,
 		model:         cfg.Model,
 		contextWindow: cfg.ContextWindow,
 		timeout:       timeout,
@@ -84,34 +82,20 @@ func NewOllamaProvider(name string, cfg ProviderConfig) *OllamaProvider {
 }
 
 // Name returns the provider identifier.
-func (p *OllamaProvider) Name() string  { return p.name }
-func (p *OllamaProvider) Model() string { return p.model }
+func (p *OllamaProvider) Name() string { return p.name }
 
 // Available checks if Ollama is running and the configured model is loaded.
 func (p *OllamaProvider) Available(ctx context.Context) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"/api/tags", nil)
+	models, err := p.listModels(ctx)
 	if err != nil {
 		return false
 	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	var tags struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
-		return false
+	if p.model == "" {
+		return len(models) > 0
 	}
 	// Accept exact name or prefix (e.g. "qwen2.5:9b" matches "qwen2.5:9b-instruct").
-	for _, m := range tags.Models {
-		if m.Name == p.model || strings.HasPrefix(m.Name, p.model) {
+	for _, model := range models {
+		if model == p.model || strings.HasPrefix(model, p.model) {
 			return true
 		}
 	}
@@ -164,35 +148,68 @@ func (p *OllamaProvider) Ping(ctx context.Context) (time.Duration, error) {
 	return time.Since(start), nil
 }
 
+func (p *OllamaProvider) listModels(ctx context.Context) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"/api/tags", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var tags struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(tags.Models))
+	for _, model := range tags.Models {
+		if model.Name == "" {
+			continue
+		}
+		names = append(names, model.Name)
+	}
+	return names, nil
+}
+
 // ── Ollama wire types ─────────────────────────────────────────────────────────
 
 type ollamaMessage struct {
 	Role       string           `json:"role"`
 	Content    string           `json:"content,omitempty"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
+	Thinking   string           `json:"thinking,omitempty"`
 	ToolCalls  []ollamaToolCall `json:"tool_calls,omitempty"`
+	ToolName   string           `json:"tool_name,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
 type ollamaTool struct {
-	Type     string             `json:"type"`
-	Function ollamaToolFunction `json:"function"`
+	Type     string               `json:"type"`
+	Function ollamaToolDefinition `json:"function"`
 }
 
-type ollamaToolFunction struct {
+type ollamaToolDefinition struct {
 	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Parameters  map[string]interface{} `json:"parameters"`
+	Description string                 `json:"description,omitempty"`
+	Parameters  map[string]interface{} `json:"parameters,omitempty"`
 }
 
 type ollamaToolCall struct {
-	ID       string               `json:"id,omitempty"`
-	Type     string               `json:"type"`
-	Function ollamaToolCallDetail `json:"function"`
+	Type     string                 `json:"type,omitempty"`
+	Function ollamaToolCallFunction `json:"function"`
 }
 
-type ollamaToolCallDetail struct {
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
+type ollamaToolCallFunction struct {
+	Index     *int        `json:"index,omitempty"`
+	Name      string      `json:"name"`
+	Arguments interface{} `json:"arguments,omitempty"`
 }
 
 type ollamaChatRequest struct {
@@ -205,10 +222,11 @@ type ollamaChatRequest struct {
 }
 
 type ollamaChatResponse struct {
-	Model     string        `json:"model"`
-	CreatedAt string        `json:"created_at"`
-	Message   ollamaMessage `json:"message"`
-	Done      bool          `json:"done"`
+	Model      string        `json:"model"`
+	CreatedAt  string        `json:"created_at"`
+	Message    ollamaMessage `json:"message"`
+	Done       bool          `json:"done"`
+	DoneReason string        `json:"done_reason,omitempty"`
 	// Token counts (only in final streaming chunk or non-streaming response).
 	PromptEvalCount int `json:"prompt_eval_count"`
 	EvalCount       int `json:"eval_count"`
@@ -221,26 +239,41 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 	if req.SystemPrompt != "" {
 		msgs = append(msgs, ollamaMessage{Role: "system", Content: req.SystemPrompt})
 	}
+	toolNameByID := make(map[string]string)
+	var pendingToolNames []string
 	for _, m := range req.Messages {
 		msg := ollamaMessage{
-			Role:       m.Role,
-			Content:    m.Content,
-			ToolCallID: m.ToolCallID,
+			Role:    m.Role,
+			Content: m.Content,
 		}
-		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
-			for _, tc := range m.ToolCalls {
-				rawArgs := json.RawMessage(tc.Arguments)
-				if len(rawArgs) == 0 || !json.Valid(rawArgs) {
-					rawArgs = json.RawMessage("{}")
-				}
+		switch {
+		case m.Role == "assistant" && len(m.ToolCalls) > 0:
+			msg.ToolCalls = make([]ollamaToolCall, 0, len(m.ToolCalls))
+			for i, tc := range m.ToolCalls {
+				toolArgs := decodeOllamaToolArguments(tc.Arguments)
+				index := i
 				msg.ToolCalls = append(msg.ToolCalls, ollamaToolCall{
-					ID:   tc.ID,
 					Type: "function",
-					Function: ollamaToolCallDetail{
+					Function: ollamaToolCallFunction{
+						Index:     &index,
 						Name:      tc.Name,
-						Arguments: rawArgs,
+						Arguments: toolArgs,
 					},
 				})
+				if tc.ID != "" {
+					toolNameByID[tc.ID] = tc.Name
+				}
+				pendingToolNames = append(pendingToolNames, tc.Name)
+			}
+		case m.Role == "tool":
+			msg.ToolCallID = m.ToolCallID
+			msg.ToolName = m.Name
+			if msg.ToolName == "" && m.ToolCallID != "" {
+				msg.ToolName = toolNameByID[m.ToolCallID]
+			}
+			if msg.ToolName == "" && len(pendingToolNames) > 0 {
+				msg.ToolName = pendingToolNames[0]
+				pendingToolNames = pendingToolNames[1:]
 			}
 		}
 		msgs = append(msgs, msg)
@@ -260,29 +293,134 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 		opts["num_predict"] = req.MaxTokens
 	}
 
-	var tools []ollamaTool
-	if len(req.Tools) > 0 {
-		tools = make([]ollamaTool, 0, len(req.Tools))
-		for _, t := range req.Tools {
-			tools = append(tools, ollamaTool{
-				Type: "function",
-				Function: ollamaToolFunction{
-					Name:        t.Name,
-					Description: t.Description,
-					Parameters:  t.InputSchema,
-				},
-			})
-		}
-	}
-
-	return &ollamaChatRequest{
+	or := &ollamaChatRequest{
 		Model:    model,
 		Messages: msgs,
-		Tools:    tools,
 		Stream:   stream,
 		Think:    false, // prevent silent token burn in qwen3 thinking mode
 		Options:  opts,
 	}
+	if len(req.Tools) > 0 && req.ToolChoice != "none" {
+		or.Tools = make([]ollamaTool, len(req.Tools))
+		for i, tool := range req.Tools {
+			or.Tools[i] = ollamaTool{
+				Type: "function",
+				Function: ollamaToolDefinition{
+					Name:        tool.Name,
+					Description: tool.Description,
+					Parameters:  tool.InputSchema,
+				},
+			}
+		}
+	}
+	return or
+}
+
+func decodeOllamaToolArguments(raw string) interface{} {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return map[string]interface{}{}
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var value interface{}
+	if err := dec.Decode(&value); err != nil {
+		return raw
+	}
+	return value
+}
+
+func encodeOllamaToolArguments(raw interface{}) string {
+	if raw == nil {
+		return "{}"
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+func mapOllamaDoneReason(reason string) string {
+	switch reason {
+	case "", "stop":
+		return "end_turn"
+	case "length":
+		return "max_tokens"
+	case "tool_calls":
+		return "tool_use"
+	default:
+		return reason
+	}
+}
+
+func parseOllamaToolCalls(msg ollamaMessage) []ToolCall {
+	if len(msg.ToolCalls) == 0 {
+		return nil
+	}
+	out := make([]ToolCall, 0, len(msg.ToolCalls))
+	for i, tc := range msg.ToolCalls {
+		name := tc.Function.Name
+		args := encodeOllamaToolArguments(tc.Function.Arguments)
+		out = append(out, ToolCall{
+			ID:        ollamaToolCallID(i, name),
+			Name:      name,
+			Arguments: args,
+		})
+	}
+	return out
+}
+
+func ollamaToolCallID(index int, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "tool"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	base := strings.Trim(b.String(), "-")
+	if base == "" {
+		base = "tool"
+	}
+	return "ollama-call-" + strconv.Itoa(index) + "-" + base
+}
+
+func parseOllamaResponse(or *ollamaChatResponse, providerName, model string, latency time.Duration) *CompletionResponse {
+	resp := &CompletionResponse{
+		Content: or.Message.Content,
+		Usage: TokenUsage{
+			InputTokens:  or.PromptEvalCount,
+			OutputTokens: or.EvalCount,
+		},
+		ProviderMeta: ProviderMeta{
+			Provider: providerName,
+			Model:    model,
+			Latency:  latency,
+		},
+	}
+
+	resp.ToolCalls = parseOllamaToolCalls(or.Message)
+	switch {
+	case len(resp.ToolCalls) > 0:
+		resp.StopReason = "tool_use"
+	default:
+		resp.StopReason = mapOllamaDoneReason(or.DoneReason)
+	}
+	if resp.StopReason == "" {
+		resp.StopReason = "end_turn"
+	}
+	return resp
 }
 
 // effectiveModel returns the model to send to Ollama: request override if set,
@@ -328,35 +466,7 @@ func (p *OllamaProvider) Complete(ctx context.Context, req *CompletionRequest) (
 		return nil, fmt.Errorf("ollama: decode response: %w", err)
 	}
 
-	out := &CompletionResponse{
-		Content: or.Message.Content,
-		Usage: TokenUsage{
-			InputTokens:  or.PromptEvalCount,
-			OutputTokens: or.EvalCount,
-		},
-		ProviderMeta: ProviderMeta{
-			Provider: p.name,
-			Model:    model,
-			Latency:  time.Since(start),
-		},
-	}
-	if len(or.Message.ToolCalls) > 0 {
-		out.StopReason = "tool_use"
-		for _, tc := range or.Message.ToolCalls {
-			args := string(tc.Function.Arguments)
-			if args == "" || args == "null" {
-				args = "{}"
-			}
-			out.ToolCalls = append(out.ToolCalls, ToolCall{
-				ID:        tc.ID,
-				Name:      tc.Function.Name,
-				Arguments: args,
-			})
-		}
-	} else {
-		out.StopReason = "end_turn"
-	}
-	return out, nil
+	return parseOllamaResponse(&or, p.name, model, time.Since(start)), nil
 }
 
 // Stream sends a streaming request and returns a channel of chunks.
@@ -393,6 +503,8 @@ func (p *OllamaProvider) Stream(ctx context.Context, req *CompletionRequest) (<-
 		defer close(ch)
 		defer resp.Body.Close()
 
+		var sawToolCalls bool
+
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -407,24 +519,46 @@ func (p *OllamaProvider) Stream(ctx context.Context, req *CompletionRequest) (<-
 				}
 				return
 			}
-			sc := StreamChunk{
-				Delta: chunk.Message.Content,
-				Done:  chunk.Done,
-			}
-			if chunk.Done {
-				sc.Usage = &TokenUsage{
-					InputTokens:  chunk.PromptEvalCount,
-					OutputTokens: chunk.EvalCount,
+			for idx, tc := range parseOllamaToolCalls(chunk.Message) {
+				sawToolCalls = true
+				tcd := &ToolCallDelta{
+					Index:     idx,
+					ID:        tc.ID,
+					Name:      tc.Name,
+					ArgsDelta: tc.Arguments,
 				}
-				sc.ProviderMeta = &ProviderMeta{
-					Provider: p.name,
-					Model:    model,
+				select {
+				case ch <- StreamChunk{ToolCallDelta: tcd}:
+				case <-ctx.Done():
+					return
 				}
 			}
-			select {
-			case ch <- sc:
-			case <-ctx.Done():
-				return
+
+			if chunk.Message.Content != "" || chunk.Done {
+				sc := StreamChunk{
+					Delta: chunk.Message.Content,
+					Done:  chunk.Done,
+				}
+				if chunk.Done {
+					stopReason := mapOllamaDoneReason(chunk.DoneReason)
+					if sawToolCalls && stopReason == "end_turn" {
+						stopReason = "tool_use"
+					}
+					sc.StopReason = stopReason
+					sc.Usage = &TokenUsage{
+						InputTokens:  chunk.PromptEvalCount,
+						OutputTokens: chunk.EvalCount,
+					}
+					sc.ProviderMeta = &ProviderMeta{
+						Provider: p.name,
+						Model:    model,
+					}
+				}
+				select {
+				case ch <- sc:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 		if err := scanner.Err(); err != nil {

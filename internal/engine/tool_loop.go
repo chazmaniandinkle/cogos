@@ -190,29 +190,6 @@ func NewKernelToolRegistry(mcpSrv *MCPServer) *KernelToolRegistry {
 			),
 			executor: makeExecutor(mcpSrv, mcpSrv.toolIngest, ingestInput{}),
 		},
-		// Audit-scope tools — read-only filesystem access within the workspace root.
-		// Listed here so they are in the full kernel registry; they are only
-		// visible to harness dispatches when scope="audit" (or a superset).
-		{
-			name:        "cog_read_file",
-			description: "Read an arbitrary file within the workspace root. Returns line-numbered content with optional offset/limit. Rejects paths outside the workspace root.",
-			schema: mergeSchemas(
-				requiredSchema("path", "string", "Absolute path within workspace root"),
-				optionalSchema("offset", "integer", "Line offset (0-based, default 0)"),
-				optionalSchema("limit", "integer", "Maximum lines to return (default 500)"),
-			),
-			executor: makeExecutor(mcpSrv, mcpSrv.toolReadFile, readFileInput{}),
-		},
-		{
-			name:        "cog_grep_files",
-			description: "Regex search over files within the workspace root (ripgrep-style). Returns matching lines with path and line number. Rejects search paths outside the workspace root.",
-			schema: mergeSchemas(
-				requiredSchema("pattern", "string", "Regular expression pattern to search for"),
-				optionalSchema("path", "string", "Directory or file to search (defaults to workspace root)"),
-				optionalSchema("max_results", "integer", "Maximum matches to return (default 50)"),
-			),
-			executor: makeExecutor(mcpSrv, mcpSrv.toolGrepFiles, grepFilesInput{}),
-		},
 	}
 
 	for _, t := range tools {
@@ -245,37 +222,6 @@ func (r *KernelToolRegistry) Execute(ctx context.Context, name, arguments string
 // Definitions returns the tool definitions for inclusion in CompletionRequest.
 func (r *KernelToolRegistry) Definitions() []ToolDefinition {
 	return r.definitions
-}
-
-// Scoped returns a registry limited to the named tool subset. Empty names keep
-// the original registry. Unknown names return an error instead of silently
-// widening the scope.
-func (r *KernelToolRegistry) Scoped(names []string) (*KernelToolRegistry, error) {
-	if r == nil {
-		return nil, fmt.Errorf("nil kernel tool registry")
-	}
-	if len(names) == 0 {
-		return r, nil
-	}
-
-	out := &KernelToolRegistry{
-		cfg:       r.cfg,
-		proprio:   r.proprio,
-		executors: make(map[string]toolExecutor, len(names)),
-	}
-	for _, name := range names {
-		exec, ok := r.executors[name]
-		if !ok {
-			return nil, fmt.Errorf("kernel tool %q not registered", name)
-		}
-		def, ok := lookupToolDefinition(r.definitions, name)
-		if !ok {
-			return nil, fmt.Errorf("kernel tool %q missing definition", name)
-		}
-		out.executors[name] = exec
-		out.definitions = append(out.definitions, def)
-	}
-	return out, nil
 }
 
 func toolCallValidationEnabled(provider Provider, cfg *Config) bool {
@@ -403,6 +349,7 @@ func RunToolLoopWithTranscript(
 	var transcript []ToolCallRecord
 
 	for i := 0; i < maxToolLoopIterations; i++ {
+		resp.ToolCalls = normalizeToolCallIDs(provider.Name(), i+1, resp.ToolCalls)
 		if len(resp.ToolCalls) == 0 {
 			return resp, clientToolCalls, transcript, nil
 		}
@@ -550,6 +497,53 @@ func RunToolLoopWithTranscript(
 
 	slog.Warn("tool_loop: max iterations reached", "max", maxToolLoopIterations)
 	return resp, clientToolCalls, transcript, nil
+}
+
+func normalizeToolCallIDs(providerName string, iteration int, calls []ToolCall) []ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	prefix := sanitizeToolCallIDPrefix(providerName)
+	for i := range calls {
+		if strings.TrimSpace(calls[i].ID) != "" {
+			continue
+		}
+		calls[i].ID = fmt.Sprintf("%s-call-%d-%d", prefix, iteration, i)
+	}
+	return calls
+}
+
+func sanitizeToolCallIDPrefix(providerName string) string {
+	providerName = strings.TrimSpace(providerName)
+	if providerName == "" {
+		return "provider"
+	}
+	var b strings.Builder
+	prevDash := false
+	for _, r := range providerName {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+			prevDash = false
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+			prevDash = false
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if prevDash {
+				continue
+			}
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	sanitized := strings.Trim(b.String(), "-")
+	if sanitized == "" {
+		return "provider"
+	}
+	return sanitized
 }
 
 // ── Schema helpers ───────────────────────────────────────────────────────────

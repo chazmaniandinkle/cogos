@@ -23,18 +23,14 @@ import (
 )
 
 const (
-	// openaiCompatDefaultEndpoint is the fallback endpoint when no Endpoint is
-	// configured and the COGOS_LLM_ENDPOINT environment variable is unset.
-	// Defaults to the Ollama loopback port; override via config or env for
-	// other servers (LM Studio on :1234, vLLM, llama.cpp, remote hosts, etc.).
-	openaiCompatDefaultEndpoint = "http://localhost:11434"
+	openaiCompatDefaultEndpoint = localLLMDefaultEndpoint
 	openaiCompatDefaultMaxToks  = 4096
 )
 
 // OpenAICompatProvider implements Provider against any OpenAI-compatible server.
 type OpenAICompatProvider struct {
 	name      string
-	endpoint  string // e.g. "http://<inference-host>:<port>" (local or remote)
+	endpoint  string // e.g. "http://localhost:1234" or "http://192.168.10.191:1234"
 	apiKey    string // optional; some local servers don't require auth
 	model     string
 	maxTokens int
@@ -43,12 +39,8 @@ type OpenAICompatProvider struct {
 }
 
 // NewOpenAICompatProvider creates an OpenAICompatProvider from a ProviderConfig.
-//
-// Endpoint resolution order: cfg.Endpoint > COGOS_LLM_ENDPOINT env >
-// openaiCompatDefaultEndpoint (localhost Ollama default). This lets users
-// point at an arbitrary OpenAI-compatible server without editing config.
 func NewOpenAICompatProvider(name string, cfg ProviderConfig) *OpenAICompatProvider {
-	endpoint := resolveLocalLLMEndpoint(cfg.Endpoint)
+	endpoint := ResolveLocalLLMEndpoint(cfg.Endpoint, openaiCompatDefaultEndpoint)
 	timeout := time.Duration(cfg.Timeout) * time.Second
 	if timeout == 0 {
 		timeout = 60 * time.Second
@@ -63,7 +55,7 @@ func NewOpenAICompatProvider(name string, cfg ProviderConfig) *OpenAICompatProvi
 	}
 	return &OpenAICompatProvider{
 		name:      name,
-		endpoint:  normalizeLocalLLMEndpoint(endpoint),
+		endpoint:  endpoint,
 		apiKey:    apiKey,
 		model:     cfg.Model,
 		maxTokens: maxTokens,
@@ -74,9 +66,6 @@ func NewOpenAICompatProvider(name string, cfg ProviderConfig) *OpenAICompatProvi
 
 // Name returns the provider identifier.
 func (p *OpenAICompatProvider) Name() string { return p.name }
-
-// Model returns the configured model identifier.
-func (p *OpenAICompatProvider) Model() string { return p.model }
 
 // Available checks if the server is reachable and has at least one model.
 func (p *OpenAICompatProvider) Available(ctx context.Context) bool {
@@ -235,8 +224,8 @@ type openaiToolCallDetail struct {
 
 // Non-streaming response.
 type openaiChatResponse struct {
-	ID      string              `json:"id"`
-	Choices []openaiChoice      `json:"choices"`
+	ID      string               `json:"id"`
+	Choices []openaiChoice       `json:"choices"`
 	Usage   *openaiUsageResponse `json:"usage,omitempty"`
 }
 
@@ -254,21 +243,21 @@ type openaiUsageResponse struct {
 
 // SSE streaming chunk.
 type openaiStreamChunk struct {
-	ID      string                   `json:"id"`
-	Choices []openaiStreamChoice     `json:"choices"`
-	Usage   *openaiUsageResponse     `json:"usage,omitempty"` // some servers send usage on final chunk
+	ID      string               `json:"id"`
+	Choices []openaiStreamChoice `json:"choices"`
+	Usage   *openaiUsageResponse `json:"usage,omitempty"` // some servers send usage on final chunk
 }
 
 type openaiStreamChoice struct {
-	Index        int                `json:"index"`
-	Delta        openaiStreamDelta  `json:"delta"`
-	FinishReason *string            `json:"finish_reason"` // pointer: null until final chunk
+	Index        int               `json:"index"`
+	Delta        openaiStreamDelta `json:"delta"`
+	FinishReason *string           `json:"finish_reason"` // pointer: null until final chunk
 }
 
 type openaiStreamDelta struct {
-	Role      string                    `json:"role,omitempty"`
-	Content   string                    `json:"content,omitempty"`
-	ToolCalls []openaiStreamToolCall    `json:"tool_calls,omitempty"`
+	Role      string                 `json:"role,omitempty"`
+	Content   string                 `json:"content,omitempty"`
+	ToolCalls []openaiStreamToolCall `json:"tool_calls,omitempty"`
 }
 
 // openaiStreamToolCall is the streaming variant of a tool call delta.
