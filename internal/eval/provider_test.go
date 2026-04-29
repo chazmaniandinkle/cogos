@@ -80,7 +80,7 @@ func (s *stubBusReader) ReadChannel(_ context.Context, _ string, _ string) ([]Bu
 
 // buildTestProvider returns an EvalProvider with stub dependencies.
 func buildTestProvider(dispatcher AgentDispatcher, emitter BusEmitter, busReader BusReader) *EvalProvider {
-	p := New(dispatcher, emitter, nil)
+	p := New(dispatcher, emitter)
 	p.busReader = busReader
 	return p
 }

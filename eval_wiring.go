@@ -27,7 +27,7 @@ import (
 // evalProviderInstance is the singleton EvalProvider registered with the
 // reconcile registry. The same instance is passed to RegisterEvalTools so
 // the MCP tools share state (root path, dispatcher) with the reconcile loop.
-var evalProviderInstance = eval.New(nil, nil, nil)
+var evalProviderInstance = eval.New(nil, nil)
 
 func init() {
 	// Wire the NowISO dependency so EvalProvider uses the same timestamp
@@ -39,8 +39,8 @@ func init() {
 	// Wire the EvalProvider constructor. The concrete BusReader is an HTTP reader
 	// hitting the local kernel; the BusEmitter is an HTTP emitter. Both degrade
 	// gracefully when the kernel is not reachable.
-	eval.NewEvalProvider = func(dispatcher eval.AgentDispatcher, emitter eval.BusEmitter, reader eval.CogdocReader) *eval.EvalProvider {
-		return eval.New(dispatcher, emitter, reader)
+	eval.NewEvalProvider = func(dispatcher eval.AgentDispatcher, emitter eval.BusEmitter) *eval.EvalProvider {
+		return eval.New(dispatcher, emitter)
 	}
 
 	// Register the eval provider with the reconcile registry.

@@ -32,7 +32,7 @@ import (
 // eval MCP tools. The daemon does not run plan/apply; it only exposes the
 // four read/trigger tools whose state effects (trigger files, baseline pins)
 // are read by the CLI's reconcile loop.
-var daemonEvalProvider = eval.New(nil, nil, nil)
+var daemonEvalProvider = eval.New(nil, nil)
 
 func init() {
 	// The named import of internal/providers/daemon above already triggered
