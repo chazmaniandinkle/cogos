@@ -16,14 +16,19 @@
 package engine
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -251,7 +256,7 @@ func (m *MCPServer) registerTools() {
 
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_dispatch_to_harness",
-		Description: "Phase 2 transport: dispatch a task into the kernel-interior agent harness with structured return, optional concurrency (n=1..4), per-call tool scope narrowing, optional system-prompt override, and pluggable model routing (e4b local Ollama, default; 26b LM Studio with degrade-to-e4b fallback). Synchronous: blocks until every slot completes, errors, or hits its per-slot timeout (default 30s, max 120s). Returns one DispatchResult per slot with content (the agent's final respond text), tool-call digests, duration, and turn count. Use this for the foveal->peripheral handoff — offload validation, rewriting, modality matching to the resident swarm instead of paying with Anthropic tokens. Backward-compat note: cog_trigger_agent_loop still wakes the singleton with no payload; this tool is the new payload-bearing path.",
+		Description: "Phase 2 transport: dispatch a task into the kernel-interior agent harness with structured return, optional concurrency (n=1..4), named tool scope, per-call tool narrowing, optional system-prompt override, and pluggable model routing (e4b local Ollama, default; 26b LM Studio with degrade-to-e4b fallback). Synchronous: blocks until every slot completes, errors, or hits its per-slot timeout (default 30s, max 120s). Returns one DispatchResult per slot with content (the agent's final respond text), tool-call digests, duration, and turn count. Use this for the foveal->peripheral handoff — offload validation, rewriting, modality matching to the resident swarm instead of paying with Anthropic tokens. Named scopes: \"consolidation\" (default, 11 substrate tools: memory/field/coherence/identity), \"audit\" (consolidation + cog_read_file + cog_grep_files for read-only filesystem inspection). The tools parameter narrows within the chosen scope; unknown scope names error immediately. Backward-compat note: cog_trigger_agent_loop still wakes the singleton with no payload; this tool is the new payload-bearing path.",
 	}, m.toolDispatchToHarness)
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
@@ -318,6 +323,19 @@ func (m *MCPServer) registerTools() {
 	// status and plays the returned audio/wav locally. Supersedes the
 	// installed binary's OpenClaw gateway which silently drops audio bytes.
 	m.registerMod3Tools()
+
+	// Audit-scope read-only filesystem tools. Also registered as first-class
+	// MCP tools so they're callable directly from Claude Code sessions.
+	// In harness dispatches these are available only when scope="audit".
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+		Name:        "cog_read_file",
+		Description: "Read an arbitrary file within the workspace root. Returns line-numbered content with optional offset/limit (default 500 lines). Rejects paths outside the workspace root. Use for source inspection and substrate-introspection tasks. Fallback: cat -n <path>",
+	}), withToolObserver(m, "cog_read_file", m.toolReadFile))
+
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+		Name:        "cog_grep_files",
+		Description: "Regex search over files within the workspace root (uses ripgrep when available, falls back to pure-Go walk). Returns matching lines with relative path and line number. Rejects search paths outside the workspace root. Fallback: rg --no-heading -n <pattern> <path>",
+	}), withToolObserver(m, "cog_grep_files", m.toolGrepFiles))
 
 	// Phase 1B: peer-awareness packet (READ side of the 4E ambient-
 	// awareness loop; Phase 1A publishes channel.<sid>.activity).
@@ -690,7 +708,8 @@ type triggerAgentLoopInput struct {
 type dispatchToHarnessInput struct {
 	AgentID      string                 `json:"agent_id,omitempty" jsonschema:"Which harness instance to dispatch into. Default \"primary\"."`
 	Task         string                 `json:"task" jsonschema:"Required. The user-role prompt the harness's Execute loop will receive."`
-	Tools        []string               `json:"tools,omitempty" jsonschema:"Optional tool allowlist (subset of registered core tools). nil/empty uses the full default set. Unknown names error in the per-slot result rather than silently dropping."`
+	Scope        string                 `json:"scope,omitempty" jsonschema:"Named tool scope for this dispatch. \"consolidation\" (default, 11 substrate tools: memory/field/coherence/identity) or \"audit\" (consolidation + cog_read_file + cog_grep_files for read-only filesystem inspection). Unknown scope names error immediately. The tools parameter, if set, narrows further within the chosen scope."`
+	Tools        []string               `json:"tools,omitempty" jsonschema:"Optional tool allowlist (subset of the chosen scope's tools). nil/empty uses the full scope set. Unknown names error in the per-slot result rather than silently dropping."`
 	Model        string                 `json:"model,omitempty" jsonschema:"Inference backend. \"e4b\" (default, local Ollama) or \"26b\" (configured remote OpenAI-compatible endpoint). Unknown values fall back to e4b."`
 	Timeout      int                    `json:"timeout_seconds,omitempty" jsonschema:"Per-slot wall-clock budget in seconds. Default 30, max 120. On exceed, that slot returns success=false error=\"timeout\"; sibling slots continue."`
 	N            int                    `json:"n,omitempty" jsonschema:"Parallel fan-out, [1,4]. Default 1. Each slot gets its own context, its own deadline, and its own result entry; failures don't abort siblings."`
@@ -756,6 +775,20 @@ type searchTracesInput struct {
 	Until     string `json:"until,omitempty" jsonschema:"Upper time bound. RFC3339 timestamp or Go duration."`
 	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum results (default 100, max 1000)."`
 	Order     string `json:"order,omitempty" jsonschema:"'desc' (default, newest first) or 'asc'."`
+}
+
+// readFileInput is the input type for cog_read_file (audit scope).
+type readFileInput struct {
+	Path   string `json:"path" jsonschema:"Absolute path within workspace root"`
+	Offset int    `json:"offset,omitempty" jsonschema:"Line offset (0-based). Default 0."`
+	Limit  int    `json:"limit,omitempty" jsonschema:"Maximum lines to return. Default 500."`
+}
+
+// grepFilesInput is the input type for cog_grep_files (audit scope).
+type grepFilesInput struct {
+	Pattern    string `json:"pattern" jsonschema:"Regular expression pattern to search for"`
+	Path       string `json:"path,omitempty" jsonschema:"Directory or file to search (defaults to workspace root)"`
+	MaxResults int    `json:"max_results,omitempty" jsonschema:"Maximum matches to return. Default 50."`
 }
 
 // ── Tool Implementations ─────────────────────────────────────────────────────
@@ -1718,6 +1751,7 @@ func (m *MCPServer) toolDispatchToHarness(ctx context.Context, req *mcp.CallTool
 	dr := DispatchRequest{
 		AgentID:        input.AgentID,
 		Task:           input.Task,
+		Scope:          input.Scope,
 		Tools:          input.Tools,
 		Model:          DispatchModel(input.Model),
 		TimeoutSeconds: input.Timeout,
@@ -2247,6 +2281,257 @@ func fallbackResult(errMsg, fallbackCmd string) (*mcp.CallToolResult, any, error
 		},
 		IsError: true,
 	}, nil, nil
+}
+
+// ── Audit-scope tool implementations ─────────────────────────────────────────
+
+// toolReadFile implements cog_read_file. Reads an arbitrary file path that
+// must be within cfg.WorkspaceRoot. Returns line-numbered content with
+// optional offset and limit for large files.
+//
+// Example output:
+//
+//	{"content":"   1\tpackage engine\n   2\t\n", "lines":2, "truncated":false}
+func (m *MCPServer) toolReadFile(ctx context.Context, req *mcp.CallToolRequest, input readFileInput) (*mcp.CallToolResult, any, error) {
+	if input.Path == "" {
+		return textResult("path is required")
+	}
+
+	workspaceRoot := ""
+	if m.cfg != nil {
+		workspaceRoot = m.cfg.WorkspaceRoot
+	}
+
+	// Workspace jail: reject paths that are not under the workspace root.
+	// We resolve both to absolute paths so symlink traversal can't escape.
+	abs, err := filepath.Abs(input.Path)
+	if err != nil {
+		return textResult(fmt.Sprintf("invalid path: %v", err))
+	}
+	if workspaceRoot != "" {
+		rootAbs, err2 := filepath.Abs(workspaceRoot)
+		if err2 != nil {
+			return textResult(fmt.Sprintf("workspace root resolution failed: %v", err2))
+		}
+		// EvalSymlinks to catch symlink escapes.
+		absReal, err3 := filepath.EvalSymlinks(abs)
+		if err3 != nil {
+			// If the file doesn't exist EvalSymlinks fails; use abs for the check.
+			absReal = abs
+		}
+		rootReal, _ := filepath.EvalSymlinks(rootAbs)
+		if rootReal == "" {
+			rootReal = rootAbs
+		}
+		if !strings.HasPrefix(absReal, rootReal+string(filepath.Separator)) && absReal != rootReal {
+			return textResult(fmt.Sprintf("path %q is outside workspace root %q", input.Path, workspaceRoot))
+		}
+	}
+
+	f, err := os.Open(abs)
+	if err != nil {
+		return textResult(fmt.Sprintf("open failed: %v", err))
+	}
+	defer f.Close()
+
+	const defaultLimit = 500
+	limit := input.Limit
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	offset := input.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	scanner := bufio.NewScanner(f)
+	var buf bytes.Buffer
+	lineNo := 0
+	linesWritten := 0
+	truncated := false
+
+	for scanner.Scan() {
+		lineNo++
+		if lineNo <= offset {
+			continue
+		}
+		if linesWritten >= limit {
+			// Peek to see if there's more.
+			if scanner.Scan() {
+				truncated = true
+			}
+			break
+		}
+		fmt.Fprintf(&buf, "%4d\t%s\n", lineNo, scanner.Text())
+		linesWritten++
+	}
+	if err := scanner.Err(); err != nil {
+		return textResult(fmt.Sprintf("read error: %v", err))
+	}
+
+	return marshalResult(map[string]any{
+		"content":   buf.String(),
+		"lines":     linesWritten,
+		"truncated": truncated,
+	})
+}
+
+// toolGrepFiles implements cog_grep_files. Runs ripgrep (rg) when available,
+// otherwise falls back to a pure-Go regexp walk. The search path must be
+// within cfg.WorkspaceRoot.
+//
+// Example match entry: {"path":"engine/foo.go","line":42,"text":"func Foo() {"}
+func (m *MCPServer) toolGrepFiles(ctx context.Context, req *mcp.CallToolRequest, input grepFilesInput) (*mcp.CallToolResult, any, error) {
+	if input.Pattern == "" {
+		return textResult("pattern is required")
+	}
+
+	workspaceRoot := ""
+	if m.cfg != nil {
+		workspaceRoot = m.cfg.WorkspaceRoot
+	}
+
+	// Resolve search path.
+	searchPath := input.Path
+	if searchPath == "" {
+		searchPath = workspaceRoot
+	}
+	if searchPath == "" {
+		searchPath = "."
+	}
+
+	absSearch, err := filepath.Abs(searchPath)
+	if err != nil {
+		return textResult(fmt.Sprintf("invalid search path: %v", err))
+	}
+
+	// Workspace jail check.
+	if workspaceRoot != "" {
+		rootAbs, err2 := filepath.Abs(workspaceRoot)
+		if err2 != nil {
+			return textResult(fmt.Sprintf("workspace root resolution failed: %v", err2))
+		}
+		rootReal, _ := filepath.EvalSymlinks(rootAbs)
+		if rootReal == "" {
+			rootReal = rootAbs
+		}
+		absReal, err3 := filepath.EvalSymlinks(absSearch)
+		if err3 != nil {
+			absReal = absSearch
+		}
+		if !strings.HasPrefix(absReal, rootReal+string(filepath.Separator)) && absReal != rootReal {
+			return textResult(fmt.Sprintf("search path %q is outside workspace root %q", searchPath, workspaceRoot))
+		}
+	}
+
+	maxResults := input.MaxResults
+	if maxResults <= 0 {
+		maxResults = 50
+	}
+
+	type matchEntry struct {
+		Path string `json:"path"`
+		Line int    `json:"line"`
+		Text string `json:"text"`
+	}
+
+	var matches []matchEntry
+	truncated := false
+
+	// Try ripgrep first (much faster on large trees).
+	if rgPath, rgErr := exec.LookPath("rg"); rgErr == nil {
+		// rg --no-heading --line-number --max-count N pattern path
+		args := []string{
+			"--no-heading",
+			"--line-number",
+			"--color=never",
+			"--max-count", strconv.Itoa(maxResults + 1), // +1 to detect truncation
+			input.Pattern,
+			absSearch,
+		}
+		cmd := exec.CommandContext(ctx, rgPath, args...)
+		out, _ := cmd.Output() // exit 1 means no match, not an error we care about
+		scanner := bufio.NewScanner(bytes.NewReader(out))
+		for scanner.Scan() {
+			line := scanner.Text()
+			// rg --no-heading format: path:linenum:text
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) < 3 {
+				continue
+			}
+			lineNum, err2 := strconv.Atoi(parts[1])
+			if err2 != nil {
+				continue
+			}
+			if len(matches) >= maxResults {
+				truncated = true
+				break
+			}
+			relPath := parts[0]
+			if workspaceRoot != "" {
+				if rel, err3 := filepath.Rel(workspaceRoot, relPath); err3 == nil {
+					relPath = rel
+				}
+			}
+			matches = append(matches, matchEntry{
+				Path: relPath,
+				Line: lineNum,
+				Text: parts[2],
+			})
+		}
+	} else {
+		// Pure-Go fallback: walk the tree and grep with regexp.
+		slog.Debug("cog_grep_files: rg not found, using Go fallback", "path", absSearch)
+		re, err2 := regexp.Compile(input.Pattern)
+		if err2 != nil {
+			return textResult(fmt.Sprintf("invalid pattern: %v", err2))
+		}
+		err = filepath.Walk(absSearch, func(p string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil || info.IsDir() {
+				return nil
+			}
+			if len(matches) >= maxResults {
+				truncated = true
+				return io.EOF // stop walk
+			}
+			f, ferr := os.Open(p)
+			if ferr != nil {
+				return nil
+			}
+			defer f.Close()
+			scanner := bufio.NewScanner(f)
+			lineNo := 0
+			for scanner.Scan() {
+				lineNo++
+				if re.MatchString(scanner.Text()) {
+					if len(matches) >= maxResults {
+						truncated = true
+						return io.EOF
+					}
+					relPath := p
+					if workspaceRoot != "" {
+						if rel, err3 := filepath.Rel(workspaceRoot, p); err3 == nil {
+							relPath = rel
+						}
+					}
+					matches = append(matches, matchEntry{
+						Path: relPath,
+						Line: lineNo,
+						Text: scanner.Text(),
+					})
+				}
+			}
+			return nil
+		})
+		if err != nil && err != io.EOF {
+			return textResult(fmt.Sprintf("walk error: %v", err))
+		}
+	}
+
+	return marshalResult(map[string]any{
+		"matches":   matches,
+		"truncated": truncated,
+	})
 }
 
 // extractSection pulls a section from markdown by heading anchor.

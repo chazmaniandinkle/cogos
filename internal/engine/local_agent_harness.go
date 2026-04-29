@@ -13,18 +13,55 @@ import (
 	"time"
 )
 
-var defaultLocalHarnessToolScope = []string{
-	"cog_resolve_uri",
-	"cog_search_memory",
-	"cog_read_cogdoc",
-	"cog_query_field",
-	"cog_check_coherence",
-	"cog_get_state",
-	"cog_get_trust",
-	"cog_get_nucleus",
-	"cog_get_index",
-	"cog_assemble_context",
-	"cog_emit_event",
+// defaultHarnessScopeName is the scope used when no scope is requested.
+// Callers that don't specify a scope get exactly the tool set they always have.
+const defaultHarnessScopeName = "consolidation"
+
+// harnessToolScopes is the named-scope catalog for harness dispatches.
+// Each scope is a named set of tool names the harness may use.
+//
+// "consolidation" — substrate-only tools: memory, observability, identity.
+//   This is the default scope (unchanged from the original tool set).
+//   The harness operates on cogdocs, the field, and coherence only.
+//
+// "audit" — consolidation tools PLUS read-only filesystem access.
+//   Use this scope when the harness needs to inspect source, configs,
+//   or workspace files without mutating anything.
+//
+// Future scopes (add entries here when the underlying mechanisms land):
+//   "maintenance" — read+write filesystem tools gated behind per-dispatch
+//                   worktree isolation (see ADR-081 §8 worktree work).
+//   "introspection" — audit tools plus kernel state-dump tools for deep
+//                     diagnostic cycles.
+var harnessToolScopes = map[string][]string{
+	"consolidation": {
+		"cog_resolve_uri",
+		"cog_search_memory",
+		"cog_read_cogdoc",
+		"cog_query_field",
+		"cog_check_coherence",
+		"cog_get_state",
+		"cog_get_trust",
+		"cog_get_nucleus",
+		"cog_get_index",
+		"cog_assemble_context",
+		"cog_emit_event",
+	},
+	"audit": {
+		"cog_resolve_uri",
+		"cog_search_memory",
+		"cog_read_cogdoc",
+		"cog_query_field",
+		"cog_check_coherence",
+		"cog_get_state",
+		"cog_get_trust",
+		"cog_get_nucleus",
+		"cog_get_index",
+		"cog_assemble_context",
+		"cog_emit_event",
+		"cog_read_file",
+		"cog_grep_files",
+	},
 }
 
 const (
@@ -143,11 +180,25 @@ type LocalHarnessController struct {
 }
 
 func NewLocalHarnessController(cfg *Config, nucleus *Nucleus, process *Process, mcpSrv *MCPServer) (*LocalHarnessController, error) {
+	return NewLocalHarnessControllerWithScope(cfg, nucleus, process, mcpSrv, "")
+}
+
+// NewLocalHarnessControllerWithScope creates a LocalHarnessController using
+// the named harness scope. An empty scopeName selects defaultHarnessScopeName.
+// Unknown scope names return an error immediately.
+func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *Process, mcpSrv *MCPServer, scopeName string) (*LocalHarnessController, error) {
 	if mcpSrv == nil {
 		return nil, fmt.Errorf("local harness requires MCP server wiring")
 	}
+	if scopeName == "" {
+		scopeName = defaultHarnessScopeName
+	}
+	toolNames, ok := harnessToolScopes[scopeName]
+	if !ok {
+		return nil, fmt.Errorf("unknown harness scope %q (known: consolidation, audit)", scopeName)
+	}
 	registry := NewKernelToolRegistry(mcpSrv)
-	dispatchTools, err := registry.Scoped(defaultLocalHarnessToolScope)
+	dispatchTools, err := registry.Scoped(toolNames)
 	if err != nil {
 		return nil, err
 	}
@@ -735,9 +786,31 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		return nil, errors.New(note)
 	}
 
-	registry := c.dispatchTools
+	// Resolve the named scope. Empty scope means the harness's own default
+	// scope (c.dispatchTools, already scoped at construction time). A
+	// non-empty scope is resolved from the catalog; unknown names are
+	// rejected here so the error is immediate and clear.
+	baseRegistry := c.dispatchTools
+	if req.Scope != "" {
+		scopeTools, ok := harnessToolScopes[req.Scope]
+		if !ok {
+			known := make([]string, 0, len(harnessToolScopes))
+			for k := range harnessToolScopes {
+				known = append(known, k)
+			}
+			return nil, &AgentControllerError{
+				Code:    "invalid_input",
+				Message: fmt.Sprintf("unknown harness scope %q (known: %v)", req.Scope, known),
+			}
+		}
+		baseRegistry, err = c.toolRegistry.Scoped(scopeTools)
+		if err != nil {
+			return nil, err
+		}
+	}
+	registry := baseRegistry
 	if len(req.Tools) > 0 {
-		registry, err = c.dispatchTools.Scoped(req.Tools)
+		registry, err = baseRegistry.Scoped(req.Tools)
 		if err != nil {
 			return nil, err
 		}

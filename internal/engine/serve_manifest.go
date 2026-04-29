@@ -49,8 +49,15 @@ type mcpToolMeta struct {
 // route registers a handler on mux and records the (method, path) tuple onto
 // s.httpRoutes. The pattern follows http.ServeMux's method-prefixed form,
 // e.g. "GET /v1/health" or "POST /v1/sessions/{id}/heartbeat".
+//
+// Every handler is automatically wrapped by withSpan so that each invocation
+// emits a KernelHandlerSpan to the bus_traces bus. The handler name is derived
+// from the pattern (method + path) rather than reflection; it is stable and
+// readable in log output.
 func (s *Server) route(mux *http.ServeMux, pattern string, handler http.HandlerFunc) {
-	mux.HandleFunc(pattern, handler)
+	method, path := splitRoutePattern(pattern)
+	handlerName := method + " " + path
+	mux.HandleFunc(pattern, withSpan(handlerName, handler, s.spanEmitter))
 	s.recordRoute(pattern)
 }
 
