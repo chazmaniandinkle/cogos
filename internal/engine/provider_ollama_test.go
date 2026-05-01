@@ -910,3 +910,164 @@ func TestOllamaCompleteToolCalls(t *testing.T) {
 		t.Fatalf("ToolCalls = %+v; want one search tool call", resp.ToolCalls)
 	}
 }
+
+// ── ollamaToolCallID ─────────────────────────────────────────────────────────
+
+// TestOllamaToolCallID covers the deterministic ID generator for tool calls
+// that Ollama returns without an ID field.
+func TestOllamaToolCallID(t *testing.T) {
+	t.Parallel()
+
+	t.Run("deterministic same input same output", func(t *testing.T) {
+		t.Parallel()
+		id1 := ollamaToolCallID("search", map[string]any{"query": "hello"}, 0)
+		id2 := ollamaToolCallID("search", map[string]any{"query": "hello"}, 0)
+		if id1 != id2 {
+			t.Errorf("same inputs produced different IDs: %q vs %q", id1, id2)
+		}
+	})
+
+	t.Run("distinct ID per distinct args", func(t *testing.T) {
+		t.Parallel()
+		id1 := ollamaToolCallID("search", map[string]any{"query": "foo"}, 0)
+		id2 := ollamaToolCallID("search", map[string]any{"query": "bar"}, 0)
+		if id1 == id2 {
+			t.Errorf("different args produced the same ID: %q", id1)
+		}
+	})
+
+	t.Run("distinct ID per distinct seq", func(t *testing.T) {
+		t.Parallel()
+		id1 := ollamaToolCallID("search", map[string]any{"query": "x"}, 0)
+		id2 := ollamaToolCallID("search", map[string]any{"query": "x"}, 1)
+		if id1 == id2 {
+			t.Errorf("different seq produced the same ID: %q", id1)
+		}
+	})
+
+	t.Run("format conforms to call_<hex> pattern", func(t *testing.T) {
+		t.Parallel()
+		id := ollamaToolCallID("get_weather", map[string]any{"city": "Denver"}, 2)
+		if !strings.HasPrefix(id, "call_") {
+			t.Errorf("ID %q does not start with call_", id)
+		}
+		suffix := strings.TrimPrefix(id, "call_")
+		if len(suffix) != 12 {
+			t.Errorf("ID suffix %q has len %d; want 12 hex chars", suffix, len(suffix))
+		}
+		for _, c := range suffix {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				t.Errorf("ID suffix %q contains non-hex char %q", suffix, c)
+			}
+		}
+	})
+}
+
+// TestOllamaCompleteToolCallMissingID asserts that when Ollama returns a tool
+// call without an ID field, the returned CompletionResponse assigns a
+// non-empty ID matching the call_<hex> format.
+func TestOllamaCompleteToolCallMissingID(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/chat" {
+			http.NotFound(w, r)
+			return
+		}
+		// Intentionally omit the ID field to simulate an older Ollama model
+		// that doesn't assign tool-call IDs.
+		_ = json.NewEncoder(w).Encode(ollamaChatResponse{
+			Model: "gemma4:e4b",
+			Message: ollamaMessage{
+				Role: "assistant",
+				ToolCalls: []ollamaToolCall{
+					{
+						// ID is deliberately omitted (zero value "").
+						Type: "function",
+						Function: ollamaToolCallDetail{
+							Name:      "list_files",
+							Arguments: json.RawMessage(`{"path":"/tmp"}`),
+						},
+					},
+				},
+			},
+			Done:            true,
+			PromptEvalCount: 8,
+			EvalCount:       4,
+		})
+	}))
+	defer srv.Close()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Endpoint: srv.URL, Model: "gemma4:e4b"})
+	resp, err := p.Complete(context.Background(), &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "list files"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if resp.StopReason != "tool_use" {
+		t.Fatalf("StopReason = %q; want tool_use", resp.StopReason)
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls len = %d; want 1", len(resp.ToolCalls))
+	}
+	tc := resp.ToolCalls[0]
+	if tc.ID == "" {
+		t.Fatal("ToolCall.ID is empty; want a generated call_<hex> ID")
+	}
+	if !strings.HasPrefix(tc.ID, "call_") {
+		t.Errorf("ToolCall.ID = %q; want prefix call_", tc.ID)
+	}
+	// Confirm the assigned ID is stable (same response shape → same ID).
+	expected := ollamaToolCallID("list_files", json.RawMessage(`{"path":"/tmp"}`), 0)
+	if tc.ID != expected {
+		t.Errorf("ToolCall.ID = %q; want deterministic %q", tc.ID, expected)
+	}
+}
+
+// TestOllamaCompleteToolCallExistingIDPreserved asserts that when Ollama does
+// return an ID on a tool call, we keep it rather than overwriting it.
+func TestOllamaCompleteToolCallExistingIDPreserved(t *testing.T) {
+	t.Parallel()
+
+	const wantID = "ollama-assigned-id-xyz"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/chat" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ollamaChatResponse{
+			Model: "qwen2.5:9b",
+			Message: ollamaMessage{
+				Role: "assistant",
+				ToolCalls: []ollamaToolCall{
+					{
+						ID:   wantID,
+						Type: "function",
+						Function: ollamaToolCallDetail{
+							Name:      "echo",
+							Arguments: json.RawMessage(`{}`),
+						},
+					},
+				},
+			},
+			Done: true,
+		})
+	}))
+	defer srv.Close()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Endpoint: srv.URL, Model: "qwen2.5:9b"})
+	resp, err := p.Complete(context.Background(), &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "echo"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls len = %d; want 1", len(resp.ToolCalls))
+	}
+	if resp.ToolCalls[0].ID != wantID {
+		t.Errorf("ToolCall.ID = %q; want %q (Ollama-assigned ID should be preserved)", resp.ToolCalls[0].ID, wantID)
+	}
+}
