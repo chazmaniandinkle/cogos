@@ -17,8 +17,31 @@ type NodeManifest struct {
 	Services   map[string]ServiceDef `yaml:"services" json:"services"`
 }
 
+// ServiceKind classifies a service by ownership and observability.
+//
+//   - "managed"  (default): kernel orchestrates the lifecycle via a supervisor.
+//   - "observed": kernel probes health but does not control start/stop/restart.
+//   - "external": kernel knows the service exists for dependency-graph purposes
+//     only; it does not probe and does not control.
+type ServiceKind string
+
+const (
+	ServiceKindManaged  ServiceKind = "managed"
+	ServiceKindObserved ServiceKind = "observed"
+	ServiceKindExternal ServiceKind = "external"
+)
+
+// EffectiveKind returns the resolved kind, defaulting to "managed" when unset.
+func (k ServiceKind) EffectiveKind() ServiceKind {
+	if k == "" {
+		return ServiceKindManaged
+	}
+	return k
+}
+
 // ServiceDef describes a single managed service.
 type ServiceDef struct {
+	Kind      ServiceKind     `yaml:"kind,omitempty" json:"kind,omitempty"`
 	Port      int             `yaml:"port" json:"port"`
 	Binary    string          `yaml:"binary,omitempty" json:"binary,omitempty"`
 	Workdir   string          `yaml:"workdir,omitempty" json:"workdir,omitempty"`
