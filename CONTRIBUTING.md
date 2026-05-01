@@ -67,6 +67,20 @@ The bar for "ready for review":
 - Test evidence is concrete: new tests are named, command output is pasted, CI status is linked. "Tests pass" by itself doesn't count.
 - Out-of-scope is stated. Reviewers should never have to guess whether you intentionally left something for a follow-up or just forgot.
 
+## Pull request titles and bodies
+
+PR titles and bodies are this project's changelog. The auto-generated GitHub release notes pull every PR title since the previous tag verbatim, so PR title quality is a load-bearing concern for the project's history.
+
+Conventions:
+
+- **Title is a complete imperative-mood sentence with a conventional-commit prefix.** Example: `fix(chat): execute injected cog_* MCP tools server-side` -- not `Tool fix` or `various improvements`. Anyone reading the release notes should understand what the PR did from the title alone.
+- **Use a conventional-commit prefix:** `feat:`, `fix:`, `refactor:`, `chore:`, `docs:`, `test:`, `perf:`. Optionally scope it: `fix(provider/ollama):`. Prefixes group release notes naturally and scan well in `git log`.
+- **Body explains the why, not the what.** The diff shows the what; the body should answer "why is this the right change here?" and "what is this NOT trying to do?" -- out-of-scope is as informative as in-scope.
+- **Link the issue** with `Closes #N` so the PR-issue chain is queryable. The issue's acceptance criteria become the merge bar.
+- **Out-of-scope deserves a section.** If you noticed something during the work that you intentionally didn't fix, name it -- otherwise reviewers can't tell whether you missed it or chose to defer.
+
+See [CHANGELOG.md](CHANGELOG.md) for the rationale.
+
 ## RFCs and ADRs
 
 For substantial design changes -- new subsystems, protocol changes, breaking behavior, or anything that touches the kernel's persistence or routing -- open an RFC before opening a PR:
