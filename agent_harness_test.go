@@ -152,44 +152,115 @@ func TestAgentHarness_Assess_MessageBuilding(t *testing.T) {
 	}
 }
 
-// TestAgentHarness_Assess_KeepAlivePinsModel asserts the wire body sent to
-// /api/chat carries keep_alive=-1 by default — i.e., between cycles Ollama is
-// told to keep the model resident in VRAM. Decodes the raw body so a refactor
-// that drops the field (or changes its JSON tag) fails this test.
-func TestAgentHarness_Assess_KeepAlivePinsModel(t *testing.T) {
-	var rawBody []byte
+// TestAgentHarness_KeepAlivePinsModel asserts the wire body sent to /api/chat
+// carries keep_alive=-1 on every dispatch path — Assess, Execute, and
+// ExecuteScoped. Decodes the raw body so a refactor that drops the field (or
+// changes its JSON tag) on any one path fails the corresponding sub-test.
+//
+// Each row uses a dedicated httptest.Server that captures the first request
+// body and responds with the minimum payload needed to make the method return
+// cleanly. JSON numbers decode as float64 in map[string]any, so the assertion
+// checks float64(-1).
+func TestAgentHarness_KeepAlivePinsModel(t *testing.T) {
+	t.Parallel()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var err error
-		rawBody, err = io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read body: %v", err)
-		}
-		resp := agentChatResponse{Model: "test-model", Done: true, DoneReason: "stop"}
-		resp.Message.Role = "assistant"
-		resp.Message.Content = `{"action":"sleep","reason":"x","urgency":0,"target":""}`
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
-
-	h := NewAgentHarness(AgentHarnessConfig{OllamaURL: server.URL, Model: "test-model"})
-	if _, err := h.Assess(context.Background(), "sys", "obs"); err != nil {
-		t.Fatalf("assess: %v", err)
+	tests := []struct {
+		name    string
+		// respond returns the wire response for a given request number (0-indexed).
+		respond func(n int) agentChatResponse
+		// invoke calls the method under test on h against the server URL.
+		invoke  func(h *AgentHarness, url string) error
+	}{
+		{
+			name: "Assess",
+			respond: func(_ int) agentChatResponse {
+				resp := agentChatResponse{Model: "test-model", Done: true, DoneReason: "stop"}
+				resp.Message.Role = "assistant"
+				resp.Message.Content = `{"action":"sleep","reason":"x","urgency":0,"target":""}`
+				return resp
+			},
+			invoke: func(h *AgentHarness, url string) error {
+				h.ollamaURL = url
+				_, err := h.Assess(context.Background(), "sys", "obs")
+				return err
+			},
+		},
+		{
+			name: "Execute",
+			respond: func(_ int) agentChatResponse {
+				// Return content with no tool_calls so the loop exits after turn 0.
+				resp := agentChatResponse{Model: "test-model", Done: true, DoneReason: "stop"}
+				resp.Message.Role = "assistant"
+				resp.Message.Content = "done"
+				return resp
+			},
+			invoke: func(h *AgentHarness, url string) error {
+				h.ollamaURL = url
+				_, err := h.Execute(context.Background(), "sys", "task")
+				return err
+			},
+		},
+		{
+			name: "ExecuteScoped",
+			respond: func(_ int) agentChatResponse {
+				// Return content with no tool_calls so the loop exits after turn 0.
+				resp := agentChatResponse{Model: "test-model", Done: true, DoneReason: "stop"}
+				resp.Message.Role = "assistant"
+				resp.Message.Content = "scoped-done"
+				return resp
+			},
+			invoke: func(h *AgentHarness, url string) error {
+				h.ollamaURL = url
+				_, err := h.ExecuteScoped(context.Background(), "task", ExecuteScopedOptions{})
+				return err
+			},
+		},
 	}
 
-	var decoded map[string]any
-	if err := json.Unmarshal(rawBody, &decoded); err != nil {
-		t.Fatalf("decode body: %v (raw=%s)", err, rawBody)
-	}
-	ka, ok := decoded["keep_alive"]
-	if !ok {
-		t.Fatalf("keep_alive missing from request body: %s", rawBody)
-	}
-	// JSON numbers decode as float64 in a map[string]any.
-	f, ok := ka.(float64)
-	if !ok || f != -1 {
-		t.Errorf("keep_alive = %v (%T); want -1 (float64)", ka, ka)
+	for _, tc := range tests {
+		tc := tc // capture loop variable
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				rawBody []byte
+				reqNum  int
+			)
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read body: %v", err)
+				}
+				if reqNum == 0 {
+					rawBody = body
+				}
+				reqNum++
+				resp := tc.respond(reqNum - 1)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(resp)
+			}))
+			defer server.Close()
+
+			h := NewAgentHarness(AgentHarnessConfig{OllamaURL: server.URL, Model: "test-model"})
+			if err := tc.invoke(h, server.URL); err != nil {
+				t.Fatalf("invoke: %v", err)
+			}
+
+			var decoded map[string]any
+			if err := json.Unmarshal(rawBody, &decoded); err != nil {
+				t.Fatalf("decode body: %v (raw=%s)", err, rawBody)
+			}
+			ka, ok := decoded["keep_alive"]
+			if !ok {
+				t.Fatalf("keep_alive missing from request body: %s", rawBody)
+			}
+			// JSON numbers decode as float64 in a map[string]any.
+			f, fok := ka.(float64)
+			if !fok || f != -1 {
+				t.Errorf("keep_alive = %v (%T); want -1 (float64)", ka, ka)
+			}
+		})
 	}
 }
 

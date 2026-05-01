@@ -222,6 +222,19 @@ type ollamaChatResponse struct {
 
 // buildOllamaRequest converts a CompletionRequest to Ollama's /api/chat format.
 // contextWindow sets num_ctx on the request; 0 means omit (use Ollama default of 4096).
+//
+// VRAM note: every request sets keep_alive=-1 so the model stays resident
+// between cycles. The model is NOT automatically unloaded when the daemon
+// exits — there is no shutdown hook because that would require bridging the
+// kernel shutdown path to this package's model name at teardown time.
+//
+// Manual recovery (VRAM-constrained environments):
+//
+//	curl -s http://localhost:11434/api/chat -d '{"model":"<model>","keep_alive":0}' > /dev/null
+//
+// Replace <model> with the model name configured in providers.yaml (default:
+// gemma4:e4b). This tells Ollama to unload the model immediately. Run it after
+// stopping the daemon if you need VRAM back before starting another workload.
 func buildOllamaRequest(model string, req *CompletionRequest, stream bool, contextWindow int) *ollamaChatRequest {
 	msgs := make([]ollamaMessage, 0, len(req.Messages)+1)
 	if req.SystemPrompt != "" {
