@@ -19,6 +19,11 @@ import (
 const (
 	DefaultMaxFovealDocs = 10
 	DefaultSalienceFloor = 0.3
+	// DefaultBudget is the fallback token budget for context assembly when no
+	// per-request override (X-Cogos-Context-Budget header or MCP budget field)
+	// or kernel.yaml default_budget is provided. Matches the default provider
+	// context_window in providers.yaml.
+	DefaultBudget = 32768
 )
 
 // hasUsableCogConfig reports whether dir looks like a real workspace root for
@@ -72,7 +77,21 @@ type Config struct {
 	// files. 0 means use DefaultSalienceFloor.
 	SalienceFloor float64
 
-	// gatingMu guards the two knobs above for hot-update via the
+	// DefaultBudget is the token budget used when the caller does not supply
+	// a per-request override (X-Cogos-Context-Budget header or MCP budget
+	// field). 0 means use the package-level DefaultBudget constant (32768).
+	// Set via default_budget in kernel.yaml.
+	DefaultBudget int
+
+	// ExcludeGlobs is a list of path substrings. Any CogDoc whose slash-normalised
+	// path contains one of these substrings is excluded from the foveated context
+	// window for chat requests. Useful to keep large or sensitive path trees
+	// (e.g. /inbox/, /archive/, /vendor/) out of ambient context without
+	// removing the files from the corpus entirely.
+	// Configured via exclude_globs in kernel.yaml.
+	ExcludeGlobs []string
+
+	// gatingMu guards the gating knobs above for hot-update via the
 	// /v1/settings/context endpoints.
 	gatingMu sync.RWMutex
 
@@ -131,6 +150,8 @@ type kernelConfigSection struct {
 	OutputReserve         int               `yaml:"output_reserve"`
 	MaxFovealDocs         int               `yaml:"max_foveal_docs"`
 	SalienceFloor         *float64          `yaml:"salience_floor"`
+	DefaultBudget         int               `yaml:"default_budget"`
+	ExcludeGlobs          []string          `yaml:"exclude_globs"`
 	TRMWeightsPath        string            `yaml:"trm_weights_path"`
 	TRMEmbeddingsPath     string            `yaml:"trm_embeddings_path"`
 	TRMChunksPath         string            `yaml:"trm_chunks_path"`
@@ -235,6 +256,12 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	if s.SalienceFloor != nil {
 		cfg.SalienceFloor = *s.SalienceFloor
 	}
+	if s.DefaultBudget != 0 {
+		cfg.DefaultBudget = s.DefaultBudget
+	}
+	if len(s.ExcludeGlobs) > 0 {
+		cfg.ExcludeGlobs = s.ExcludeGlobs
+	}
 	if s.TRMWeightsPath != "" {
 		cfg.TRMWeightsPath = s.TRMWeightsPath
 	}
@@ -288,6 +315,31 @@ func (c *Config) ContextGating() (maxDocs int, salienceFloor float64) {
 		salienceFloor = DefaultSalienceFloor
 	}
 	return maxDocs, salienceFloor
+}
+
+// EffectiveBudget returns the token budget to use for context assembly when no
+// per-request override is provided. Falls back to DefaultBudget (32768) when
+// the config field is zero (i.e. not set in kernel.yaml).
+func (c *Config) EffectiveBudget() int {
+	c.gatingMu.RLock()
+	defer c.gatingMu.RUnlock()
+	if c.DefaultBudget > 0 {
+		return c.DefaultBudget
+	}
+	return DefaultBudget
+}
+
+// ContextExcludeGlobs returns a snapshot of the configured exclude-glob list.
+// The returned slice is safe for the caller to iterate without holding a lock.
+func (c *Config) ContextExcludeGlobs() []string {
+	c.gatingMu.RLock()
+	defer c.gatingMu.RUnlock()
+	if len(c.ExcludeGlobs) == 0 {
+		return nil
+	}
+	out := make([]string, len(c.ExcludeGlobs))
+	copy(out, c.ExcludeGlobs)
+	return out
 }
 
 // SetContextGating hot-updates the foveated-assembler gating knobs. Pass a

@@ -635,6 +635,149 @@ func TestEvictForBudgetSingletonsPreferHighCombinedScore(t *testing.T) {
 	}
 }
 
+// ── default_budget and exclude_globs (issue #77) ────────────────────────────
+
+// TestEffectiveBudgetFallback verifies that EffectiveBudget() returns the
+// package-level DefaultBudget constant when the config field is zero (not
+// explicitly set via kernel.yaml).
+func TestEffectiveBudgetFallback(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{}
+	if got := cfg.EffectiveBudget(); got != DefaultBudget {
+		t.Errorf("EffectiveBudget with zero config = %d; want DefaultBudget=%d", got, DefaultBudget)
+	}
+}
+
+// TestEffectiveBudgetFromConfig verifies that a non-zero DefaultBudget in
+// the Config is respected by EffectiveBudget() and flows through to the
+// assembled context package's Budget field.
+func TestEffectiveBudgetFromConfig(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	cfg.DefaultBudget = 8192
+	p := NewProcess(cfg, makeNucleus("T", "r"))
+
+	pkg, err := p.AssembleContext("hello", nil, 0)
+	if err != nil {
+		t.Fatalf("AssembleContext: %v", err)
+	}
+	// Budget in the returned package must reflect the configured ceiling.
+	if pkg.Budget != 8192 {
+		t.Errorf("pkg.Budget = %d; want 8192 (from cfg.DefaultBudget)", pkg.Budget)
+	}
+}
+
+// TestExplicitBudgetOverridesDefault verifies that a positive budget passed
+// directly to AssembleContext takes precedence over cfg.DefaultBudget.
+func TestExplicitBudgetOverridesDefault(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	cfg.DefaultBudget = 8192
+	p := NewProcess(cfg, makeNucleus("T", "r"))
+
+	const explicitBudget = 4096
+	pkg, err := p.AssembleContext("hello", nil, explicitBudget)
+	if err != nil {
+		t.Fatalf("AssembleContext: %v", err)
+	}
+	if pkg.Budget != explicitBudget {
+		t.Errorf("pkg.Budget = %d; want %d (explicit caller override)", pkg.Budget, explicitBudget)
+	}
+}
+
+// TestExcludeGlobsFiltersMatchingPaths verifies that paths matching any entry
+// in cfg.ExcludeGlobs are excluded from the foveated candidate set even when
+// they score above the salience floor.
+func TestExcludeGlobsFiltersMatchingPaths(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	cfg.SalienceFloor = 0 // floor off so exclusion is the only filter
+	cfg.ExcludeGlobs = []string{"/sensitive/"}
+	p := NewProcess(cfg, makeNucleus("T", "r"))
+
+	memDir := filepath.Join(root, ".cog", "mem")
+	sensitiveDir := filepath.Join(memDir, "sensitive")
+	if err := os.MkdirAll(sensitiveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	semanticDir := filepath.Join(memDir, "semantic")
+
+	// Sensitive doc: should be excluded by the glob.
+	writeTestFile(t, filepath.Join(sensitiveDir, "secret.cog.md"),
+		"---\ntitle: Secret Sensitive\nstatus: active\n---\n\nsensitive secret content\n")
+	// Normal doc: should pass through.
+	writeTestFile(t, filepath.Join(semanticDir, "normal.cog.md"),
+		"---\ntitle: Normal Doc\nstatus: active\n---\n\nnormal content\n")
+
+	idx, err := BuildIndex(root)
+	if err != nil {
+		t.Fatalf("BuildIndex: %v", err)
+	}
+	p.indexMu.Lock()
+	p.index = idx
+	p.indexMu.Unlock()
+
+	pkg, err := p.AssembleContext("sensitive secret normal", nil, 0)
+	if err != nil {
+		t.Fatalf("AssembleContext: %v", err)
+	}
+
+	for _, doc := range pkg.FovealDocs {
+		if strings.Contains(filepath.ToSlash(doc.Path), "/sensitive/") {
+			t.Errorf("excluded glob path leaked into foveal context: %s", doc.Path)
+		}
+	}
+}
+
+// TestPathMatchesExcludeGlobs exercises the helper directly with edge cases.
+func TestPathMatchesExcludeGlobs(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		path   string
+		globs  []string
+		expect bool
+	}{
+		{"/workspace/.cog/mem/inbox/foo.cog.md", []string{"/inbox/"}, true},
+		{"/workspace/.cog/mem/semantic/foo.cog.md", []string{"/inbox/"}, false},
+		{"/workspace/.cog/mem/semantic/foo.cog.md", nil, false},
+		{"/workspace/.cog/mem/sensitive/bar.cog.md", []string{"/inbox/", "/sensitive/"}, true},
+		{"/workspace/.cog/mem/semantic/foo.cog.md", []string{""}, false}, // empty entry ignored
+	}
+	for _, tc := range cases {
+		got := pathMatchesExcludeGlobs(tc.path, tc.globs)
+		if got != tc.expect {
+			t.Errorf("pathMatchesExcludeGlobs(%q, %v) = %v; want %v", tc.path, tc.globs, got, tc.expect)
+		}
+	}
+}
+
+// TestContextExcludeGlobsSnapshot verifies that ContextExcludeGlobs returns a
+// copy of the configured slice (not the live pointer) and handles nil safely.
+func TestContextExcludeGlobsSnapshot(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{}
+	if globs := cfg.ContextExcludeGlobs(); globs != nil {
+		t.Errorf("empty config: ContextExcludeGlobs = %v; want nil", globs)
+	}
+
+	cfg.ExcludeGlobs = []string{"/inbox/", "/sensitive/"}
+	got := cfg.ContextExcludeGlobs()
+	if len(got) != 2 || got[0] != "/inbox/" || got[1] != "/sensitive/" {
+		t.Errorf("ContextExcludeGlobs = %v; want [/inbox/ /sensitive/]", got)
+	}
+
+	// Mutation of the returned slice must not affect the config.
+	got[0] = "/mutated/"
+	if cfg.ExcludeGlobs[0] != "/inbox/" {
+		t.Error("ContextExcludeGlobs returned live slice instead of copy")
+	}
+}
+
+// ── TestDebugZoneItemExposesCombinedScore ────────────────────────────────────
+
 // TestDebugZoneItemExposesCombinedScore verifies the debug-snapshot pipeline
 // surfaces CombinedScore on conversation zone items so the /v1/debug/last
 // endpoint can render it instead of defaulting to 0.00.
