@@ -6,7 +6,7 @@
 //
 // Background: when a chat request lands on the kernel-agent route, the
 // inference provider receives whatever ToolDefinitions the caller chose to
-// pass through. The dashboard at internal/engine/web/dashboard.html builds
+// pass through. The dashboard at ui/dashboard/dashboard.html builds
 // `{model, messages, stream}` with no `tools` array, so the model is told
 // about zero tools and falls back to narrating tool calls in prose
 // ("I will use cog_read_cogdoc...") that never fire. The user perceives
