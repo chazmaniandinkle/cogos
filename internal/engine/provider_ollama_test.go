@@ -5,6 +5,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -94,6 +95,22 @@ func TestBuildOllamaRequestNumCtx(t *testing.T) {
 	r2 := buildOllamaRequest("m", req, false, 0)
 	if _, ok := r2.Options["num_ctx"]; ok {
 		t.Errorf("num_ctx should be absent when contextWindow=0, got %v", r2.Options["num_ctx"])
+	}
+}
+
+func TestBuildOllamaRequestKeepAlivePinsModel(t *testing.T) {
+	t.Parallel()
+	req := &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	}
+	r := buildOllamaRequest("m", req, false, 0)
+	// Compare via JSON shape so the test is robust to any/int interface boxing.
+	body, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(body, []byte(`"keep_alive":-1`)) {
+		t.Errorf("request body should pin model with keep_alive=-1; got %s", body)
 	}
 }
 
