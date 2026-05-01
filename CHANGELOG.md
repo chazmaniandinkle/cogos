@@ -1,8 +1,26 @@
 # Changelog
 
+> **Going forward (v0.4.0 onward):** this project does not maintain hand-curated changelog entries. PR titles and bodies are the canonical record; auto-generated GitHub release notes are the per-release projection.
+>
+> - **Per-release summaries:** [Releases page](https://github.com/cogos-dev/cogos/releases)
+> - **Detailed PR list per release:** auto-generated from PR titles since the previous tag (via `gh release create --generate-notes`)
+> - **Per-PR rationale:** the linked PR's description and discussion
+>
+> See [CONTRIBUTING.md](CONTRIBUTING.md) ("Pull request titles and bodies") for the conventions that make those notes readable.
+
+## Versioning
+
+Pre-1.0. Per semver convention, breaking changes can land at any minor-version bump (`0.x` → `0.(x+1)`). When the project commits to external compatibility, a `v1.0.0` will be tagged. Until then, expect changes at minor boundaries.
+
+---
+
+# Historical entries
+
+The entries below predate the changelog policy above and are preserved as the historical record. For releases at v0.4.0 or later, see the [Releases page](https://github.com/cogos-dev/cogos/releases).
+
 ## [Unreleased]
 
-_(no entries yet)_
+_(no entries — see Releases page going forward)_
 
 ## [0.3.0] - 2026-04-22 — Track 5 consolidation + Agent F gap closure
 

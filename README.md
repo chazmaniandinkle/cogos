@@ -428,6 +428,12 @@ CogOS is one piece of a larger system. Each component is its own repo with indep
 
 ---
 
+## Releases & Changelog
+
+Per-release summaries: the [Releases page](https://github.com/cogos-dev/cogos/releases) (auto-generated from PR titles since the previous tag). See [CHANGELOG.md](CHANGELOG.md) for the policy and the historical entries (pre-v0.4.0).
+
+---
+
 ## Design documents
 
 - [System Specification](docs/SYSTEM-SPEC.md): Multi-level spec from ontology to deployment
