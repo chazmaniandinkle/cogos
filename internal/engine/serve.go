@@ -153,6 +153,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.route(mux, "GET /v1/conversation", s.handleConversation)
 	s.route(mux, "GET /v1/manifest", s.handleManifest)
 	s.registerAgentRoutes(mux)
+	s.registerSkillRoutes(mux)
 
 	// Constellation / attention endpoints (Phase 3)
 	s.registerAttentionRoutes(mux)
