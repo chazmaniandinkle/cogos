@@ -403,6 +403,7 @@ func RunToolLoopWithTranscript(
 	var transcript []ToolCallRecord
 
 	for i := 0; i < maxToolLoopIterations; i++ {
+		resp.ToolCalls = normalizeToolCallIDs(provider.Name(), i+1, resp.ToolCalls)
 		if len(resp.ToolCalls) == 0 {
 			return resp, clientToolCalls, transcript, nil
 		}
@@ -550,6 +551,58 @@ func RunToolLoopWithTranscript(
 
 	slog.Warn("tool_loop: max iterations reached", "max", maxToolLoopIterations)
 	return resp, clientToolCalls, transcript, nil
+}
+
+// normalizeToolCallIDs assigns stable IDs to any tool calls that arrived
+// without one. Any provider may omit IDs; this ensures downstream code never
+// has to handle blank ToolCall.ID values.
+func normalizeToolCallIDs(providerName string, iteration int, calls []ToolCall) []ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	prefix := sanitizeToolCallIDPrefix(providerName)
+	for i := range calls {
+		if strings.TrimSpace(calls[i].ID) != "" {
+			continue
+		}
+		calls[i].ID = fmt.Sprintf("%s-call-%d-%d", prefix, iteration, i)
+	}
+	return calls
+}
+
+// sanitizeToolCallIDPrefix converts an arbitrary provider name into a
+// lowercase alphanumeric-plus-dash string suitable for use in a generated ID.
+func sanitizeToolCallIDPrefix(providerName string) string {
+	providerName = strings.TrimSpace(providerName)
+	if providerName == "" {
+		return "provider"
+	}
+	var b strings.Builder
+	prevDash := false
+	for _, r := range providerName {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+			prevDash = false
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+			prevDash = false
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if prevDash {
+				continue
+			}
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	sanitized := strings.Trim(b.String(), "-")
+	if sanitized == "" {
+		return "provider"
+	}
+	return sanitized
 }
 
 // ── Schema helpers ───────────────────────────────────────────────────────────
