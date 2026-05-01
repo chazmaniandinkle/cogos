@@ -89,29 +89,13 @@ func (p *OllamaProvider) Model() string { return p.model }
 
 // Available checks if Ollama is running and the configured model is loaded.
 func (p *OllamaProvider) Available(ctx context.Context) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"/api/tags", nil)
+	models, err := p.listModels(ctx)
 	if err != nil {
-		return false
-	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	var tags struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
 		return false
 	}
 	// Accept exact name or prefix (e.g. "qwen2.5:9b" matches "qwen2.5:9b-instruct").
-	for _, m := range tags.Models {
-		if m.Name == p.model || strings.HasPrefix(m.Name, p.model) {
+	for _, m := range models {
+		if m == p.model || strings.HasPrefix(m, p.model) {
 			return true
 		}
 	}
@@ -162,6 +146,41 @@ func (p *OllamaProvider) Ping(ctx context.Context) (time.Duration, error) {
 	}
 	resp.Body.Close()
 	return time.Since(start), nil
+}
+
+// listModels queries GET /api/tags and returns the names of all locally
+// available Ollama models. Empty names are filtered out. This is the shared
+// implementation used by Available() and any future listing callers, extracted
+// to avoid duplicating the HTTP + JSON decode logic.
+func (p *OllamaProvider) listModels(ctx context.Context) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"/api/tags", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ollama: /api/tags status %d", resp.StatusCode)
+	}
+	var tags struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(tags.Models))
+	for _, m := range tags.Models {
+		if m.Name == "" {
+			continue
+		}
+		names = append(names, m.Name)
+	}
+	return names, nil
 }
 
 // ── Ollama wire types ─────────────────────────────────────────────────────────

@@ -170,6 +170,43 @@ func TestOllamaAvailableServerDown(t *testing.T) {
 	}
 }
 
+// ── listModels ────────────────────────────────────────────────────────────────
+
+// TestOllamaListModels verifies that listModels() correctly returns model names
+// from /api/tags and filters out any entry with an empty name.
+func TestOllamaListModels(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"models": []map[string]any{
+				{"name": "llama3:8b"},
+				{"name": ""},          // should be filtered out
+				{"name": "gemma4:e4b"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Endpoint: srv.URL, Model: "llama3:8b"})
+	names, err := p.listModels(context.Background())
+	if err != nil {
+		t.Fatalf("listModels: %v", err)
+	}
+	if len(names) != 2 {
+		t.Fatalf("len(names) = %d; want 2 (empty entry filtered)", len(names))
+	}
+	if names[0] != "llama3:8b" {
+		t.Errorf("names[0] = %q; want llama3:8b", names[0])
+	}
+	if names[1] != "gemma4:e4b" {
+		t.Errorf("names[1] = %q; want gemma4:e4b", names[1])
+	}
+}
+
 // ── Ping ──────────────────────────────────────────────────────────────────────
 
 func TestOllamaPing(t *testing.T) {
