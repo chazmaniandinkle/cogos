@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -148,6 +149,47 @@ func TestAgentHarness_Assess_MessageBuilding(t *testing.T) {
 	}
 	if receivedReq.Format != "json" {
 		t.Error("expected format 'json' for assess")
+	}
+}
+
+// TestAgentHarness_Assess_KeepAlivePinsModel asserts the wire body sent to
+// /api/chat carries keep_alive=-1 by default — i.e., between cycles Ollama is
+// told to keep the model resident in VRAM. Decodes the raw body so a refactor
+// that drops the field (or changes its JSON tag) fails this test.
+func TestAgentHarness_Assess_KeepAlivePinsModel(t *testing.T) {
+	var rawBody []byte
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		rawBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		resp := agentChatResponse{Model: "test-model", Done: true, DoneReason: "stop"}
+		resp.Message.Role = "assistant"
+		resp.Message.Content = `{"action":"sleep","reason":"x","urgency":0,"target":""}`
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	h := NewAgentHarness(AgentHarnessConfig{OllamaURL: server.URL, Model: "test-model"})
+	if _, err := h.Assess(context.Background(), "sys", "obs"); err != nil {
+		t.Fatalf("assess: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(rawBody, &decoded); err != nil {
+		t.Fatalf("decode body: %v (raw=%s)", err, rawBody)
+	}
+	ka, ok := decoded["keep_alive"]
+	if !ok {
+		t.Fatalf("keep_alive missing from request body: %s", rawBody)
+	}
+	// JSON numbers decode as float64 in a map[string]any.
+	f, ok := ka.(float64)
+	if !ok || f != -1 {
+		t.Errorf("keep_alive = %v (%T); want -1 (float64)", ka, ka)
 	}
 }
 
