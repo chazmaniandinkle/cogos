@@ -229,10 +229,11 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 		}
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
 			for _, tc := range m.ToolCalls {
-				rawArgs := json.RawMessage(tc.Arguments)
-				if len(rawArgs) == 0 || !json.Valid(rawArgs) {
-					rawArgs = json.RawMessage("{}")
-				}
+				// Normalize arguments to a stable JSON object before sending
+				// back to Ollama. Some models return arguments as a JSON string
+				// rather than an object; decodeOllamaToolArguments unwraps both.
+				normalizedArgs := decodeOllamaToolArguments(tc.Arguments)
+				rawArgs := json.RawMessage(encodeOllamaToolArguments(normalizedArgs))
 				msg.ToolCalls = append(msg.ToolCalls, ollamaToolCall{
 					ID:   tc.ID,
 					Type: "function",
@@ -283,6 +284,59 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 		Think:    false, // prevent silent token burn in qwen3 thinking mode
 		Options:  opts,
 	}
+}
+
+// decodeOllamaToolArguments normalizes the raw argument value that Ollama
+// returns for a tool call. Ollama's /api/chat returns tool-call arguments as
+// either a JSON object or a JSON string whose content is itself a JSON object
+// — the shape varies by model and version. This function handles both:
+//
+//   - Object: `{"query":"x"}` → map[string]any{"query":"x"}
+//   - String: `"{\"query\":\"x\"}"` → map[string]any{"query":"x"}
+//   - Empty / blank → empty map
+//   - Malformed → the original string value (caller must tolerate this)
+func decodeOllamaToolArguments(raw string) interface{} {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return map[string]interface{}{}
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var value interface{}
+	if err := dec.Decode(&value); err != nil {
+		// Not valid JSON at all — return as-is; caller sees the raw string.
+		return raw
+	}
+	// If Ollama encoded the arguments as a JSON string, unwrap one layer.
+	if s, ok := value.(string); ok {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return map[string]interface{}{}
+		}
+		dec2 := json.NewDecoder(strings.NewReader(s))
+		dec2.UseNumber()
+		var inner interface{}
+		if err := dec2.Decode(&inner); err != nil {
+			// The string content isn't JSON; return the unwrapped string.
+			return s
+		}
+		return inner
+	}
+	return value
+}
+
+// encodeOllamaToolArguments serializes a normalized argument value (as
+// returned by decodeOllamaToolArguments) back to a JSON string suitable for
+// downstream callers. Returns "{}" on nil or marshal failure.
+func encodeOllamaToolArguments(v interface{}) string {
+	if v == nil {
+		return "{}"
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
 }
 
 // effectiveModel returns the model to send to Ollama: request override if set,
@@ -343,10 +397,10 @@ func (p *OllamaProvider) Complete(ctx context.Context, req *CompletionRequest) (
 	if len(or.Message.ToolCalls) > 0 {
 		out.StopReason = "tool_use"
 		for _, tc := range or.Message.ToolCalls {
-			args := string(tc.Function.Arguments)
-			if args == "" || args == "null" {
-				args = "{}"
-			}
+			// Ollama may return arguments as a JSON object or a JSON string
+			// wrapping a JSON object depending on the model. Normalize both.
+			decoded := decodeOllamaToolArguments(string(tc.Function.Arguments))
+			args := encodeOllamaToolArguments(decoded)
 			out.ToolCalls = append(out.ToolCalls, ToolCall{
 				ID:        tc.ID,
 				Name:      tc.Function.Name,
