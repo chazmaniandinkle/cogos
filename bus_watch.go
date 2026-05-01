@@ -42,9 +42,12 @@ func (w *BusWatcher) Run(ctx context.Context) error {
 
 // runLive connects to the kernel SSE endpoint and streams events.
 func (w *BusWatcher) runLive(ctx context.Context) error {
-	url := fmt.Sprintf("http://%s/v1/events/stream?bus_id=%s", w.kernelAddr, w.busID)
+	rawURL := fmt.Sprintf("http://%s/v1/bus/%s/stream", w.kernelAddr, w.busID)
+	if w.filter.NoReplay {
+		rawURL += "?no_replay=1"
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}

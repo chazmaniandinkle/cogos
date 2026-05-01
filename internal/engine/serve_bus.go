@@ -14,6 +14,7 @@
 //	GET    /v1/bus/{bus_id}/events            — per-bus events, filtered
 //	GET    /v1/bus/{bus_id}/events/{seq}      — single event by seq
 //	GET    /v1/bus/{bus_id}/stats             — bus statistics
+//	GET    /v1/bus/{bus_id}/stream            — live SSE stream for a bus
 //	GET    /v1/bus/consumers                  — list consumer cursors (ADR-061)
 //	DELETE /v1/bus/consumers/{consumer_id}    — remove a consumer cursor
 package engine
@@ -25,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cogos-dev/cogos/pkg/cogfield"
 )
@@ -320,8 +322,10 @@ func (s *Server) handleBusRoute(w http.ResponseWriter, r *http.Request) {
 		}
 	case "stats":
 		s.handleBusStats(w, r, busID)
+	case "stream":
+		s.handleBusStream(w, r, busID)
 	default:
-		http.Error(w, `{"error":"expected /v1/bus/{bus_id}/events or /v1/bus/{bus_id}/stats"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"expected /v1/bus/{bus_id}/events, /v1/bus/{bus_id}/stats, or /v1/bus/{bus_id}/stream"}`, http.StatusBadRequest)
 	}
 }
 
@@ -419,6 +423,147 @@ func (s *Server) handleBusStats(w http.ResponseWriter, r *http.Request, busID st
 		stats.LastEventAt = e.Ts
 	}
 	_ = json.NewEncoder(w).Encode(stats)
+}
+
+// ─── GET /v1/bus/{bus_id}/stream — live SSE ──────────────────────────────────
+
+// busSSEEnvelope is the wire format emitted on the bus SSE stream. The shape
+// matches the busEventEnvelope type in bus_watch.go (root package) so the CLI
+// watcher can decode it without changes.
+//
+//	{"id":"<hash>","type":"<event_type>","timestamp":"<RFC3339Nano>","data":{…BusBlock…}}
+//
+// The `data` field is the full BusBlock so callers have access to seq, from,
+// payload, hash, and the full type — identical to the polling response from
+// GET /v1/bus/{bus_id}/events.
+type busSSEEnvelope struct {
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`
+	Timestamp string    `json:"timestamp"`
+	Data      *BusBlock `json:"data"`
+}
+
+const (
+	busSSEHeartbeatInterval = 30 * time.Second
+	busSSEWriteDeadline     = 10 * time.Second
+)
+
+// handleBusStream serves GET /v1/bus/{bus_id}/stream — the live SSE endpoint
+// for a per-bus event stream. Subscribers receive:
+//
+//   - `event: connected` on open (one-shot)
+//   - `data: {busSSEEnvelope JSON}` per event (no named event type, so
+//     EventSource fires onmessage)
+//   - `: heartbeat` every 30 s (SSE comment — invisible to EventSource)
+//
+// Replay query params:
+//
+//	no_replay=1  skip historical events (only live from this point forward)
+//	consumer_id  optional identity for dedup (replaces any prior connection
+//	             with the same ID)
+//
+// The stream runs until the client disconnects or the server shuts down.
+// There is no max_duration cap on bus streams — they are intended for
+// long-lived dashboard / hook consumers.
+func (s *Server) handleBusStream(w http.ResponseWriter, r *http.Request, busID string) {
+	broker := s.busBroker
+	if broker == nil {
+		http.Error(w, `{"error":"bus broker not initialised"}`, http.StatusInternalServerError)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Connection", "keep-alive")
+
+	noReplay := r.URL.Query().Get("no_replay") == "1"
+	consumerID := r.URL.Query().Get("consumer_id")
+
+	rc := http.NewResponseController(w)
+
+	// Subscribe to the bus BEFORE replaying so we don't miss events that
+	// arrive between the snapshot and the live subscription.
+	ch := make(chan *BusBlock, 64)
+	ctx := r.Context()
+	if !broker.Subscribe(busID, ch, ctx, consumerID) {
+		http.Error(w, `{"error":"bus at subscriber capacity"}`, http.StatusServiceUnavailable)
+		return
+	}
+	defer broker.Unsubscribe(busID, ch)
+
+	// Connected handshake.
+	_ = rc.SetWriteDeadline(time.Now().Add(busSSEWriteDeadline))
+	fmt.Fprintf(w, "event: connected\ndata: {\"bus_id\":%q,\"at\":%q}\n\n",
+		busID, time.Now().UTC().Format(time.RFC3339))
+	flusher.Flush()
+
+	// Replay historical events from disk so the subscriber sees the full
+	// tail on connect (mirrors cog bus tail behaviour). Skip if no_replay=1.
+	if !noReplay && s.busSessions != nil {
+		events, err := s.busSessions.ReadEvents(busID)
+		if err == nil {
+			for i := range events {
+				evt := &events[i]
+				env := busSSEEnvelope{
+					ID:        "replay_" + evt.Hash,
+					Type:      evt.Type,
+					Timestamp: evt.Ts,
+					Data:      evt,
+				}
+				b, err := json.Marshal(env)
+				if err != nil {
+					continue
+				}
+				_ = rc.SetWriteDeadline(time.Now().Add(busSSEWriteDeadline))
+				fmt.Fprintf(w, "data: %s\n\n", b)
+				broker.TouchWrite(busID, ch)
+			}
+			if len(events) > 0 {
+				flusher.Flush()
+			}
+		}
+	}
+
+	// Live loop.
+	hb := time.NewTicker(busSSEHeartbeatInterval)
+	defer hb.Stop()
+
+	for {
+		select {
+		case evt, ok := <-ch:
+			if !ok {
+				// Channel closed by broker (shutdown or reaper).
+				return
+			}
+			env := busSSEEnvelope{
+				ID:        evt.Hash,
+				Type:      evt.Type,
+				Timestamp: evt.Ts,
+				Data:      evt,
+			}
+			b, err := json.Marshal(env)
+			if err != nil {
+				continue
+			}
+			_ = rc.SetWriteDeadline(time.Now().Add(busSSEWriteDeadline))
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
+			broker.TouchWrite(busID, ch)
+		case <-hb.C:
+			_ = rc.SetWriteDeadline(time.Now().Add(busSSEWriteDeadline))
+			fmt.Fprintf(w, ": heartbeat\n\n")
+			flusher.Flush()
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // ─── GET /v1/bus/events (cross-bus search) ───────────────────────────────────

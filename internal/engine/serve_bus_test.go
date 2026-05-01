@@ -5,6 +5,7 @@
 package engine
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -496,8 +497,7 @@ func TestSessionsListAndDetail(t *testing.T) {
 }
 
 // TestBusStreamBrokerPublishSubscribe verifies that AppendEvent fans out to
-// a subscribed channel (library-level test — the port doesn't register an
-// HTTP route for bus SSE because PR #16 owns /v1/events/stream).
+// a subscribed channel via BusEventBroker (library-level test).
 func TestBusStreamBrokerPublishSubscribe(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -535,6 +535,114 @@ func TestBusStreamBrokerPublishSubscribe(t *testing.T) {
 	broker.Unsubscribe("bus-s", ch)
 	if broker.SubscriberCount("bus-s") != 0 {
 		t.Errorf("subscriber count = %d after unsubscribe, want 0", broker.SubscriberCount("bus-s"))
+	}
+}
+
+// TestBusStreamSSEEndToEnd is the regression test for issue #51: bus events
+// must reach GET /v1/bus/{bus_id}/stream as SSE frames. Before the fix,
+// BusEventBroker had no HTTP route and every client using the stream endpoint
+// would sit silent indefinitely.
+func TestBusStreamSSEEndToEnd(t *testing.T) {
+	t.Parallel()
+	handler, _, _ := newEventsTestServer(t)
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	const busID = "sse-regression-bus"
+
+	// Pre-create the bus so the stream handler sees it exists.
+	openBody := `{"bus_id":"` + busID + `"}`
+	openResp, err := http.Post(srv.URL+"/v1/bus/open", "application/json", strings.NewReader(openBody))
+	if err != nil {
+		t.Fatalf("POST /v1/bus/open: %v", err)
+	}
+	openResp.Body.Close()
+
+	// Open the SSE stream. no_replay=1 so we only see live events.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		srv.URL+"/v1/bus/"+busID+"/stream?no_replay=1", nil)
+	if err != nil {
+		t.Fatalf("build SSE request: %v", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/bus/%s/stream: %v", busID, err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type=%q; want text/event-stream", ct)
+	}
+
+	// Collect SSE envelopes in the background.
+	type sseEnvelope struct {
+		ID        string          `json:"id"`
+		Type      string          `json:"type"`
+		Timestamp string          `json:"timestamp"`
+		Data      json.RawMessage `json:"data"`
+	}
+	received := make(chan sseEnvelope, 8)
+	go func() {
+		defer close(received)
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var env sseEnvelope
+			if err := json.Unmarshal([]byte(line[6:]), &env); err != nil || env.Data == nil {
+				continue
+			}
+			received <- env
+		}
+	}()
+
+	// Give the subscriber a moment to register, then send two events.
+	time.Sleep(50 * time.Millisecond)
+	for _, msg := range []string{"hello-stream", "world-stream"} {
+		body := `{"bus_id":"` + busID + `","from":"test","message":"` + msg + `"}`
+		postResp, err := http.Post(srv.URL+"/v1/bus/send", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /v1/bus/send (%s): %v", msg, err)
+		}
+		postResp.Body.Close()
+	}
+
+	// Expect both events on the stream.
+	var got []sseEnvelope
+	deadline := time.After(3 * time.Second)
+collect:
+	for len(got) < 2 {
+		select {
+		case env, ok := <-received:
+			if !ok {
+				break collect
+			}
+			got = append(got, env)
+		case <-deadline:
+			t.Fatalf("timed out: received %d/2 events on /v1/bus/%s/stream (issue #51 regression)", len(got), busID)
+		}
+	}
+
+	if len(got) < 2 {
+		t.Fatalf("received %d events; want 2", len(got))
+	}
+
+	// Both envelopes must have a non-empty ID (hash) and non-nil data.
+	for i, env := range got {
+		if env.ID == "" {
+			t.Errorf("got[%d].ID empty — hash not forwarded", i)
+		}
+		if env.Data == nil {
+			t.Errorf("got[%d].Data nil — BusBlock not embedded", i)
+		}
 	}
 }
 
