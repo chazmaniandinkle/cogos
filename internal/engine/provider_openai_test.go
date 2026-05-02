@@ -168,6 +168,66 @@ func TestBuildOpenAIRequestTools(t *testing.T) {
 	}
 }
 
+// TestBuildOpenAIRequestSuppressesToolsWhenNone verifies that the tools array
+// is omitted from the wire body when tool_choice is "none", and that it is
+// included for other values ("auto", "required", specific tool name).
+func TestBuildOpenAIRequestSuppressesToolsWhenNone(t *testing.T) {
+	t.Parallel()
+
+	tools := []ToolDefinition{
+		{
+			Name:        "search",
+			Description: "Search the memory index",
+			InputSchema: map[string]interface{}{"type": "object"},
+		},
+	}
+	msgs := []ProviderMessage{{Role: "user", Content: "hi"}}
+
+	// tool_choice == "none" → tools field must be absent from the wire body.
+	t.Run("none suppresses tools", func(t *testing.T) {
+		t.Parallel()
+		req := &CompletionRequest{Messages: msgs, Tools: tools, ToolChoice: "none"}
+		r := buildOpenAIRequest("m", req, false, 4096)
+		if len(r.Tools) != 0 {
+			t.Errorf("tools len = %d; want 0 when tool_choice is none", len(r.Tools))
+		}
+		body, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(body, &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, present := raw["tools"]; present {
+			t.Errorf("wire body contains 'tools' key; want omitted when tool_choice is none")
+		}
+	})
+
+	// Other tool_choice values must still send the tools schema.
+	for _, tc := range []string{"auto", "required", "search"} {
+		tc := tc
+		t.Run("includes tools for "+tc, func(t *testing.T) {
+			t.Parallel()
+			req := &CompletionRequest{Messages: msgs, Tools: tools, ToolChoice: tc}
+			r := buildOpenAIRequest("m", req, false, 4096)
+			if len(r.Tools) != 1 {
+				t.Errorf("tools len = %d; want 1 for tool_choice=%q", len(r.Tools), tc)
+			}
+		})
+	}
+
+	// No tools in the request → tools field absent regardless of tool_choice.
+	t.Run("no tools always omits tools field", func(t *testing.T) {
+		t.Parallel()
+		req := &CompletionRequest{Messages: msgs, ToolChoice: "auto"}
+		r := buildOpenAIRequest("m", req, false, 4096)
+		if len(r.Tools) != 0 {
+			t.Errorf("tools len = %d; want 0 when no tools defined", len(r.Tools))
+		}
+	})
+}
+
 // ── parseOpenAIResponse ──────────────────────────────────────────────────────
 
 func TestParseOpenAIResponseBasic(t *testing.T) {

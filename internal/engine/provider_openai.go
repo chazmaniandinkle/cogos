@@ -343,8 +343,10 @@ func buildOpenAIRequest(model string, req *CompletionRequest, stream bool, maxTo
 		or.MaxTokens = req.MaxTokens
 	}
 
-	// Map tools.
-	if len(req.Tools) > 0 {
+	// Map tools. Skip when tool_choice is "none" — the caller has explicitly
+	// opted out of tool use for this turn; sending schemas wastes tokens and
+	// can bias models toward tool calls they should ignore.
+	if len(req.Tools) > 0 && req.ToolChoice != "none" {
 		or.Tools = make([]openaiTool, len(req.Tools))
 		for i, t := range req.Tools {
 			or.Tools[i] = openaiTool{
