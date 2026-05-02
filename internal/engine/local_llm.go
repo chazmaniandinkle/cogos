@@ -127,7 +127,11 @@ func buildLocalProvider(target LocalLLMTarget, model string) Provider {
 	cfg := ProviderConfig{
 		Endpoint: target.BaseURL,
 		Model:    model,
-		Timeout:  120,
+		// 300s covers cold-load of an 8B-class quantized model on Apple Silicon
+		// under memory pressure (~110s clean, ~150-180s under load). 120s
+		// closed the connection mid-load, aborting Ollama's load and forcing
+		// a retry on the next dispatch. See cogos-dev/cogos#144.
+		Timeout: 300,
 	}
 	switch target.Backend {
 	case LocalLLMBackendOllama:
