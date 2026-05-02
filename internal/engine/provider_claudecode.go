@@ -155,7 +155,7 @@ func (p *ClaudeCodeProvider) Complete(ctx context.Context, req *CompletionReques
 		"--include-partial-messages",
 	)
 
-	cmd := exec.CommandContext(ctx, p.cliBinary, args...)
+	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild}, p.cliBinary, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {
@@ -260,7 +260,7 @@ func (p *ClaudeCodeProvider) Stream(ctx context.Context, req *CompletionRequest)
 		"--include-partial-messages",
 	)
 
-	cmd := exec.CommandContext(ctx, p.cliBinary, args...)
+	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild}, p.cliBinary, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {
@@ -723,7 +723,7 @@ func (p *ClaudeCodeProvider) SpawnBackground(opts BackgroundTaskOpts) (string, e
 		ctx, cancel = context.WithTimeout(context.Background(), opts.Timeout)
 	}
 
-	cmd := exec.CommandContext(ctx, p.cliBinary, args...)
+	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild, Dir: opts.WorkDir}, p.cliBinary, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {
@@ -737,9 +737,6 @@ func (p *ClaudeCodeProvider) SpawnBackground(opts BackgroundTaskOpts) (string, e
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
 	cmd.Stdin = strings.NewReader(opts.Prompt)
-	if opts.WorkDir != "" {
-		cmd.Dir = opts.WorkDir
-	}
 
 	proc := p.procMgr.Track(cmd, ManagedProcessOpts{
 		Kind:            ProcessBackground,

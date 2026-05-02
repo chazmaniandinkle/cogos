@@ -217,10 +217,7 @@ func (p *CodexProvider) Complete(ctx context.Context, req *CompletionRequest) (*
 	if err != nil {
 		return nil, fmt.Errorf("codex binary not available: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, binary, args...)
-	if p.workDir != "" {
-		cmd.Dir = p.workDir
-	}
+	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild, Dir: p.workDir}, binary, args...)
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -276,10 +273,7 @@ func (p *CodexProvider) Stream(ctx context.Context, req *CompletionRequest) (<-c
 	if err != nil {
 		return nil, fmt.Errorf("codex binary not available: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, binary, args...)
-	if p.workDir != "" {
-		cmd.Dir = p.workDir
-	}
+	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild, Dir: p.workDir}, binary, args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

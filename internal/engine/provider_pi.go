@@ -120,7 +120,7 @@ func (p *PiProvider) Complete(ctx context.Context, req *CompletionRequest) (*Com
 	prompt := p.buildPrompt(req)
 	args := p.buildArgs(req)
 
-	cmd := exec.CommandContext(ctx, p.piBinary, args...)
+	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild}, p.piBinary, args...)
 	cmd.Stdin = strings.NewReader(prompt)
 
 	proc := p.procMgr.Track(cmd, ManagedProcessOpts{
@@ -164,7 +164,7 @@ func (p *PiProvider) Stream(ctx context.Context, req *CompletionRequest) (<-chan
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, p.piBinary, args...)
+	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild}, p.piBinary, args...)
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdout, err := cmd.StdoutPipe()
