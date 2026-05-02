@@ -35,6 +35,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -100,6 +101,16 @@ func (c *LaunchctlController) Start(ctx context.Context, name string, def Servic
 			}, nil
 		}
 		plistPath := plistPathForLabel(label)
+		// Spec item 5: if the plist file is absent on disk, do not attempt to
+		// load — return ErrNotControllable so the HTTP layer surfaces the same
+		// "controllable: false" shape as ObserverSupervisor (409 response).
+		if _, statErr := os.Stat(plistPath); os.IsNotExist(statErr) {
+			return &ServiceStatus{
+				Running:           false,
+				LaunchdRegistered: false,
+				At:                time.Now().UTC(),
+			}, fmt.Errorf("%w: plist not found at %s", ErrNotControllable, plistPath)
+		}
 		if loadErr := c.runLaunchctl(ctx, "load", plistPath); loadErr != nil {
 			st2, _ := c.Status(ctx, name, def)
 			if st2 != nil {
