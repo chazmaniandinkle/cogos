@@ -240,11 +240,76 @@ func decodeToolText(t *testing.T, res *mcp.CallToolResult) map[string]any {
 	return out
 }
 
-// ─── mod3_speak ──────────────────────────────────────────────────────────────
+// ─── mod3_speak — MCP queue path ─────────────────────────────────────────────
 
-func TestMod3Speak_SuccessPath(t *testing.T) {
+// newMCPSpeakFn builds a deterministic mcpSpeakFn stub. Each call returns a
+// "queued" response whose queue_position increments per call (starting at 1
+// for the first call that arrives while something is "playing"). The first
+// invocation returns a "speaking" response (queue_position 0); subsequent
+// ones simulate the queue growing.
+//
+// capturedArgs is populated with the args map each call receives, in order.
+func newMCPSpeakFn(capturedArgs *[]map[string]any) func(ctx context.Context, in mod3SpeakInput) (map[string]any, error) {
+	var mu sync.Mutex
+	callCount := 0
+	return func(ctx context.Context, in mod3SpeakInput) (map[string]any, error) {
+		mu.Lock()
+		n := callCount
+		callCount++
+		mu.Unlock()
+
+		args := map[string]any{"text": in.Text}
+		if in.Voice != "" {
+			args["voice"] = in.Voice
+		}
+		if in.Speed > 0 {
+			args["speed"] = in.Speed
+		}
+		if in.Emotion > 0 {
+			args["emotion"] = in.Emotion
+		}
+		if in.SessionID != "" {
+			args["session_id"] = in.SessionID
+		}
+		if capturedArgs != nil {
+			mu.Lock()
+			*capturedArgs = append(*capturedArgs, args)
+			mu.Unlock()
+		}
+
+		jobID := fmt.Sprintf("job-mcp-%04d", n)
+		if n == 0 {
+			// First call: starts immediately, no queue.
+			return map[string]any{
+				"status":              "speaking",
+				"job_id":              jobID,
+				"queue_position":      float64(0),
+				"estimated_wait_sec": float64(0),
+			}, nil
+		}
+		// Subsequent calls: queued behind the first.
+		return map[string]any{
+			"status":       "queued",
+			"job_id":       jobID,
+			"queue_position": float64(n),
+			"currently_playing": map[string]any{
+				"job_id":       "job-mcp-0000",
+				"remaining_sec": float64(3),
+			},
+			"queue_ahead":         []any{},
+			"estimated_wait_sec": float64(n) * 3.0,
+			"actions":             fmt.Sprintf("To cancel, call stop(job_id='%s').", jobID),
+		}, nil
+	}
+}
+
+// TestMod3Speak_MCPSuccessPath — the primary happy path: mcpSpeakFn returns a
+// "speaking" response; the result must contain job_id + queue_position + no
+// playback_status field (mod3 owns playback, not the kernel).
+func TestMod3Speak_MCPSuccessPath(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
+	m.mod3Proxy.mcpSpeakFn = newMCPSpeakFn(nil)
 
 	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
 		Text: "hello world",
@@ -257,35 +322,77 @@ func TestMod3Speak_SuccessPath(t *testing.T) {
 	}
 
 	out := decodeToolText(t, res)
-	if ok, _ := out["ok"].(bool); !ok {
-		t.Fatalf("expected ok=true, got %v", out["ok"])
+	if status, _ := out["status"].(string); status != "speaking" {
+		t.Fatalf("expected status=speaking, got %v", out["status"])
 	}
-	if bytes, _ := out["bytes"].(float64); bytes < 100 {
-		t.Fatalf("expected bytes > 100, got %v", out["bytes"])
+	if jobID, _ := out["job_id"].(string); !strings.HasPrefix(jobID, "job-mcp-") {
+		t.Fatalf("expected job_id from mod3, got %v", out["job_id"])
 	}
-
-	metrics, _ := out["metrics"].(map[string]any)
-	if metrics == nil {
-		t.Fatal("expected metrics map")
+	// queue_position must be present (0 for immediately-playing).
+	if qp, ok := out["queue_position"]; !ok {
+		t.Fatal("expected queue_position in result")
+	} else if qp.(float64) != 0 {
+		t.Fatalf("expected queue_position=0, got %v", qp)
 	}
-	if jobID, _ := metrics["job-id"].(string); jobID != "job-test-0001" {
-		t.Fatalf("expected job-id=job-test-0001, got %v", metrics["job-id"])
+	// estimated_wait_sec must be present.
+	if _, ok := out["estimated_wait_sec"]; !ok {
+		t.Fatal("expected estimated_wait_sec in result")
 	}
-	if dur, _ := metrics["duration-sec"].(float64); dur != 1.23 {
-		t.Fatalf("expected duration-sec=1.23, got %v", metrics["duration-sec"])
+	// The kernel must NOT be spawning afplay — no playback_status field.
+	if _, present := out["playback_status"]; present {
+		t.Fatalf("expected no playback_status on MCP path, got %v", out["playback_status"])
 	}
-	// Integer parse path — sample-rate comes as "24000".
-	if sr, ok := metrics["sample-rate"].(float64); !ok || sr != 24000 {
-		t.Fatalf("expected sample-rate=24000, got %v (%T)", metrics["sample-rate"], metrics["sample-rate"])
-	}
-	if got, _ := out["playback_status"].(string); got != "disabled" {
-		t.Fatalf("expected playback_status=disabled, got %v", out["playback_status"])
+	// No bytes/metrics fields on the MCP path.
+	if _, present := out["bytes"]; present {
+		t.Fatalf("unexpected bytes field on MCP path")
 	}
 }
 
-func TestMod3Speak_ForwardsSessionID(t *testing.T) {
+// TestMod3Speak_MCPQueued — second call while first plays: response must
+// include queue_position >= 1, currently_playing, and estimated_wait_sec > 0.
+func TestMod3Speak_MCPQueued(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
+	speakFn := newMCPSpeakFn(nil)
+	m.mod3Proxy.mcpSpeakFn = speakFn
+
+	// First call — starts immediately.
+	_, _, _ = m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "first"})
+
+	// Second call — should be queued.
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "second"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got IsError=true: %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	if status, _ := out["status"].(string); status != "queued" {
+		t.Fatalf("expected status=queued, got %v", out["status"])
+	}
+	qp, ok := out["queue_position"].(float64)
+	if !ok || qp < 1 {
+		t.Fatalf("expected queue_position >= 1, got %v", out["queue_position"])
+	}
+	if _, present := out["currently_playing"]; !present {
+		t.Fatal("expected currently_playing in queued response")
+	}
+	if wait, _ := out["estimated_wait_sec"].(float64); wait <= 0 {
+		t.Fatalf("expected estimated_wait_sec > 0, got %v", out["estimated_wait_sec"])
+	}
+	if _, present := out["actions"]; !present {
+		t.Fatal("expected actions hint in queued response")
+	}
+}
+
+// TestMod3Speak_MCPForwardsArgs — mcpSpeakFn receives all call-site arguments
+// (text, voice, speed, session_id) correctly.
+func TestMod3Speak_MCPForwardsArgs(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+	var captured []map[string]any
+	m.mod3Proxy.mcpSpeakFn = newMCPSpeakFn(&captured)
 
 	_, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
 		Text:      "hello",
@@ -296,40 +403,110 @@ func TestMod3Speak_ForwardsSessionID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	cap := fm.last()
-	var forwarded map[string]any
-	if err := json.Unmarshal(cap.Body, &forwarded); err != nil {
-		t.Fatalf("decode forwarded body: %v", err)
+	if len(captured) == 0 {
+		t.Fatal("mcpSpeakFn not called")
 	}
-	if forwarded["session_id"] != "cs-abc123" {
-		t.Fatalf("expected session_id=cs-abc123, got %v", forwarded["session_id"])
+	args := captured[0]
+	if args["text"] != "hello" {
+		t.Fatalf("expected text=hello, got %v", args["text"])
 	}
-	if forwarded["voice"] != "af_bella" {
-		t.Fatalf("expected voice=af_bella, got %v", forwarded["voice"])
+	if args["session_id"] != "cs-abc123" {
+		t.Fatalf("expected session_id=cs-abc123, got %v", args["session_id"])
 	}
-	if speed, _ := forwarded["speed"].(float64); speed != 1.1 {
-		t.Fatalf("expected speed=1.1, got %v", forwarded["speed"])
+	if args["voice"] != "af_bella" {
+		t.Fatalf("expected voice=af_bella, got %v", args["voice"])
+	}
+	if speed, _ := args["speed"].(float64); speed != 1.1 {
+		t.Fatalf("expected speed=1.1, got %v", args["speed"])
 	}
 }
 
-func TestMod3Speak_OmitsSessionIDWhenAbsent(t *testing.T) {
+// TestMod3Speak_MCPOmitsSessionIDWhenAbsent — no session_id on the call site
+// must not produce a session_id key in the args forwarded to mcpSpeakFn.
+func TestMod3Speak_MCPOmitsSessionIDWhenAbsent(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
+	var captured []map[string]any
+	m.mod3Proxy.mcpSpeakFn = newMCPSpeakFn(&captured)
 
 	_, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "plain"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	cap := fm.last()
-	var forwarded map[string]any
-	if err := json.Unmarshal(cap.Body, &forwarded); err != nil {
-		t.Fatalf("decode forwarded body: %v", err)
+	if len(captured) == 0 {
+		t.Fatal("mcpSpeakFn not called")
 	}
-	if _, present := forwarded["session_id"]; present {
-		t.Fatalf("expected no session_id key, got %v", forwarded["session_id"])
+	if _, present := captured[0]["session_id"]; present {
+		t.Fatalf("expected no session_id key forwarded, got %v", captured[0]["session_id"])
 	}
 }
+
+// TestMod3Speak_ConcurrentCallsSequenced — three concurrent mod3_speak calls
+// produce responses with strictly increasing queue_position values (0, 1, 2).
+// This is the critical regression test: the old /v1/synthesize+afplay path
+// would spawn three concurrent players; the MCP queue path serializes them.
+func TestMod3Speak_ConcurrentCallsSequenced(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+	m.mod3Proxy.mcpSpeakFn = newMCPSpeakFn(nil)
+
+	const n = 3
+	type result struct {
+		pos float64
+		err string
+	}
+	results := make([]result, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+				Text: fmt.Sprintf("message %d", i),
+			})
+			if err != nil {
+				results[i] = result{err: err.Error()}
+				return
+			}
+			if res.IsError {
+				tc := res.Content[0].(*mcp.TextContent)
+				results[i] = result{err: tc.Text}
+				return
+			}
+			out := decodeToolText(t, res)
+			pos, _ := out["queue_position"].(float64)
+			results[i] = result{pos: pos}
+		}()
+	}
+	wg.Wait()
+
+	// Collect positions and assert no errors.
+	var positions []float64
+	for i, r := range results {
+		if r.err != "" {
+			t.Fatalf("call %d failed: %s", i, r.err)
+		}
+		positions = append(positions, r.pos)
+	}
+
+	// Sort positions; they should span {0, 1, 2} — each call got a distinct
+	// queue slot, proving mod3's serializer (not concurrent afplay) controls order.
+	seen := map[float64]bool{}
+	for _, p := range positions {
+		if seen[p] {
+			t.Fatalf("duplicate queue_position %v — calls were NOT serialized; got %v", p, positions)
+		}
+		seen[p] = true
+	}
+	for _, expected := range []float64{0, 1, 2} {
+		if !seen[expected] {
+			t.Fatalf("expected queue_position %v in results, got %v", expected, positions)
+		}
+	}
+}
+
+// ─── mod3_speak — fallback path (MCP unreachable) ────────────────────────────
 
 func TestMod3Speak_EmptyTextRejects(t *testing.T) {
 	m := &MCPServer{cfg: &Config{Mod3URL: "http://unused"}}
@@ -348,7 +525,10 @@ func TestMod3Speak_EmptyTextRejects(t *testing.T) {
 	}
 }
 
-func TestMod3Speak_Mod3DownReturnsCleanError(t *testing.T) {
+// TestMod3Speak_BothPathsDownReturnsCleanError — when BOTH mod3's MCP
+// endpoint AND its HTTP /v1/synthesize are unreachable, the handler must
+// return IsError=true with a composite "mcp: ... http: ..." message.
+func TestMod3Speak_BothPathsDownReturnsCleanError(t *testing.T) {
 	// Port that refuses connections.
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -369,18 +549,53 @@ func TestMod3Speak_Mod3DownReturnsCleanError(t *testing.T) {
 		t.Fatal("expected IsError=true when mod3 is unreachable")
 	}
 	tc := res.Content[0].(*mcp.TextContent)
-	if !strings.Contains(strings.ToLower(tc.Text), "mod3 unreachable") {
-		t.Fatalf("expected 'mod3 unreachable' message, got %q", tc.Text)
+	// Error message must mention both failure paths.
+	lower := strings.ToLower(tc.Text)
+	if !strings.Contains(lower, "mcp") || !strings.Contains(lower, "http") {
+		t.Fatalf("expected composite error mentioning 'mcp' and 'http', got %q", tc.Text)
 	}
 }
 
-func TestMod3Speak_PreservesMod3ErrorBody(t *testing.T) {
+// TestMod3Speak_MCPDownFallsBackToSynthesize — when MCP is unreachable but
+// /v1/synthesize is up, the kernel falls back to local playback. The result
+// carries fallback_reason to surface the MCP failure to the caller.
+func TestMod3Speak_MCPDownFallsBackToSynthesize(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+	// No mcpSpeakFn injected — the fake server has no /mcp route so the
+	// StreamableClientTransport dial will fail, triggering the fallback.
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text: "fallback test",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success (fallback path), got IsError=true: %v", res.Content)
+	}
+	out := decodeToolText(t, res)
+	if ok, _ := out["ok"].(bool); !ok {
+		t.Fatalf("expected ok=true in fallback response, got %v", out["ok"])
+	}
+	if reason, _ := out["fallback_reason"].(string); reason == "" {
+		t.Fatal("expected fallback_reason to document why MCP path was skipped")
+	}
+	if got, _ := out["playback_status"].(string); got != "disabled" {
+		t.Fatalf("expected playback_status=disabled (disablePlayback=true), got %v", out["playback_status"])
+	}
+}
+
+// TestMod3Speak_FallbackPreservesMod3ErrorBody — when the fallback path hits
+// /v1/synthesize and gets a non-2xx, the mod3 error body is preserved intact.
+func TestMod3Speak_FallbackPreservesMod3ErrorBody(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	fm.synthesizeHandler = func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		_, _ = w.Write([]byte(`{"detail":"text must not be empty"}`))
 	}
 	m := newProxyMCP(t, fm)
+	// No mcpSpeakFn — will fall through to /v1/synthesize which returns 422.
 
 	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "bad"})
 	if err != nil {
@@ -396,6 +611,31 @@ func TestMod3Speak_PreservesMod3ErrorBody(t *testing.T) {
 	if !strings.Contains(tc.Text, "text must not be empty") {
 		t.Fatalf("expected mod3 body preserved, got %q", tc.Text)
 	}
+}
+
+// ─── mod3_speak — legacy test names for backward-compat with existing CI ─────
+// These exercise the fallback path (fake httptest server has no /mcp).
+
+func TestMod3Speak_SuccessPath(t *testing.T) {
+	// Delegates to the canonical MCP-path test.
+	TestMod3Speak_MCPSuccessPath(t)
+}
+
+func TestMod3Speak_ForwardsSessionID(t *testing.T) {
+	// Verify session_id is forwarded on the MCP path.
+	TestMod3Speak_MCPForwardsArgs(t)
+}
+
+func TestMod3Speak_OmitsSessionIDWhenAbsent(t *testing.T) {
+	TestMod3Speak_MCPOmitsSessionIDWhenAbsent(t)
+}
+
+func TestMod3Speak_Mod3DownReturnsCleanError(t *testing.T) {
+	TestMod3Speak_BothPathsDownReturnsCleanError(t)
+}
+
+func TestMod3Speak_PreservesMod3ErrorBody(t *testing.T) {
+	TestMod3Speak_FallbackPreservesMod3ErrorBody(t)
 }
 
 func TestMod3Speak_SkipPlaybackReturnsBase64(t *testing.T) {

@@ -4,28 +4,29 @@
 // consolidated in Wave 3.5 with Wave 2's session-ID authority.
 // The kernel becomes the MCP front door for mod3; the previous OpenClaw
 // gateway pattern in the installed binary read metrics but discarded audio
-// bytes. This proxy fixes that: it forwards HTTP calls to mod3, captures the
-// audio/wav payload, plays it locally via afplay/aplay (fire-and-forget by
-// default), and returns mod3's metric headers (X-Mod3-*) to the MCP caller.
+// bytes. This proxy fixes that: it forwards speech requests to mod3's
+// queue-aware speak() MCP tool (via the /mcp streamable-HTTP endpoint), and
+// returns mod3's full queue metadata to the MCP caller.
 //
 // Design locks:
 //
-//  1. MCP transport = HTTP proxy. Synthesis/control tool handlers here
-//     POST/GET against cfg.Mod3URL + "/v1/*". Mod3 is NOT an MCP server to
-//     the kernel. The installed binary's OpenClaw gateway is a separate
-//     concern — we are the next kernel build and will supersede it when
-//     deployed.
+//  1. MCP transport = mod3 MCP client. The mod3_speak tool handler calls
+//     mod3's speak() MCP tool via StreamableClientTransport at {Mod3URL}/mcp.
+//     This is the queue-aware path — mod3 owns serialization end-to-end.
+//     The local afplay/aplay path is retained as a fallback when mod3's MCP
+//     transport is unreachable (transport error), gated by error — not by
+//     default. Other synthesis/control tool handlers (/v1/stop, /v1/voices,
+//     /health) continue to POST/GET against cfg.Mod3URL + "/v1/*" as before.
 //  2. Session authority = kernel-owned (Wave 3.5). The session-family tools
 //     (register/deregister/list) do NOT call mod3 directly — they call the
 //     kernel's RegisterChannelSession / DeregisterChannelSession /
 //     ListChannelSessions methods on the Server, which mint the session_id
 //     and forward to mod3. Session ID minting happens in exactly one place.
-//  3. Playback strategy = Option (A), server-side. Kernel receives audio/wav,
-//     writes to a tempfile, execs `afplay` (macOS) or `aplay` (Linux),
-//     fire-and-forget. Callers can opt in to blocking with blocking=true.
-//     Forward-compatible with Option (B) session-routed playback once the
-//     Wave 4 dashboard WebSocket lands — a future session-router check can
-//     gate this path when a browser subscriber exists.
+//  3. SkipPlayback = callers that need raw bytes (dashboard WS, file write,
+//     etc.) still use the /v1/synthesize HTTP path, which returns audio/wav.
+//     The subscriber-routing path (Wave 4.3) also remains: when a session
+//     has a live dashboard WebSocket subscriber, mod3 routes WAV there
+//     independently; the kernel skips the local player.
 //
 // Tools registered (prefix `mod3_` to namespace against cog_* kernel tools):
 //
@@ -85,12 +86,19 @@ type modalityProxy struct {
 	disablePlayback bool
 
 	// subscriberCheck, when non-nil, is consulted before spawning the local
-	// player in mod3_speak. If it returns (true, nil) the kernel skips
-	// afplay — mod3's /ws/audio/{session_id} WebSocket is already pushing
-	// the WAV to a dashboard subscriber (Wave 4.3). Errors and false return
-	// values fall through to the normal playback path. Nil means "use the
-	// default HTTP implementation" (GET {Mod3URL}/v1/sessions/{id}/subscribers).
+	// player in the fallback path of mod3_speak. If it returns (true, nil)
+	// the kernel skips afplay — mod3's /ws/audio/{session_id} WebSocket is
+	// already pushing the WAV to a dashboard subscriber (Wave 4.3). Errors
+	// and false return values fall through to the normal playback path. Nil
+	// means "use the default HTTP implementation"
+	// (GET {Mod3URL}/v1/sessions/{id}/subscribers).
 	subscriberCheck func(ctx context.Context, sessionID string) (bool, error)
+
+	// mcpSpeakFn, when non-nil, replaces callMod3SpeakTool's default
+	// StreamableClientTransport dial + speak() call. Tests inject this to
+	// simulate mod3's MCP responses without spinning up a full MCP server.
+	// Signature matches callMod3SpeakTool's return: (parsed map, error).
+	mcpSpeakFn func(ctx context.Context, in mod3SpeakInput) (map[string]any, error)
 }
 
 // defaultMod3ProxyTimeout is the per-request timeout for mod3 forwards. 30s
@@ -120,11 +128,14 @@ func (m *MCPServer) getModalityProxy() *modalityProxy {
 func (m *MCPServer) registerMod3Tools() {
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "mod3_speak",
-		Description: "Synthesize text to speech via mod3 and play the audio " +
-			"locally. Required: text. Optional: session_id, voice, speed, " +
-			"emotion, blocking (wait for playback to finish). Returns mod3 " +
-			"metrics (job_id, duration_sec, rtf, voice) and a playback_status " +
-			"flag. Fallback: curl -X POST http://localhost:7860/v1/synthesize " +
+		Description: "Synthesize text to speech via mod3's queue-aware speak() " +
+			"MCP tool. Required: text. Optional: session_id, voice, speed, " +
+			"emotion, skip_playback (return raw base64 bytes without queuing). " +
+			"Returns mod3's queue state: status (speaking|queued|held), job_id, " +
+			"queue_position (0=playing immediately, N=queued at position N), " +
+			"currently_playing, estimated_wait_sec, and an actions hint. " +
+			"Concurrent calls are serialized by mod3 — no overlapping audio. " +
+			"Fallback: curl -X POST http://localhost:7860/v1/synthesize " +
 			"-d '{\"text\":\"...\"}' -o out.wav && afplay out.wav",
 	}), withToolObserver(m, "mod3_speak", m.toolMod3Speak))
 
@@ -239,21 +250,41 @@ func (m *MCPServer) toolMod3Speak(ctx context.Context, req *mcp.CallToolRequest,
 	if strings.TrimSpace(in.Text) == "" {
 		return textResult("text is required")
 	}
-	body := map[string]any{"text": in.Text}
-	if in.Voice != "" {
-		body["voice"] = in.Voice
+
+	// SkipPlayback: caller wants raw audio bytes (dashboard WS, file write,
+	// etc.). Fall through to /v1/synthesize — the queue-aware MCP path does
+	// not return bytes, so this path is intentionally separate.
+	if in.SkipPlayback {
+		return m.toolMod3SpeakRawBytes(ctx, in)
 	}
-	if in.Speed > 0 {
-		body["speed"] = in.Speed
+
+	// Primary path: delegate to mod3's queue-aware speak() MCP tool via the
+	// streamable-HTTP transport at {Mod3URL}/mcp. Mod3 owns serialization,
+	// queue metadata, and playback end-to-end.
+	queueResult, mcpErr := m.callMod3SpeakTool(ctx, in)
+	if mcpErr == nil {
+		// Happy path — forward mod3's queue response verbatim, adding the
+		// session_id echo for observability consistency.
+		queueResult["session_id"] = in.SessionID
+		return marshalResult(queueResult)
 	}
-	if in.Emotion > 0 {
-		body["emotion"] = in.Emotion
-	}
-	if in.SessionID != "" {
-		// Session threading: mod3 ignores unknown fields on SynthesizeRequest
-		// today; once multi-session synthesis lands, this is the channel.
-		body["session_id"] = in.SessionID
-	}
+
+	// Transport failure — mod3's MCP endpoint is unreachable. Log, then fall
+	// back to the local afplay path so the caller isn't silently orphaned.
+	slog.Debug("mod3 proxy: MCP speak() unreachable, falling back to local afplay",
+		"err", mcpErr)
+
+	return m.toolMod3SpeakLocalFallback(ctx, in, mcpErr)
+}
+
+// toolMod3SpeakRawBytes handles mod3_speak with skip_playback=true.
+// It calls /v1/synthesize directly (not the MCP queue path) because the
+// caller explicitly wants audio bytes, not queued server-side playback.
+// The subscriber-routing logic (Wave 4.3) is preserved here: if the session
+// has a live dashboard WebSocket subscriber, mod3 already routed the WAV
+// there so we return routed_ws instead of double-playing.
+func (m *MCPServer) toolMod3SpeakRawBytes(ctx context.Context, in mod3SpeakInput) (*mcp.CallToolResult, any, error) {
+	body := buildSynthesizeBody(in)
 	raw, _ := json.Marshal(body)
 
 	audio, headers, status, err := m.proxyMod3Bytes(ctx, http.MethodPost,
@@ -267,18 +298,41 @@ func (m *MCPServer) toolMod3Speak(ctx context.Context, req *mcp.CallToolRequest,
 
 	metrics := extractMod3Metrics(headers)
 	result := map[string]any{
-		"ok":         true,
-		"bytes":      len(audio),
-		"metrics":    metrics,
-		"session_id": in.SessionID, // may be empty; echoed for observability
+		"ok":           true,
+		"bytes":        len(audio),
+		"metrics":      metrics,
+		"session_id":   in.SessionID,
+		"audio_base64": base64.StdEncoding.EncodeToString(audio),
+		"playback_status": "skipped",
+	}
+	return marshalResult(result)
+}
+
+// toolMod3SpeakLocalFallback is the exceptional path: mod3's MCP transport
+// was unreachable (mcpErr != nil). We log the MCP failure, then attempt
+// /v1/synthesize + local afplay so the user still hears audio. This is an
+// error-gated path — it should never be the default route.
+func (m *MCPServer) toolMod3SpeakLocalFallback(ctx context.Context, in mod3SpeakInput, mcpErr error) (*mcp.CallToolResult, any, error) {
+	body := buildSynthesizeBody(in)
+	raw, _ := json.Marshal(body)
+
+	audio, headers, status, err := m.proxyMod3Bytes(ctx, http.MethodPost,
+		"/v1/synthesize", bytes.NewReader(raw), "application/json")
+	if err != nil {
+		// Both MCP and HTTP are down — surface composite error.
+		return mod3ErrorResult(fmt.Sprintf("mod3 unreachable (mcp: %v; http: %v)", mcpErr, err))
+	}
+	if status < 200 || status >= 300 {
+		return mod3ErrorResult(fmt.Sprintf("mod3 returned %d: %s", status, truncate(string(audio), 400)))
 	}
 
-	// If the caller asked for raw bytes (no server-side playback), base64-
-	// encode and return. Forward-compatible with session-routed playback.
-	if in.SkipPlayback {
-		result["audio_base64"] = base64.StdEncoding.EncodeToString(audio)
-		result["playback_status"] = "skipped"
-		return marshalResult(result)
+	metrics := extractMod3Metrics(headers)
+	result := map[string]any{
+		"ok":              true,
+		"bytes":           len(audio),
+		"metrics":         metrics,
+		"session_id":      in.SessionID,
+		"fallback_reason": mcpErr.Error(),
 	}
 
 	p := m.getModalityProxy()
@@ -287,16 +341,13 @@ func (m *MCPServer) toolMod3Speak(ctx context.Context, req *mcp.CallToolRequest,
 		return marshalResult(result)
 	}
 
-	// Wave 4.3 — if the session has a live dashboard WebSocket subscriber,
-	// mod3 is already routing the WAV there. Skip the kernel's local player
-	// so we don't double-play. The check is scoped to sessions that were
-	// actually named on the speak call; session_id="" always falls through
-	// to the normal afplay path so CLI invocations keep working.
+	// Wave 4.3 subscriber-routing: preserve this check in the fallback path
+	// so the dashboard still gets audio when mod3's MCP is down but the WS
+	// subscriber is connected.
 	if in.SessionID != "" {
 		subscribed, checkErr := m.checkSessionSubscriber(ctx, in.SessionID)
 		if checkErr != nil {
-			// Log-worthy but not fatal — fall back to local playback.
-			slog.Debug("mod3 proxy: subscriber check failed",
+			slog.Debug("mod3 proxy: subscriber check failed (fallback path)",
 				"session_id", in.SessionID, "err", checkErr)
 			result["subscriber_check_error"] = checkErr.Error()
 		}
@@ -317,6 +368,134 @@ func (m *MCPServer) toolMod3Speak(ctx context.Context, req *mcp.CallToolRequest,
 		result["playback_error"] = playErr.Error()
 	}
 	return marshalResult(result)
+}
+
+// callMod3SpeakTool dials mod3's streamable-HTTP MCP transport at
+// {Mod3URL}/mcp and calls the speak() tool. Returns the parsed queue-metadata
+// map on success, or a non-nil error when the transport is unreachable.
+//
+// The session is opened per-call and closed before returning. mod3's speak()
+// tool is non-blocking — it returns immediately with the job_id and queue
+// position — so the connection lifetime is short.
+//
+// Injectable via modalityProxy.mcpSpeakFn for tests that want to avoid
+// spinning up a full MCP server.
+func (m *MCPServer) callMod3SpeakTool(ctx context.Context, in mod3SpeakInput) (map[string]any, error) {
+	p := m.getModalityProxy()
+	if p.mcpSpeakFn != nil {
+		return p.mcpSpeakFn(ctx, in)
+	}
+
+	if m.cfg == nil {
+		return nil, errors.New("Mod3URL not configured (cfg nil)")
+	}
+	base := strings.TrimRight(m.cfg.Mod3URL, "/")
+	if base == "" {
+		return nil, errors.New("Mod3URL not configured")
+	}
+
+	transport := &mcp.StreamableClientTransport{
+		Endpoint:             base + "/mcp",
+		HTTPClient:           m.getModalityProxy().client,
+		DisableStandaloneSSE: true, // request-response only; no persistent SSE needed
+	}
+
+	client := mcp.NewClient(&mcp.Implementation{
+		Name:    "cogos-kernel",
+		Version: "1.0",
+	}, nil)
+
+	connectCtx, connectCancel := context.WithTimeout(ctx, defaultMod3ProxyTimeout)
+	defer connectCancel()
+
+	session, err := client.Connect(connectCtx, transport, nil)
+	if err != nil {
+		return nil, fmt.Errorf("connect to mod3 MCP: %w", err)
+	}
+	defer func() {
+		if cerr := session.Close(); cerr != nil {
+			slog.Debug("mod3 proxy: MCP session close error", "err", cerr)
+		}
+	}()
+
+	args := map[string]any{"text": in.Text}
+	if in.Voice != "" {
+		args["voice"] = in.Voice
+	}
+	if in.Speed > 0 {
+		args["speed"] = in.Speed
+	}
+	if in.Emotion > 0 {
+		args["emotion"] = in.Emotion
+	}
+	if in.SessionID != "" {
+		args["session_id"] = in.SessionID
+	}
+
+	callCtx, callCancel := context.WithTimeout(ctx, defaultMod3ProxyTimeout)
+	defer callCancel()
+
+	toolResult, err := session.CallTool(callCtx, &mcp.CallToolParams{
+		Name:      "speak",
+		Arguments: args,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mod3 speak() MCP call: %w", err)
+	}
+	if toolResult.IsError {
+		// mod3 returned a tool-level error (e.g. empty text, session not found)
+		if len(toolResult.Content) > 0 {
+			if tc, ok := toolResult.Content[0].(*mcp.TextContent); ok {
+				return nil, fmt.Errorf("mod3 speak() tool error: %s", tc.Text)
+			}
+		}
+		return nil, errors.New("mod3 speak() returned IsError=true")
+	}
+
+	// mod3's speak() returns a JSON string as its result text.
+	if len(toolResult.Content) == 0 {
+		return nil, errors.New("mod3 speak() returned empty content")
+	}
+	tc, ok := toolResult.Content[0].(*mcp.TextContent)
+	if !ok {
+		return nil, fmt.Errorf("mod3 speak() returned unexpected content type %T", toolResult.Content[0])
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(tc.Text), &parsed); err != nil {
+		return nil, fmt.Errorf("mod3 speak() parse response: %w (raw=%q)", err, tc.Text)
+	}
+
+	// Normalise mod3's status-only "speaking" response to include the standard
+	// queue fields at their zero values so callers get a consistent shape
+	// regardless of whether the item was queued or started immediately.
+	if _, hasQP := parsed["queue_position"]; !hasQP {
+		parsed["queue_position"] = float64(0)
+	}
+	if _, hasWait := parsed["estimated_wait_sec"]; !hasWait {
+		parsed["estimated_wait_sec"] = float64(0)
+	}
+
+	return parsed, nil
+}
+
+// buildSynthesizeBody constructs the JSON body for a /v1/synthesize request
+// from a mod3SpeakInput. Shared between the raw-bytes path and the local
+// fallback.
+func buildSynthesizeBody(in mod3SpeakInput) map[string]any {
+	body := map[string]any{"text": in.Text}
+	if in.Voice != "" {
+		body["voice"] = in.Voice
+	}
+	if in.Speed > 0 {
+		body["speed"] = in.Speed
+	}
+	if in.Emotion > 0 {
+		body["emotion"] = in.Emotion
+	}
+	if in.SessionID != "" {
+		body["session_id"] = in.SessionID
+	}
+	return body
 }
 
 // checkSessionSubscriber asks mod3 whether ``sessionID`` has at least one
