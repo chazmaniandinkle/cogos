@@ -702,3 +702,254 @@ func TestConsumerRegistryAckAndList(t *testing.T) {
 		t.Error("Remove twice should return false")
 	}
 }
+
+// TestBusStreamSinceReplayFromMid verifies that ?since=N replays only events
+// with seq > N, not the full history.
+func TestBusStreamSinceReplayFromMid(t *testing.T) {
+	t.Parallel()
+	handler, _, _ := newEventsTestServer(t)
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	const busID = "since-mid-bus"
+	openBody := `{"bus_id":"` + busID + `"}`
+	openResp, _ := http.Post(srv.URL+"/v1/bus/open", "application/json", strings.NewReader(openBody))
+	openResp.Body.Close()
+
+	// Append 5 events (seq 1..5).
+	for i := 0; i < 5; i++ {
+		body := fmt.Sprintf(`{"bus_id":%q,"from":"test","message":"m%d"}`, busID, i)
+		r, _ := http.Post(srv.URL+"/v1/bus/send", "application/json", strings.NewReader(body))
+		r.Body.Close()
+	}
+
+	// Connect with ?since=2 — expect replay of seq 3, 4, 5 only.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		srv.URL+"/v1/bus/"+busID+"/stream?since=2", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET stream: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// Collect replay frames (prefixed "replay_") until we've seen all expected
+	// or the deadline fires.
+	var replayed []float64
+	scanner := bufio.NewScanner(resp.Body)
+	timeout := time.After(3 * time.Second)
+	lineCh := make(chan string, 32)
+	go func() {
+		for scanner.Scan() {
+			lineCh <- scanner.Text()
+		}
+		close(lineCh)
+	}()
+	for len(replayed) < 3 {
+		select {
+		case line, ok := <-lineCh:
+			if !ok {
+				goto done
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var env map[string]interface{}
+			if err := json.Unmarshal([]byte(line[6:]), &env); err != nil {
+				continue
+			}
+			id, _ := env["id"].(string)
+			if !strings.HasPrefix(id, "replay_") {
+				continue
+			}
+			data, ok := env["data"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			seq, _ := data["seq"].(float64)
+			replayed = append(replayed, seq)
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	cancel()
+
+	if len(replayed) != 3 {
+		t.Fatalf("replayed %d events, want 3 (seq 3,4,5 after since=2)", len(replayed))
+	}
+	for _, seq := range replayed {
+		if seq <= 2 {
+			t.Errorf("replay included seq=%v which should be filtered by since=2", seq)
+		}
+	}
+}
+
+// TestBusStreamSinceReplayFromTip verifies that ?since=N where N equals the
+// current tip skips replay entirely and proceeds directly to live.
+func TestBusStreamSinceReplayFromTip(t *testing.T) {
+	t.Parallel()
+	handler, _, _ := newEventsTestServer(t)
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	const busID = "since-tip-bus"
+	openResp, _ := http.Post(srv.URL+"/v1/bus/open", "application/json",
+		strings.NewReader(`{"bus_id":"`+busID+`"}`))
+	openResp.Body.Close()
+
+	// Append 3 events (seq 1..3). Tip is seq 3.
+	for i := 0; i < 3; i++ {
+		body := fmt.Sprintf(`{"bus_id":%q,"from":"test","message":"m%d"}`, busID, i)
+		r, _ := http.Post(srv.URL+"/v1/bus/send", "application/json", strings.NewReader(body))
+		r.Body.Close()
+	}
+
+	// ?since=3 (the tip) — no replay frames expected, only connected + live.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		srv.URL+"/v1/bus/"+busID+"/stream?since=3", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET stream: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// Read the stream for a short window; no replay_ frames should appear.
+	replayCount := 0
+	liveReceived := make(chan struct{}, 1)
+	lineCh := make(chan string, 32)
+	scanner := bufio.NewScanner(resp.Body)
+	go func() {
+		for scanner.Scan() {
+			lineCh <- scanner.Text()
+		}
+		close(lineCh)
+	}()
+
+	// Send a live event after the connection is established.
+	time.Sleep(50 * time.Millisecond)
+	liveBody := fmt.Sprintf(`{"bus_id":%q,"from":"test","message":"live"}`, busID)
+	lr, _ := http.Post(srv.URL+"/v1/bus/send", "application/json", strings.NewReader(liveBody))
+	lr.Body.Close()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case line, ok := <-lineCh:
+			if !ok {
+				goto checkTip
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var env map[string]interface{}
+			if err := json.Unmarshal([]byte(line[6:]), &env); err != nil {
+				continue
+			}
+			id, _ := env["id"].(string)
+			if strings.HasPrefix(id, "replay_") {
+				replayCount++
+			} else if id != "" {
+				select {
+				case liveReceived <- struct{}{}:
+				default:
+				}
+				goto checkTip
+			}
+		case <-deadline:
+			goto checkTip
+		}
+	}
+checkTip:
+	cancel()
+
+	if replayCount != 0 {
+		t.Errorf("replay frames = %d, want 0 (since=tip)", replayCount)
+	}
+	select {
+	case <-liveReceived:
+	default:
+		t.Error("no live event received after since=tip connection")
+	}
+}
+
+// TestBusStreamSincePastTip verifies that ?since=N where N exceeds the current
+// tip returns 416 Range Not Satisfiable before upgrading to SSE.
+func TestBusStreamSincePastTip(t *testing.T) {
+	t.Parallel()
+	handler, _, _ := newEventsTestServer(t)
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	const busID = "since-past-tip-bus"
+	openResp, _ := http.Post(srv.URL+"/v1/bus/open", "application/json",
+		strings.NewReader(`{"bus_id":"`+busID+`"}`))
+	openResp.Body.Close()
+
+	// Append 2 events (tip = seq 2).
+	for i := 0; i < 2; i++ {
+		body := fmt.Sprintf(`{"bus_id":%q,"from":"test","message":"m%d"}`, busID, i)
+		r, _ := http.Post(srv.URL+"/v1/bus/send", "application/json", strings.NewReader(body))
+		r.Body.Close()
+	}
+
+	// ?since=99 (beyond tip) — expect 416.
+	resp, err := http.Get(srv.URL + "/v1/bus/" + busID + "/stream?since=99")
+	if err != nil {
+		t.Fatalf("GET stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Errorf("status = %d, want 416", resp.StatusCode)
+	}
+
+	var body map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if _, ok := body["error"]; !ok {
+		t.Errorf("response missing 'error' field: %+v", body)
+	}
+}
+
+// TestBusStreamSinceMutualExclusion verifies that passing both ?since=N and
+// ?no_replay=1 returns 400 Bad Request.
+func TestBusStreamSinceMutualExclusion(t *testing.T) {
+	t.Parallel()
+	handler, _, _ := newEventsTestServer(t)
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	const busID = "since-mutex-bus"
+	openResp, _ := http.Post(srv.URL+"/v1/bus/open", "application/json",
+		strings.NewReader(`{"bus_id":"`+busID+`"}`))
+	openResp.Body.Close()
+
+	resp, err := http.Get(srv.URL + "/v1/bus/" + busID + "/stream?since=1&no_replay=1")
+	if err != nil {
+		t.Fatalf("GET stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+
+	var body map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if _, ok := body["error"]; !ok {
+		t.Errorf("response missing 'error' field: %+v", body)
+	}
+}
