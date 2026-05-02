@@ -406,16 +406,13 @@ func TestBusEventsAfterSeq(t *testing.T) {
 }
 
 // TestSessionsListAndDetail exercises /v1/sessions + /v1/sessions/{id}.
+//
+// After fix #154, GET /v1/sessions routes to handleSessionPresence and returns
+// the kernel-native session registry (registered via POST /v1/sessions/register).
+// Individual TAA inference-context detail is still served via
+// GET /v1/sessions/{id}[/context].
 func TestSessionsListAndDetail(t *testing.T) {
 	t.Parallel()
-	handler, _, _ := newEventsTestServer(t)
-
-	// Seed the session store. We need a handle on the Server to Record —
-	// the helper only returns the handler, so we re-build the server here.
-	// newEventsTestServer uses NewServer internally; for test purposes we
-	// just mutate the real route by poking at the Server via the exposed
-	// handler's context. Simpler: create our own Server side-by-side.
-	_ = handler
 	root := t.TempDir()
 	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
 	nucleus := &Nucleus{Name: "test-sessions"}
@@ -423,75 +420,91 @@ func TestSessionsListAndDetail(t *testing.T) {
 	server := NewServer(cfg, nucleus, proc)
 	t.Cleanup(func() { _ = proc.Broker().Close() })
 
-	server.sessions.Record(&SessionContextState{
-		SessionID:      "sess-abc",
-		Profile:        "agent_harness",
-		TurnNumber:     448,
-		IrisPressure:   0.25,
-		TotalTokens:    37,
-		BlockCount:     4,
-		CoherenceScore: 0.5,
-		LastRequestAt:  time.Now(),
-	})
-
 	srv := httptest.NewServer(server.Handler())
 	t.Cleanup(srv.Close)
 
-	// List.
+	// Register a session via the kernel-native register endpoint so it lands
+	// in sessionRegistry (the store that GET /v1/sessions now reads).
+	regBody, _ := json.Marshal(map[string]any{
+		"session_id": "sess-list-abc",
+		"workspace":  "/tmp/test",
+		"role":       "claude-code",
+		"status":     "active",
+	})
+	regResp, err := http.Post(srv.URL+"/v1/sessions/register",
+		"application/json", bytes.NewReader(regBody))
+	if err != nil {
+		t.Fatalf("POST register: %v", err)
+	}
+	regResp.Body.Close()
+	if regResp.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, want 200", regResp.StatusCode)
+	}
+
+	// List — GET /v1/sessions now returns sessionRegistry data (fix #154).
 	listResp, err := http.Get(srv.URL + "/v1/sessions")
 	if err != nil {
 		t.Fatalf("GET sessions: %v", err)
 	}
 	defer listResp.Body.Close()
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, want 200", listResp.StatusCode)
+	}
 
 	var listBody struct {
 		Count    int                      `json:"count"`
 		Sessions []map[string]interface{} `json:"sessions"`
 	}
-	_ = json.NewDecoder(listResp.Body).Decode(&listBody)
+	if err := json.NewDecoder(listResp.Body).Decode(&listBody); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
 	if listBody.Count != 1 {
 		t.Errorf("count = %d, want 1", listBody.Count)
 	}
 	if len(listBody.Sessions) != 1 {
 		t.Fatalf("sessions len = %d", len(listBody.Sessions))
 	}
-	// Byte-compat fields captured from /tmp/phase3-fixture-sessions.json.
-	wantFields := []string{"session_id", "profile", "turn_number", "iris_pressure", "total_tokens", "block_count", "coherence_score", "last_request_at"}
+	// The registry shape carries session_id, workspace, role, active — not TAA fields.
+	wantFields := []string{"session_id", "workspace", "role", "active"}
 	for _, f := range wantFields {
 		if _, ok := listBody.Sessions[0][f]; !ok {
 			t.Errorf("list response missing %q", f)
 		}
 	}
-
-	// Detail.
-	detResp, err := http.Get(srv.URL + "/v1/sessions/sess-abc")
-	if err != nil {
-		t.Fatalf("GET detail: %v", err)
-	}
-	defer detResp.Body.Close()
-	if detResp.StatusCode != 200 {
-		t.Fatalf("detail status = %d", detResp.StatusCode)
-	}
-	var detail map[string]interface{}
-	_ = json.NewDecoder(detResp.Body).Decode(&detail)
-	if detail["session_id"] != "sess-abc" {
-		t.Errorf("session_id = %v", detail["session_id"])
+	if got := listBody.Sessions[0]["session_id"]; got != "sess-list-abc" {
+		t.Errorf("session_id = %v, want sess-list-abc", got)
 	}
 
-	// Also supports /context alias.
-	ctxResp, err := http.Get(srv.URL + "/v1/sessions/sess-abc/context")
+	// Individual TAA context detail is still available via /{id}/context.
+	// Seed the TAA store for a separate session.
+	server.sessions.Record(&SessionContextState{
+		SessionID:    "sess-taa-xyz",
+		Profile:      "agent_harness",
+		TurnNumber:   1,
+		IrisPressure: 0.25,
+		LastRequestAt: time.Now(),
+	})
+
+	ctxResp, err := http.Get(srv.URL + "/v1/sessions/sess-taa-xyz/context")
 	if err != nil {
 		t.Fatalf("GET detail/context: %v", err)
 	}
 	defer ctxResp.Body.Close()
-	if ctxResp.StatusCode != 200 {
+	if ctxResp.StatusCode != http.StatusOK {
 		t.Fatalf("context alias status = %d", ctxResp.StatusCode)
 	}
+	var detail map[string]interface{}
+	if err := json.NewDecoder(ctxResp.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if detail["session_id"] != "sess-taa-xyz" {
+		t.Errorf("session_id = %v", detail["session_id"])
+	}
 
-	// Missing session → 404.
-	missResp, _ := http.Get(srv.URL + "/v1/sessions/nope")
+	// Missing TAA session → 404.
+	missResp, _ := http.Get(srv.URL + "/v1/sessions/nope/context")
 	missResp.Body.Close()
-	if missResp.StatusCode != 404 {
+	if missResp.StatusCode != http.StatusNotFound {
 		t.Errorf("missing session status = %d, want 404", missResp.StatusCode)
 	}
 }

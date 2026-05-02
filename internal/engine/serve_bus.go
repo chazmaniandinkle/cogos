@@ -54,7 +54,12 @@ func (s *Server) registerBusRoutes(mux *http.ServeMux) {
 	s.route(mux, "GET /v1/bus/", s.handleBusRoute)
 
 	// Session surface.
-	s.route(mux, "GET /v1/sessions", s.handleListSessions)
+	// GET /v1/sessions delegates to the kernel-native session registry so
+	// callers see the sessions registered via POST /v1/sessions/register.
+	// The TAA inference-context list (handleListSessions) is no longer
+	// reachable at the list endpoint; individual TAA context is still
+	// available via GET /v1/sessions/{id}[/context]. Fixes #154.
+	s.route(mux, "GET /v1/sessions", s.handleSessionPresence)
 	s.route(mux, "GET /v1/sessions/", s.handleSessionContext)
 }
 
