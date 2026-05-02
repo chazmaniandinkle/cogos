@@ -800,7 +800,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if p, err := s.process.AssembleContext(query, clientMsgs, 0,
+	// Allow per-request budget override via the X-Cogos-Context-Budget header.
+	// A value of 0 (absent or unparseable) defers to the kernel's configured
+	// default_budget (or the package-level DefaultBudget fallback).
+	contextBudget := 0
+	if hv := r.Header.Get("X-Cogos-Context-Budget"); hv != "" {
+		if v, err := strconv.Atoi(hv); err == nil && v > 0 {
+			contextBudget = v
+		}
+	}
+
+	if p, err := s.process.AssembleContext(query, clientMsgs, contextBudget,
 		WithContext(r.Context()),
 		WithConversationID(creq.Metadata.RequestID),
 		WithManifestMode(true),

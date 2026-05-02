@@ -224,7 +224,7 @@ func WithManifestMode(enabled bool) AssembleOption {
 
 func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID string, query string, messages []ProviderMessage, budget int, manifestMode bool, iris irisSignal) (*ContextPackage, error) {
 	if budget <= 0 {
-		budget = 32768
+		budget = p.cfg.EffectiveBudget()
 	}
 
 	estimateTokens := estTokens
@@ -297,6 +297,7 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 	// half-apply mid-assembly. See .cog/scratch/audit-dashboard-context/REPORT.md
 	// §4 — without these the chat path admits every doc above zero salience.
 	maxFovealDocs, salienceFloor := p.cfg.ContextGating()
+	excludeSubstrings := p.cfg.ContextExcludeSubstrings()
 
 	var docCandidates []FovealDoc
 	usedTRM := false
@@ -338,6 +339,9 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 				continue
 			}
 			if strings.Contains(filepath.ToSlash(doc.Path), "/archive/") {
+				continue
+			}
+			if pathMatchesExcludeSubstrings(doc.Path, excludeSubstrings) {
 				continue
 			}
 
@@ -744,6 +748,24 @@ func extractKeywords(query string) []string {
 		}
 	}
 	return keywords
+}
+
+// pathMatchesExcludeSubstrings reports whether the slash-normalised path
+// contains any of the configured exclude substrings. Each entry is treated as
+// a literal path substring (not a shell glob), consistent with the existing
+// /archive/ and /inbox/ exclusion rules used elsewhere in the assembler.
+// An empty list always returns false.
+func pathMatchesExcludeSubstrings(path string, substrings []string) bool {
+	if len(substrings) == 0 {
+		return false
+	}
+	slashed := filepath.ToSlash(path)
+	for _, sub := range substrings {
+		if sub != "" && strings.Contains(slashed, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // queryRelevance scores a CogDoc against a keyword set.
