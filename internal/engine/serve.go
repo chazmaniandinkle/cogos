@@ -49,6 +49,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cogos-dev/cogos/ui/canvas"
+	"github.com/cogos-dev/cogos/ui/dashboard"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -131,8 +133,8 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.channelSessionRegistry = NewChannelSessionRegistry()
 
 	mux := http.NewServeMux()
-	s.route(mux, "GET /", handleDashboard)
-	s.route(mux, "GET /canvas", handleCanvas)
+	s.routeH(mux, "GET /", dashboard.Handler())
+	s.routeH(mux, "GET /canvas", canvas.Handler())
 	s.route(mux, "GET /health", s.handleHealth)
 	s.route(mux, "GET /v1/context", s.handleContext)
 	s.route(mux, "GET /v1/resolve", s.handleResolve)
