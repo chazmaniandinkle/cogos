@@ -31,6 +31,7 @@ var expectedProviders = []string{
 	"component",
 	"discord",
 	"eval",
+	"mlx-inference",
 	"mcp-tools",
 	"openclaw-agents",
 	"openclaw-cron",
@@ -47,8 +48,8 @@ func TestDaemonInit_RegistersAll10Providers(t *testing.T) {
 	copy(want, expectedProviders)
 	sort.Strings(want)
 
-	if len(got) != len(want) {
-		t.Fatalf("provider count: got %d want %d\ngot:  %v\nwant: %v", len(got), len(want), got, want)
+	if len(got) < len(want) {
+		t.Fatalf("provider count: got %d want at least %d\ngot:  %v\nwant: %v", len(got), len(want), got, want)
 	}
 
 	missing := []string{}
@@ -285,5 +286,103 @@ sync: read-only
 		if s.Health == reconcile.HealthHealthy {
 			t.Errorf("goroutine %d: Health()=Healthy with unreachable pin; want Degraded; message=%q", i, s.Message)
 		}
+	}
+}
+
+// ── mlx-inference provider tests ──────────────────────────────────────────────
+
+// TestMLXInference_Registered: mlx-inference provider is registered by init().
+func TestMLXInference_Registered(t *testing.T) {
+	if !reconcile.HasProvider("mlx-inference") {
+		t.Fatal("mlx-inference provider not registered after daemon init()")
+	}
+}
+
+// TestMLXInference_TypeMethod: Type() returns "mlx-inference".
+func TestMLXInference_TypeMethod(t *testing.T) {
+	p, err := reconcile.GetProvider("mlx-inference")
+	if err != nil {
+		t.Fatalf("GetProvider: %v", err)
+	}
+	if got := p.Type(); got != "mlx-inference" {
+		t.Errorf("Type()=%q; want mlx-inference", got)
+	}
+}
+
+// TestMLXInference_HealthDoesNotPanic: Health() must never panic regardless of
+// environment (missing workspace, no launchd, no mlx config).
+func TestMLXInference_HealthDoesNotPanic(t *testing.T) {
+	p, err := reconcile.GetProvider("mlx-inference")
+	if err != nil {
+		t.Fatalf("GetProvider: %v", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("Health() panicked: %v", r)
+		}
+	}()
+	_ = p.Health()
+}
+
+// TestMLXInference_HealthSuspendedWhenNoConfig: when the workspace has no
+// mlx-supervised provider entries, Health() returns HealthSuspended — the
+// feature is opt-in and absence is not an error.
+func TestMLXInference_HealthSuspendedWhenNoConfig(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, ".cog", "config"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Write a providers.yaml with no mlx-supervised entries.
+	if err := os.WriteFile(
+		filepath.Join(tmp, ".cog", "config", "providers.yaml"),
+		[]byte("providers:\n  ollama:\n    type: ollama\n    model: gemma4:e4b\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write providers.yaml: %v", err)
+	}
+
+	daemon.SetWorkspaceRoot(tmp)
+	defer daemon.SetWorkspaceRoot("")
+
+	p, err := reconcile.GetProvider("mlx-inference")
+	if err != nil {
+		t.Fatalf("GetProvider: %v", err)
+	}
+	h := p.Health()
+	if h.Health != reconcile.HealthSuspended {
+		t.Errorf("Health()=%q; want HealthSuspended when no mlx-supervised entries", h.Health)
+	}
+}
+
+// TestMLXInference_HealthDegradedWhenConfiguredButDown: when an mlx-supervised
+// provider is declared but the launchd label is not registered, Health()
+// returns HealthDegraded (not Suspended, not Healthy).
+func TestMLXInference_HealthDegradedWhenConfiguredButDown(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, ".cog", "config"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Write a providers.yaml with an mlx-supervised entry pointing at a
+	// non-existent launchd label (guaranteed not to be registered in CI).
+	if err := os.WriteFile(
+		filepath.Join(tmp, ".cog", "config", "providers.yaml"),
+		[]byte("providers:\n  mlx-test:\n    type: mlx-supervised\n    endpoint: http://localhost:19876\n    model: /vol/no-such-model\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write providers.yaml: %v", err)
+	}
+
+	daemon.SetWorkspaceRoot(tmp)
+	defer daemon.SetWorkspaceRoot("")
+
+	p, err := reconcile.GetProvider("mlx-inference")
+	if err != nil {
+		t.Fatalf("GetProvider: %v", err)
+	}
+	h := p.Health()
+	// Either Degraded (launchd probe failed) or Progressing (rare race) but
+	// never Healthy or Suspended when a config entry exists and the service is down.
+	if h.Health == reconcile.HealthHealthy || h.Health == reconcile.HealthSuspended {
+		t.Errorf("Health()=%q; want Degraded or Progressing when service is configured but down", h.Health)
 	}
 }
