@@ -279,6 +279,77 @@ func TestRunToolLoopTracksToolCallRejections(t *testing.T) {
 	}
 }
 
+func TestNormalizeToolCallIDs(t *testing.T) {
+	t.Parallel()
+
+	t.Run("all blank gets unique IDs", func(t *testing.T) {
+		t.Parallel()
+		calls := []ToolCall{
+			{Name: "tool_a", Arguments: "{}"},
+			{Name: "tool_b", Arguments: "{}"},
+			{Name: "tool_c", Arguments: "{}"},
+		}
+		got := normalizeToolCallIDs("myprovider", 1, calls)
+		ids := make(map[string]bool, len(got))
+		for _, c := range got {
+			if c.ID == "" {
+				t.Fatalf("expected non-empty ID for tool %q", c.Name)
+			}
+			if ids[c.ID] {
+				t.Fatalf("duplicate ID %q generated", c.ID)
+			}
+			ids[c.ID] = true
+		}
+	})
+
+	t.Run("mix of blank and set keeps set ones", func(t *testing.T) {
+		t.Parallel()
+		calls := []ToolCall{
+			{ID: "existing-id", Name: "tool_a", Arguments: "{}"},
+			{Name: "tool_b", Arguments: "{}"},
+		}
+		got := normalizeToolCallIDs("myprovider", 2, calls)
+		if got[0].ID != "existing-id" {
+			t.Fatalf("existing ID was overwritten: got %q, want %q", got[0].ID, "existing-id")
+		}
+		if got[1].ID == "" {
+			t.Fatal("blank ID was not assigned for tool_b")
+		}
+		if got[1].ID == "existing-id" {
+			t.Fatal("generated ID collides with existing ID")
+		}
+	})
+
+	t.Run("all set passes through unchanged", func(t *testing.T) {
+		t.Parallel()
+		calls := []ToolCall{
+			{ID: "id-1", Name: "tool_a", Arguments: "{}"},
+			{ID: "id-2", Name: "tool_b", Arguments: "{}"},
+		}
+		got := normalizeToolCallIDs("myprovider", 1, calls)
+		if got[0].ID != "id-1" || got[1].ID != "id-2" {
+			t.Fatalf("IDs changed: got %q %q, want id-1 id-2", got[0].ID, got[1].ID)
+		}
+	})
+
+	t.Run("empty slice returns nil", func(t *testing.T) {
+		t.Parallel()
+		got := normalizeToolCallIDs("myprovider", 1, nil)
+		if got != nil {
+			t.Fatalf("expected nil for nil input, got %v", got)
+		}
+	})
+
+	t.Run("empty provider name uses fallback prefix", func(t *testing.T) {
+		t.Parallel()
+		calls := []ToolCall{{Name: "tool_a", Arguments: "{}"}}
+		got := normalizeToolCallIDs("", 1, calls)
+		if got[0].ID == "" {
+			t.Fatal("expected non-empty ID even with empty provider name")
+		}
+	})
+}
+
 func testToolDefinition() ToolDefinition {
 	return ToolDefinition{
 		Name: "lookup",
