@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -365,6 +366,29 @@ func encodeOllamaToolArguments(v interface{}) string {
 	return string(data)
 }
 
+// ollamaToolCallID returns a deterministic, stable ID for an Ollama tool call.
+//
+// Ollama's /api/chat responses often omit the ID field on tool calls, especially
+// with older or open-weight models. Downstream consumers and OpenAI-style
+// clients require every tool call to carry a unique, stable ID so they can
+// correlate tool-call → tool-result pairs.
+//
+// The ID is derived from a SHA-256 hash of the canonicalized (name, arguments,
+// seq) triple and formatted as "call_<12-hex-chars>" to be recognisable but not
+// cryptographically meaningful. Same inputs always produce the same ID, making
+// the round-trip testable without mocking random state.
+func ollamaToolCallID(name string, arguments any, seq int) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d\x00%s\x00", seq, name)
+	if arguments != nil {
+		b, err := json.Marshal(arguments)
+		if err == nil {
+			h.Write(b)
+		}
+	}
+	return fmt.Sprintf("call_%x", h.Sum(nil)[:6])
+}
+
 // effectiveModel returns the model to send to Ollama: request override if set,
 // otherwise the provider's configured default.
 func (p *OllamaProvider) effectiveModel(req *CompletionRequest) string {
@@ -422,13 +446,17 @@ func (p *OllamaProvider) Complete(ctx context.Context, req *CompletionRequest) (
 	}
 	if len(or.Message.ToolCalls) > 0 {
 		out.StopReason = "tool_use"
-		for _, tc := range or.Message.ToolCalls {
+		for i, tc := range or.Message.ToolCalls {
 			// Ollama may return arguments as a JSON object or a JSON string
 			// wrapping a JSON object depending on the model. Normalize both.
 			decoded := decodeOllamaToolArguments(string(tc.Function.Arguments))
 			args := encodeOllamaToolArguments(decoded)
+			id := strings.TrimSpace(tc.ID)
+			if id == "" {
+				id = ollamaToolCallID(tc.Function.Name, tc.Function.Arguments, i)
+			}
 			out.ToolCalls = append(out.ToolCalls, ToolCall{
-				ID:        tc.ID,
+				ID:        id,
 				Name:      tc.Function.Name,
 				Arguments: args,
 			})
