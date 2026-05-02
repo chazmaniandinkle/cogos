@@ -751,6 +751,123 @@ func TestBuildOllamaRequestToolsAndToolReplies(t *testing.T) {
 	}
 }
 
+// TestStreamSetsToolCallsFinishReason asserts that when the Ollama stream
+// contains tool_call chunks, the final StreamChunk has StopReason="tool_calls".
+// Regression: issue #76 — streaming path omitted finish_reason entirely when
+// tool calls were present, breaking OpenAI-compatible consumers.
+func TestStreamSetsToolCallsFinishReason(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/chat" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		// Chunk 1: tool_call emitted mid-stream.
+		chunk1 := ollamaChatResponse{
+			Message: ollamaMessage{
+				Role: "assistant",
+				ToolCalls: []ollamaToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: ollamaToolCallDetail{
+							Name:      "search",
+							Arguments: json.RawMessage(`{"query":"cogos"}`),
+						},
+					},
+				},
+			},
+			Done: false,
+		}
+		// Chunk 2: final done chunk with token counts.
+		chunk2 := ollamaChatResponse{
+			Message:         ollamaMessage{Role: "assistant", Content: ""},
+			Done:            true,
+			PromptEvalCount: 8,
+			EvalCount:       5,
+		}
+		for _, c := range []ollamaChatResponse{chunk1, chunk2} {
+			b, _ := json.Marshal(c)
+			_, _ = fmt.Fprintf(w, "%s\n", b)
+			w.(http.Flusher).Flush()
+		}
+	}))
+	defer srv.Close()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Endpoint: srv.URL, Model: "qwen2.5:9b"})
+	ch, err := p.Stream(context.Background(), &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "use a tool"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	var lastChunk StreamChunk
+	for sc := range ch {
+		if sc.Error != nil {
+			t.Fatalf("stream error: %v", sc.Error)
+		}
+		lastChunk = sc
+	}
+	if !lastChunk.Done {
+		t.Fatal("last chunk should have Done=true")
+	}
+	if lastChunk.StopReason != "tool_calls" {
+		t.Errorf("StopReason = %q; want \"tool_calls\" when tool calls were streamed", lastChunk.StopReason)
+	}
+}
+
+// TestStreamNoToolCallsFinishReason asserts that when the Ollama stream
+// contains no tool_calls, the final chunk's StopReason is empty (not
+// overridden to "tool_calls").
+func TestStreamNoToolCallsFinishReason(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/chat" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		chunks := []ollamaChatResponse{
+			{Message: ollamaMessage{Role: "assistant", Content: "Hello"}, Done: false},
+			{Message: ollamaMessage{Role: "assistant", Content: " world"}, Done: false},
+			{Message: ollamaMessage{Role: "assistant", Content: ""}, Done: true,
+				PromptEvalCount: 3, EvalCount: 4},
+		}
+		for _, c := range chunks {
+			b, _ := json.Marshal(c)
+			_, _ = fmt.Fprintf(w, "%s\n", b)
+			w.(http.Flusher).Flush()
+		}
+	}))
+	defer srv.Close()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Endpoint: srv.URL, Model: "qwen2.5:9b"})
+	ch, err := p.Stream(context.Background(), &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "say hello"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	var lastChunk StreamChunk
+	for sc := range ch {
+		if sc.Error != nil {
+			t.Fatalf("stream error: %v", sc.Error)
+		}
+		lastChunk = sc
+	}
+	if !lastChunk.Done {
+		t.Fatal("last chunk should have Done=true")
+	}
+	if lastChunk.StopReason == "tool_calls" {
+		t.Errorf("StopReason = %q; want non-tool_calls when no tool calls were streamed", lastChunk.StopReason)
+	}
+}
+
 func TestOllamaCompleteToolCalls(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

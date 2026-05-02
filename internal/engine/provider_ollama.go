@@ -478,6 +478,10 @@ func (p *OllamaProvider) Stream(ctx context.Context, req *CompletionRequest) (<-
 		// content-bearing chunks — coarse but vastly better than reporting 0.
 		contentChunks := 0
 
+		// Track whether any tool_calls were emitted during the stream so we can
+		// set the correct OpenAI-compatible finish_reason on the final chunk.
+		sawToolCalls := false
+
 		// bufio.Scanner has a 64KB default token limit; some Ollama chunks
 		// (long tool-call arguments) can exceed it. Allow up to 1 MiB.
 		scanner := bufio.NewScanner(resp.Body)
@@ -498,6 +502,9 @@ func (p *OllamaProvider) Stream(ctx context.Context, req *CompletionRequest) (<-
 			if !chunk.Done && chunk.Message.Content != "" {
 				contentChunks++
 			}
+			if len(chunk.Message.ToolCalls) > 0 {
+				sawToolCalls = true
+			}
 			sc := StreamChunk{
 				Delta: chunk.Message.Content,
 				Done:  chunk.Done,
@@ -516,6 +523,9 @@ func (p *OllamaProvider) Stream(ctx context.Context, req *CompletionRequest) (<-
 				sc.ProviderMeta = &ProviderMeta{
 					Provider: p.name,
 					Model:    model,
+				}
+				if sawToolCalls {
+					sc.StopReason = "tool_calls"
 				}
 			}
 			select {
