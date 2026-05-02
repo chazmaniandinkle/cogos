@@ -1485,3 +1485,114 @@ func TestRegister_PreservesRegisteredAtAcrossReRegister(t *testing.T) {
 			replayed.RegisteredAt, t1)
 	}
 }
+
+// ─── 28. TestRegisterThenListRoundTrip (#154) ─────────────────────────────────
+//
+// Regression guard for issue #154: POST /v1/sessions/register succeeds and the
+// bus event lands correctly, but GET /v1/sessions and GET /v1/peer-awareness
+// both returned empty because handleListSessions was reading s.sessions (the
+// TAA inference-context store) instead of s.sessionRegistry (the bus-backed
+// kernel-native registry). After the fix, GET /v1/sessions is wired to
+// handleSessionPresence which reads s.sessionRegistry directly.
+//
+// Asserts:
+//  1. Register returns 200 with created=true.
+//  2. GET /v1/sessions immediately returns count=1 and includes the session.
+//  3. GET /v1/sessions?include_ended=true also returns the session.
+//  4. GET /v1/sessions?active_within_seconds=3600 also returns the session.
+//  5. GET /v1/peer-awareness?sid=<id>&window=24h returns 200 (not a dead endpoint).
+func TestRegisterThenListRoundTrip(t *testing.T) {
+	t.Parallel()
+	_, ts := newSessionsTestServer(t)
+
+	sid := "repro-bug-154-abc"
+
+	// 1. Register — must succeed.
+	regResp := postJSON(t, ts.URL+"/v1/sessions/register", map[string]any{
+		"session_id": sid,
+		"workspace":  "/tmp/test-154",
+		"role":       "claude-code",
+		"status":     "active",
+	})
+	var regBody sessionWriteResponse
+	decodeJSON(t, regResp, &regBody)
+	if regResp.StatusCode != http.StatusOK || !regBody.OK || !regBody.Created {
+		t.Fatalf("register: status=%d ok=%v created=%v", regResp.StatusCode, regBody.OK, regBody.Created)
+	}
+
+	// 2. GET /v1/sessions — must return the just-registered session.
+	listResp, err := http.Get(ts.URL + "/v1/sessions")
+	if err != nil {
+		t.Fatalf("GET /v1/sessions: %v", err)
+	}
+	var listBody struct {
+		Count    int `json:"count"`
+		Sessions []struct {
+			SessionID string `json:"session_id"`
+			Active    bool   `json:"active"`
+		} `json:"sessions"`
+	}
+	decodeJSON(t, listResp, &listBody)
+	if listBody.Count != 1 {
+		t.Fatalf("GET /v1/sessions count = %d, want 1 (fix #154)", listBody.Count)
+	}
+	if len(listBody.Sessions) == 0 || listBody.Sessions[0].SessionID != sid {
+		t.Errorf("GET /v1/sessions returned unexpected sessions: %+v", listBody.Sessions)
+	}
+	if !listBody.Sessions[0].Active {
+		t.Errorf("just-registered session should be active, got active=false")
+	}
+
+	// 3. include_ended=true — still returns the session.
+	listEndedResp, err := http.Get(ts.URL + "/v1/sessions?include_ended=true")
+	if err != nil {
+		t.Fatalf("GET /v1/sessions?include_ended=true: %v", err)
+	}
+	var endedBody struct {
+		Count int `json:"count"`
+	}
+	decodeJSON(t, listEndedResp, &endedBody)
+	if endedBody.Count != 1 {
+		t.Errorf("GET /v1/sessions?include_ended=true count = %d, want 1", endedBody.Count)
+	}
+
+	// 4. active_within_seconds=3600 — still returns the session.
+	listWindowResp, err := http.Get(ts.URL + "/v1/sessions?active_within_seconds=3600")
+	if err != nil {
+		t.Fatalf("GET /v1/sessions?active_within_seconds=3600: %v", err)
+	}
+	var windowBody struct {
+		Count int `json:"count"`
+	}
+	decodeJSON(t, listWindowResp, &windowBody)
+	if windowBody.Count != 1 {
+		t.Errorf("GET /v1/sessions?active_within_seconds=3600 count = %d, want 1", windowBody.Count)
+	}
+
+	// 5. GET /v1/peer-awareness?sid=<sid>&window=24h — must return 200 (not
+	//    empty-endpoint) even when there are no activity events for this sid.
+	//    The "anti_echo_mvp" note in the response is the canonical signal that
+	//    the endpoint ran to completion.
+	peerURL := ts.URL + "/v1/peer-awareness?sid=" + sid + "&window=24h&budget=1500"
+	peerResp, err := http.Get(peerURL)
+	if err != nil {
+		t.Fatalf("GET /v1/peer-awareness: %v", err)
+	}
+	var peerBody struct {
+		Packet string   `json:"packet"`
+		Notes  []string `json:"notes"`
+	}
+	decodeJSON(t, peerResp, &peerBody)
+	if peerResp.StatusCode != http.StatusOK {
+		t.Errorf("peer-awareness status = %d, want 200", peerResp.StatusCode)
+	}
+	foundNote := false
+	for _, n := range peerBody.Notes {
+		if n == "anti_echo_mvp" {
+			foundNote = true
+		}
+	}
+	if !foundNote {
+		t.Errorf("peer-awareness did not return anti_echo_mvp note: notes=%v", peerBody.Notes)
+	}
+}
