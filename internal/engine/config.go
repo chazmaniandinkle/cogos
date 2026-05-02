@@ -124,6 +124,13 @@ type Config struct {
 	// (`cog skill exec`) is unaffected — it runs in the user's own session.
 	EnableSkillExec bool
 
+	// EnableServiceControl gates the service mutation endpoints:
+	// POST /v1/services/{name}/start|stop|restart|enable|disable.
+	// Default false: service mutations via HTTP are disabled by default because
+	// any local process on the same host could otherwise trigger launchctl
+	// operations. Set enable_service_control: true in kernel.yaml to opt in.
+	EnableServiceControl bool
+
 	// DigestPaths maps stream tailer adapter names to JSONL file/directory paths.
 	// Empty map means external digestion is disabled.
 	DigestPaths map[string]string
@@ -166,6 +173,7 @@ type kernelConfigSection struct {
 	OllamaEmbedModel      string            `yaml:"ollama_embed_model"`
 	ToolCallValidation    *bool             `yaml:"tool_call_validation_enabled"`
 	EnableSkillExec       *bool             `yaml:"enable_skill_exec"`
+	EnableServiceControl  *bool             `yaml:"enable_service_control"`
 	LocalModel            string            `yaml:"local_model"`
 	DigestPaths           map[string]string `yaml:"digest_paths"`
 	KernelLogPath         string            `yaml:"kernel_log_path"`
@@ -290,6 +298,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	}
 	if s.EnableSkillExec != nil {
 		cfg.EnableSkillExec = *s.EnableSkillExec
+	}
+	if s.EnableServiceControl != nil {
+		cfg.EnableServiceControl = *s.EnableServiceControl
 	}
 	if s.LocalModel != "" {
 		cfg.LocalModel = s.LocalModel

@@ -62,6 +62,7 @@ type Server struct {
 	nucleus         *Nucleus
 	process         *Process
 	router          Router // nil until SetRouter is called
+	serviceSupervisor ServiceSupervisor // nil until SetServiceSupervisor; defaults to ObserverSupervisor
 	srv             *http.Server
 	debug           debugStore      // captures last request pipeline state
 	attentionLog    *attentionLog   // per-server log (avoids global write race)
@@ -187,9 +188,10 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// ambient-awareness loop; Phase 1A populates channel.<sid>.activity).
 	s.registerPeerAwarenessRoutes(mux)
 
-	// Read-only services API: GET /v1/services and GET /v1/services/{name}.
-	// Phase 2 will add mutations (start/stop/restart).
+	// Services API: GET /v1/services and GET /v1/services/{name} (Phase 1);
+	// POST /v1/services/{name}/{action} mutations (Phase 2).
 	s.registerServiceRoutes(mux)
+	s.registerServiceMutationRoutes(mux)
 
 	// Replay bus_sessions + bus_handoffs into the in-memory registries so
 	// the kernel starts with an accurate derived view. Bus is authoritative
@@ -223,6 +225,13 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 // SetRouter wires an inference Router into the server.
 func (s *Server) SetRouter(r Router) {
 	s.router = r
+}
+
+// SetServiceSupervisor wires a ServiceSupervisor into the server for
+// service mutation endpoints (start/stop/restart/enable/disable).
+// If not called, all mutation endpoints use ObserverSupervisor (read-only).
+func (s *Server) SetServiceSupervisor(sup ServiceSupervisor) {
+	s.serviceSupervisor = sup
 }
 
 // SetAgentController wires a live AgentController into the server so the
