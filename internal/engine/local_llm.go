@@ -123,11 +123,22 @@ func probeOpenAICompatModels(ctx context.Context, baseURL string) ([]string, err
 	return out, nil
 }
 
-func buildLocalProvider(target LocalLLMTarget, model string) Provider {
+// localProviderDefaultTimeoutSec is the fallback HTTP client timeout (in
+// seconds) used when no provider config is available or the configured
+// provider's timeout is unset/zero. Sized to cover cold-load of an 8B-class
+// quantized model on Apple Silicon under memory pressure (~110s clean,
+// ~150-180s under load). Operators can override per provider via
+// providers(.local).yaml — see resolveLocalProviderTimeout.
+const localProviderDefaultTimeoutSec = 300
+
+func buildLocalProvider(target LocalLLMTarget, model string, timeoutSec int) Provider {
+	if timeoutSec <= 0 {
+		timeoutSec = localProviderDefaultTimeoutSec
+	}
 	cfg := ProviderConfig{
 		Endpoint: target.BaseURL,
 		Model:    model,
-		Timeout:  120,
+		Timeout:  timeoutSec,
 	}
 	switch target.Backend {
 	case LocalLLMBackendOllama:
@@ -137,6 +148,56 @@ func buildLocalProvider(target LocalLLMTarget, model string) Provider {
 		cfg.MaxTokens = openaiCompatDefaultMaxToks
 		return NewOpenAICompatProvider("agent-local", cfg)
 	}
+}
+
+// resolveLocalProviderTimeout returns the HTTP timeout (in seconds) configured
+// for the local-tier provider, honoring the providers.yaml + providers.local.yaml
+// merge so operators have a single source of truth.
+//
+// Lookup order:
+//
+//   - "ollama" provider entry (preferred — detectLocalLLMTarget probes the
+//     Ollama API shape first)
+//   - any other enabled provider whose Endpoint resolves to a localhost URL
+//   - 0 (caller falls back to localProviderDefaultTimeoutSec)
+//
+// Returns 0 on missing/unreadable config; callers must tolerate that.
+func resolveLocalProviderTimeout(cfg *Config) int {
+	if cfg == nil {
+		return 0
+	}
+	pcfg, err := loadProvidersConfig(cfg)
+	if err != nil {
+		return 0
+	}
+	if pc, ok := pcfg.Providers["ollama"]; ok && pc.IsEnabled() && pc.Timeout > 0 {
+		return pc.Timeout
+	}
+	for _, pc := range pcfg.Providers {
+		if !pc.IsEnabled() || pc.Timeout <= 0 {
+			continue
+		}
+		if isLocalEndpoint(pc.Endpoint) {
+			return pc.Timeout
+		}
+	}
+	return 0
+}
+
+// isLocalEndpoint reports whether an endpoint URL points at a loopback host.
+// Used to find a sensible fallback timeout source when no "ollama" provider
+// entry is configured.
+func isLocalEndpoint(endpoint string) bool {
+	endpoint = strings.ToLower(strings.TrimSpace(endpoint))
+	if endpoint == "" {
+		return false
+	}
+	for _, marker := range []string{"localhost", "127.0.0.1", "::1", "0.0.0.0"} {
+		if strings.Contains(endpoint, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolvePreferredLocalModel(models []string, preferred string) string {
