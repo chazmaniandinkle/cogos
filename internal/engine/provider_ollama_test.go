@@ -752,9 +752,8 @@ func TestBuildOllamaRequestToolsAndToolReplies(t *testing.T) {
 }
 
 // TestStreamSetsToolCallsFinishReason asserts that when the Ollama stream
-// contains tool_call chunks, the final StreamChunk has StopReason="tool_calls".
-// Regression: issue #76 — streaming path omitted finish_reason entirely when
-// tool calls were present, breaking OpenAI-compatible consumers.
+// contains tool_call chunks, the final StreamChunk has StopReason="tool_use",
+// matching the non-streaming Complete path's vocabulary.
 func TestStreamSetsToolCallsFinishReason(t *testing.T) {
 	t.Parallel()
 
@@ -814,14 +813,14 @@ func TestStreamSetsToolCallsFinishReason(t *testing.T) {
 	if !lastChunk.Done {
 		t.Fatal("last chunk should have Done=true")
 	}
-	if lastChunk.StopReason != "tool_calls" {
-		t.Errorf("StopReason = %q; want \"tool_calls\" when tool calls were streamed", lastChunk.StopReason)
+	if lastChunk.StopReason != "tool_use" {
+		t.Errorf("StopReason = %q; want \"tool_use\" when tool calls were streamed", lastChunk.StopReason)
 	}
 }
 
 // TestStreamNoToolCallsFinishReason asserts that when the Ollama stream
 // contains no tool_calls, the final chunk's StopReason is empty (not
-// overridden to "tool_calls").
+// overridden to "tool_use").
 func TestStreamNoToolCallsFinishReason(t *testing.T) {
 	t.Parallel()
 
@@ -863,8 +862,8 @@ func TestStreamNoToolCallsFinishReason(t *testing.T) {
 	if !lastChunk.Done {
 		t.Fatal("last chunk should have Done=true")
 	}
-	if lastChunk.StopReason == "tool_calls" {
-		t.Errorf("StopReason = %q; want non-tool_calls when no tool calls were streamed", lastChunk.StopReason)
+	if lastChunk.StopReason == "tool_use" {
+		t.Errorf("StopReason = %q; want non-tool_use when no tool calls were streamed", lastChunk.StopReason)
 	}
 }
 

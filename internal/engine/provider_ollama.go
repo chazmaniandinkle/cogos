@@ -525,7 +525,7 @@ func (p *OllamaProvider) Stream(ctx context.Context, req *CompletionRequest) (<-
 					Model:    model,
 				}
 				if sawToolCalls {
-					sc.StopReason = "tool_calls"
+					sc.StopReason = "tool_use"
 				}
 			}
 			select {
