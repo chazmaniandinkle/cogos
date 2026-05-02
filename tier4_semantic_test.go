@@ -377,6 +377,12 @@ func TestQueryConstellationWithIris_FallbackToStandard(t *testing.T) {
 	// is equivalent when the constellation DB has the same availability.
 	// We verify that the iris variant produces the same result+error pair as
 	// the standard variant for several inputs.
+	//
+	// irisPressure must be <= 0.05 so the whitespace-compression branch inside
+	// QueryConstellationWithIris's heuristic fallback is skipped.  Using a
+	// non-zero pressure (e.g. 0.5) causes compression to run, producing output
+	// that diverges from QueryConstellation whenever the constellation DB
+	// returns actual content — making the test environment-dependent and flaky.
 	tmpDir := t.TempDir()
 
 	// Reset cached config so LoadTAAConfig picks up defaults (embedding disabled)
@@ -397,7 +403,9 @@ func TestQueryConstellationWithIris_FallbackToStandard(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			irisResult, irisErr := QueryConstellationWithIris(tmpDir, tc.anchor, tc.goal, 5000, 0.5)
+			// irisPressure=0.0: no iris signal, so heuristic fallback skips whitespace
+			// compression (pressure <= 0.05 guard) and the two functions are identical.
+			irisResult, irisErr := QueryConstellationWithIris(tmpDir, tc.anchor, tc.goal, 5000, 0.0)
 			stdResult, stdErr := QueryConstellation(tmpDir, tc.anchor, tc.goal, 5000)
 
 			// Both should produce the same result (either both empty or both with content)
