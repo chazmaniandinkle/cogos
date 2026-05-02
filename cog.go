@@ -5649,6 +5649,11 @@ func main() {
 		}
 	case "bus":
 		code = cmdBus(os.Args[2:])
+	case "skill":
+		if err := cmdSkill(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			code = 1
+		}
 	case "version", "-v", "--version":
 		code = cmdVersion()
 	case "info":
