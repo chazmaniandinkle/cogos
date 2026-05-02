@@ -536,6 +536,13 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 		return NewPiProvider(name, pc, procMgr), nil
 	case "stub":
 		return NewStubProvider(name, "stub response"), nil
+	case mlxSupervisedType:
+		supervisor := ServiceSupervisor(NewLaunchctlController())
+		p, err := newMLXSupervisedProvider(name, pc, supervisor)
+		if err != nil {
+			return nil, fmt.Errorf("mlx-supervised %q: %w", name, err)
+		}
+		return p, nil
 	default:
 		return nil, fmt.Errorf("unknown provider type %q", t)
 	}
