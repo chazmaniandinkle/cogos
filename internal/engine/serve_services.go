@@ -305,6 +305,10 @@ func (s *Server) dispatchMutation(
 		case errors.Is(err, ErrServiceNotFound):
 			// 404: should have been caught above, but guard defensively.
 			httpStatus = http.StatusNotFound
+		case errors.Is(err, ErrLaunchctlTransient):
+			// 503: transient launchd error (launchctl exit 125 / "service failed").
+			// The caller may retry; this is not a permanent failure state.
+			httpStatus = http.StatusServiceUnavailable
 		case errors.Is(err, r.Context().Err()):
 			// Request cancelled.
 			httpStatus = http.StatusBadRequest

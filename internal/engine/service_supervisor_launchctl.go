@@ -119,6 +119,7 @@ func (c *LaunchctlController) Start(ctx context.Context, name string, def Servic
 		// Try the user domain if system domain kickstart failed.
 		kickErr = c.runLaunchctlWithExit(ctx, &exitCode, "kickstart", "-k", "gui/"+currentUID()+"/"+label)
 	}
+	kickErr = wrapTransientErr(kickErr, exitCode)
 
 	st2, statusErr := c.Status(ctx, name, def)
 	if st2 == nil {
@@ -145,7 +146,8 @@ func (c *LaunchctlController) Stop(ctx context.Context, name string, def Service
 	}
 
 	exitCode := 0
-	_ = c.runLaunchctlWithExit(ctx, &exitCode, "stop", label)
+	stopErr := c.runLaunchctlWithExit(ctx, &exitCode, "stop", label)
+	stopErr = wrapTransientErr(stopErr, exitCode)
 
 	st2, _ := c.Status(ctx, name, def)
 	if st2 == nil {
@@ -153,6 +155,9 @@ func (c *LaunchctlController) Stop(ctx context.Context, name string, def Service
 	}
 	st2.Stopping = true
 	st2.LaunchctlExitCode = exitCode
+	if stopErr != nil {
+		return st2, stopErr
+	}
 	return st2, nil
 }
 
@@ -300,6 +305,17 @@ func (c *LaunchctlController) Status(ctx context.Context, name string, def Servi
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
+
+// wrapTransientErr wraps err with ErrLaunchctlTransient when the launchctl
+// exit code is 125 ("service failed" — transient launchd error). This lets
+// dispatchMutation map the error to HTTP 503 per the operational-semantics
+// spec (pinned comment on issue #100).
+func wrapTransientErr(err error, exitCode int) error {
+	if err != nil && exitCode == 125 {
+		return fmt.Errorf("%w: %w", ErrLaunchctlTransient, err)
+	}
+	return err
+}
 
 func (c *LaunchctlController) restartLockFor(name string) *serviceRestartLock {
 	c.mu.Lock()

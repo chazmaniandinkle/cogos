@@ -31,6 +31,11 @@ var ErrNotControllable = errors.New("service is not controllable: kind=observed 
 // manifest. Distinct from ErrNotControllable so callers can map to 404 vs 409.
 var ErrServiceNotFound = errors.New("service not found in manifest")
 
+// ErrLaunchctlTransient is returned when launchctl exits with code 125,
+// indicating a transient launchd error ("service failed"). Maps to HTTP 503.
+// Wrapping with %w preserves the original error message for diagnostics.
+var ErrLaunchctlTransient = errors.New("transient launchd error (launchctl exit 125)")
+
 // ServiceStatus is the live state snapshot returned by ServiceSupervisor.Status.
 // All fields are launchd-authoritative; /health is a bonus signal for Healthy.
 type ServiceStatus struct {

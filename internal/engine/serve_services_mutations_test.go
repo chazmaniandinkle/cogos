@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -514,6 +515,39 @@ func TestServiceMutation_ErrorShape(t *testing.T) {
 	}
 	if resp.Error == "" {
 		t.Errorf("error field empty; want non-empty")
+	}
+	if resp.LaunchctlExitCode != 125 {
+		t.Errorf("launchctl_exit_code=%d; want 125", resp.LaunchctlExitCode)
+	}
+}
+
+// ─── Spec item 4: 503 for transient launchd errors ───────────────────────────
+
+// TestServiceMutation_TransientLaunchd503 verifies that when the supervisor
+// returns an error wrapping ErrLaunchctlTransient (launchctl exit 125),
+// dispatchMutation maps it to HTTP 503 per the operational-semantics spec
+// (pinned comment on issue #100, spec item 4).
+func TestServiceMutation_TransientLaunchd503(t *testing.T) {
+	t.Parallel()
+	stub := newStubSupervisor()
+	// Wrap the sentinel the same way LaunchctlController does: %w chain so that
+	// errors.Is traversal finds ErrLaunchctlTransient.
+	stub.startErr = fmt.Errorf("%w: launchctl kickstart exited 125", ErrLaunchctlTransient)
+	stub.startStatus = &ServiceStatus{
+		Running:           false,
+		LaunchctlExitCode: 125,
+		At:                time.Now().UTC(),
+	}
+	handler := newMutationTestServer(t, testManifest(), stub, true)
+
+	rec := postAction(handler, "kernel", "start")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status=%d; want 503 for ErrLaunchctlTransient", rec.Code)
+	}
+
+	resp := decodeMutationResp(t, rec)
+	if resp.Success {
+		t.Errorf("success=true; want false for transient error")
 	}
 	if resp.LaunchctlExitCode != 125 {
 		t.Errorf("launchctl_exit_code=%d; want 125", resp.LaunchctlExitCode)
