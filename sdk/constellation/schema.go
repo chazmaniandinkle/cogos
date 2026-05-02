@@ -32,7 +32,12 @@ CREATE TABLE IF NOT EXISTS documents (
     -- Embedding vectors (Phase A: context engine)
     embedding_768 BLOB,        -- 768-dim float32 (3072 bytes) — full nomic-embed-text
     embedding_128 BLOB,        -- 128-dim float32 (512 bytes) — Matryoshka compressed
-    embedding_hash TEXT         -- SHA256 of text that was embedded (for staleness check)
+    embedding_hash TEXT,        -- SHA256 of text that was embedded (for staleness check)
+    -- Canonical schema fields (PREREQ-1)
+    ingested TEXT,              -- RFC-3339 machine-set ingestion timestamp
+    salience TEXT,              -- critical | high | medium | low
+    confidence TEXT,            -- foundational | aspirational | empirical (insight/research types)
+    display_number TEXT         -- computed display number (RFC-031 projection)
 );
 
 CREATE INDEX IF NOT EXISTS idx_documents_type ON documents(type);
@@ -79,6 +84,18 @@ CREATE TABLE IF NOT EXISTS backlinks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_backlinks_target ON backlinks(target_id);
+
+-- Migration conflict log (PREREQ-1/CRITICAL-6)
+-- Populated when two documents resolve to the same auto-generated ID.
+-- Human review required to resolve; indexed doc wins (last-write).
+CREATE TABLE IF NOT EXISTS migration_conflicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_path TEXT NOT NULL,
+    existing_path TEXT NOT NULL,
+    detected_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_migration_conflicts_detected ON migration_conflicts(detected_at);
 
 -- FTS5 virtual table for full-text search
 -- Nuclear fix: Remove content='documents' to allow manual tag population

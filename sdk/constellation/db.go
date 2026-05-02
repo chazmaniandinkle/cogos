@@ -89,6 +89,11 @@ func (c *Constellation) runMigrations() error {
 		{"embedding_768", "BLOB"},
 		{"embedding_128", "BLOB"},
 		{"embedding_hash", "TEXT"},
+		// Canonical schema columns (PREREQ-1)
+		{"ingested", "TEXT"},
+		{"salience", "TEXT"},
+		{"confidence", "TEXT"},
+		{"display_number", "TEXT"},
 	}
 
 	for _, col := range substanceColumns {
@@ -108,6 +113,23 @@ func (c *Constellation) runMigrations() error {
 				return fmt.Errorf("failed to add column %s: %w", col.name, err)
 			}
 		}
+	}
+
+	// Migration: create migration_conflicts table if absent (PREREQ-1/CRITICAL-6)
+	if _, err := c.db.Exec(`
+		CREATE TABLE IF NOT EXISTS migration_conflicts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			candidate_path TEXT NOT NULL,
+			existing_path TEXT NOT NULL,
+			detected_at TEXT NOT NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("failed to create migration_conflicts table: %w", err)
+	}
+	if _, err := c.db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_migration_conflicts_detected ON migration_conflicts(detected_at)
+	`); err != nil {
+		return fmt.Errorf("failed to create migration_conflicts index: %w", err)
 	}
 
 	return nil

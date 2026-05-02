@@ -23,6 +23,9 @@ type Cogdoc struct {
 	Updated          string
 	Sector           string
 	Status           string
+	Salience         string
+	Confidence       string
+	Ingested         string
 	Tags             []string
 	Refs             []Reference
 	Content          string
@@ -53,6 +56,15 @@ func (c *Constellation) IndexWorkspace() error {
 	indexed := 0
 	skipped := 0
 	var indexErr error
+
+	// CRITICAL-4: purge stale cog-workspace paths before re-indexing.
+	// These accumulate when the workspace root changes (e.g., cog-workspace → cog).
+	// Log but do not abort if purge fails — stale rows are cosmetic, not blocking.
+	if result, err := tx.Exec("DELETE FROM documents WHERE path LIKE '/Users/slowbro/cog-workspace/%'"); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: stale-path purge failed: %v\n", err)
+	} else if n, _ := result.RowsAffected(); n > 0 {
+		fmt.Printf("Purged %d stale cog-workspace paths\n", n)
+	}
 
 	// Walk .cog directory for cogdocs
 	err = filepath.WalkDir(filepath.Join(c.root, ".cog"), func(path string, d fs.DirEntry, err error) error {
@@ -217,17 +229,36 @@ func (c *Constellation) indexCogdoc(tx *sql.Tx, path string) error {
 		refDensity = float64(refCount) / (float64(contentBytes) / 1024.0) // refs per KB
 	}
 
-	// Insert or replace document
+	// CRITICAL-6: check for ID collision before insert.
+	// If another document at a different path already claims this ID, log it to
+	// migration_conflicts for human review. We still proceed with INSERT OR REPLACE
+	// (last-write wins) so indexing is not blocked, but the collision is recorded.
+	var existingPath string
+	if collErr := tx.QueryRow(
+		"SELECT path FROM documents WHERE id = ? AND path != ?", doc.ID, path,
+	).Scan(&existingPath); collErr == nil {
+		// Collision detected: record in migration_conflicts
+		_, _ = tx.Exec(
+			"INSERT INTO migration_conflicts (candidate_path, existing_path, detected_at) VALUES (?, ?, ?)",
+			path, existingPath, time.Now().Format(time.RFC3339),
+		)
+		fmt.Fprintf(os.Stderr, "Warning: ID collision for %q: %s conflicts with %s\n",
+			doc.ID, path, existingPath)
+	}
+
+	// Insert or replace document (includes new canonical schema columns)
 	_, err = tx.Exec(`
 		INSERT OR REPLACE INTO documents (
 			id, path, type, title, created, updated, sector, status,
 			content, content_hash, word_count, line_count,
 			indexed_at, file_mtime,
-			frontmatter_bytes, content_bytes, substance_ratio, ref_count, ref_density
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			frontmatter_bytes, content_bytes, substance_ratio, ref_count, ref_density,
+			ingested, salience, confidence
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, doc.ID, path, doc.Type, doc.Title, doc.Created, doc.Updated, doc.Sector, doc.Status,
 		doc.Content, contentHash, wordCount, lineCount, time.Now().Format(time.RFC3339), mtime,
-		frontmatterBytes, contentBytes, substanceRatio, refCount, refDensity)
+		frontmatterBytes, contentBytes, substanceRatio, refCount, refDensity,
+		doc.Ingested, doc.Salience, doc.Confidence)
 
 	if err != nil {
 		return fmt.Errorf("failed to insert document: %w", err)
@@ -280,15 +311,28 @@ func parseCogdoc(data []byte, path string) (*Cogdoc, error) {
 
 	// Parse frontmatter
 	var fm struct {
-		ID      string                   `yaml:"id"`
-		Type    string                   `yaml:"type"`
-		Title   string                   `yaml:"title"`
-		Created string                   `yaml:"created"`
-		Updated string                   `yaml:"updated"`
-		Sector  string                   `yaml:"sector"`
-		Status  string                   `yaml:"status"`
-		Tags    []string                 `yaml:"tags"`
-		Refs    []interface{}            `yaml:"refs"`
+		ID           string        `yaml:"id"`
+		Type         string        `yaml:"type"`
+		Title        string        `yaml:"title"`
+		Created      string        `yaml:"created"`
+		Updated      string        `yaml:"updated"`
+		Modified     string        `yaml:"modified"`  // CRITICAL-1: parse-time alias for updated
+		Revised      string        `yaml:"revised"`   // CRITICAL-1: parse-time alias for updated
+		Sector       string        `yaml:"sector"`
+		MemorySector string        `yaml:"memory_sector"` // CRITICAL-1: parse-time alias for sector
+		Status       string        `yaml:"status"`
+		Salience     string        `yaml:"salience"`
+		Confidence   string        `yaml:"confidence"`
+		Ingested     string        `yaml:"ingested"`
+		Tags         []string      `yaml:"tags"`
+		Refs         []interface{} `yaml:"refs"`
+		Authors      []string      `yaml:"authors"`
+		Author       string        `yaml:"author"` // CRITICAL-1: singular alias for authors
+		// CRITICAL-2: nested cog submap for RFC/spec frontmatter (cog.type → type, cog.id → id)
+		Cog struct {
+			Type string `yaml:"type"`
+			ID   string `yaml:"id"`
+		} `yaml:"cog"`
 	}
 
 	// Fix 8: YAML Parsing Robustness
@@ -296,6 +340,53 @@ func parseCogdoc(data []byte, path string) (*Cogdoc, error) {
 	if err := yaml.Unmarshal([]byte(frontmatterYAML), &fm); err != nil {
 		// Enhanced error message with file context
 		return nil, fmt.Errorf("failed to parse frontmatter in %s: %w", filepath.Base(path), err)
+	}
+
+	// CRITICAL-1: resolve memory_sector alias → sector
+	if fm.Sector == "" && fm.MemorySector != "" {
+		fm.Sector = fm.MemorySector
+	}
+
+	// CRITICAL-1: resolve updated field aliases
+	if fm.Updated == "" && fm.Modified != "" {
+		fm.Updated = fm.Modified
+	}
+	if fm.Updated == "" && fm.Revised != "" {
+		fm.Updated = fm.Revised
+	}
+
+	// CRITICAL-2: lift cog submap fields to top-level for nested RFC/spec frontmatter
+	if fm.Type == "" && fm.Cog.Type != "" {
+		fm.Type = fm.Cog.Type
+	}
+	if fm.ID == "" && fm.Cog.ID != "" {
+		fm.ID = fm.Cog.ID
+	}
+
+	// CRITICAL-3: lowercase status at parse time (D-10: no author burden)
+	fm.Status = strings.ToLower(strings.TrimSpace(fm.Status))
+
+	// CRITICAL-5: type-aware status enum validation — emit warning, not error
+	humanStatuses := map[string]bool{
+		"draft": true, "active": true, "canonical": true,
+		"superseded": true, "retired": true, "": true,
+	}
+	machineStatuses := map[string]bool{
+		"raw": true, "enriched": true, "completed": true, "": true,
+	}
+	machineTypes := map[string]bool{
+		"conversation": true, "link": true, "session": true, "working-memory": true,
+	}
+	if machineTypes[fm.Type] {
+		if !machineStatuses[fm.Status] {
+			fmt.Fprintf(os.Stderr, "Warning: %s: machine-type %q doc has non-machine status %q\n",
+				filepath.Base(path), fm.Type, fm.Status)
+		}
+	} else if fm.Type != "" {
+		if !humanStatuses[fm.Status] {
+			fmt.Fprintf(os.Stderr, "Warning: %s: human-type %q doc has non-canonical status %q\n",
+				filepath.Base(path), fm.Type, fm.Status)
+		}
 	}
 
 	// Fix 9: Empty Title Fallback
@@ -357,6 +448,9 @@ func parseCogdoc(data []byte, path string) (*Cogdoc, error) {
 		Updated:          fm.Updated,
 		Sector:           fm.Sector,
 		Status:           fm.Status,
+		Salience:         fm.Salience,
+		Confidence:       fm.Confidence,
+		Ingested:         fm.Ingested,
 		Tags:             fm.Tags,
 		Refs:             refs,
 		Content:          content,
@@ -376,6 +470,9 @@ func resolveURIToID(tx *sql.Tx, uri string) sql.NullString {
 	if !strings.HasPrefix(uri, "cog://") {
 		return sql.NullString{Valid: false}
 	}
+
+	// PREREQ-2: normalize cog://memory/ → cog://mem/ (D-14 canonical prefix)
+	uri = strings.Replace(uri, "cog://memory/", "cog://mem/", 1)
 
 	// Strip cog:// prefix
 	path := strings.TrimPrefix(uri, "cog://")
@@ -426,6 +523,28 @@ func resolveURIToID(tx *sql.Tx, uri string) sql.NullString {
 
 	case "work":
 		// cog://work/councils/xyz/synthesis → .cog/work/councils/xyz/synthesis.cog.md
+		return resolveByPath(tx, filepath.Join(".cog", path)+".cog.md")
+
+	case "rfc":
+		// PREREQ-2: cog://rfc/NNN → .cog/conf/spec/rfc/RFC-NNN-*.cog.md (glob pattern)
+		// cog://rfc/030 → .cog/conf/spec/rfc/RFC-030-*.cog.md
+		// cog://rfc/30 → .cog/conf/spec/rfc/RFC-030-*.cog.md (zero-padded)
+		if len(parts) < 2 {
+			return sql.NullString{Valid: false}
+		}
+		rfcNum := parts[1]
+		// Attempt numeric zero-pad to 3 digits; fall back to literal if not numeric
+		var rfcPrefix string
+		var n int
+		if _, parseErr := fmt.Sscanf(rfcNum, "%d", &n); parseErr == nil {
+			rfcPrefix = fmt.Sprintf("RFC-%03d", n)
+		} else {
+			rfcPrefix = "RFC-" + strings.ToUpper(rfcNum)
+		}
+		return resolveByPattern(tx, ".cog/conf/spec/rfc", rfcPrefix+"-*")
+
+	case "conf":
+		// cog://conf/spec/foo → .cog/conf/spec/foo.cog.md
 		return resolveByPath(tx, filepath.Join(".cog", path)+".cog.md")
 
 	default:
