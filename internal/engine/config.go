@@ -83,13 +83,14 @@ type Config struct {
 	// Set via default_budget in kernel.yaml.
 	DefaultBudget int
 
-	// ExcludeGlobs is a list of path substrings. Any CogDoc whose slash-normalised
-	// path contains one of these substrings is excluded from the foveated context
-	// window for chat requests. Useful to keep large or sensitive path trees
-	// (e.g. /inbox/, /archive/, /vendor/) out of ambient context without
-	// removing the files from the corpus entirely.
-	// Configured via exclude_globs in kernel.yaml.
-	ExcludeGlobs []string
+	// ExcludeSubstrings is a list of path substrings. Any CogDoc whose
+	// slash-normalised path contains one of these substrings is excluded from
+	// the foveated context window for chat requests. Useful to keep large or
+	// sensitive path trees (e.g. /inbox/, /archive/, /vendor/) out of ambient
+	// context without removing the files from the corpus entirely.
+	// Configured via exclude_substrings in kernel.yaml. Substring (not glob)
+	// semantics — implementation uses strings.Contains, not filepath.Match.
+	ExcludeSubstrings []string
 
 	// gatingMu guards the gating knobs above for hot-update via the
 	// /v1/settings/context endpoints.
@@ -151,7 +152,7 @@ type kernelConfigSection struct {
 	MaxFovealDocs         int               `yaml:"max_foveal_docs"`
 	SalienceFloor         *float64          `yaml:"salience_floor"`
 	DefaultBudget         int               `yaml:"default_budget"`
-	ExcludeGlobs          []string          `yaml:"exclude_globs"`
+	ExcludeSubstrings     []string          `yaml:"exclude_substrings"`
 	TRMWeightsPath        string            `yaml:"trm_weights_path"`
 	TRMEmbeddingsPath     string            `yaml:"trm_embeddings_path"`
 	TRMChunksPath         string            `yaml:"trm_chunks_path"`
@@ -259,8 +260,8 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	if s.DefaultBudget != 0 {
 		cfg.DefaultBudget = s.DefaultBudget
 	}
-	if len(s.ExcludeGlobs) > 0 {
-		cfg.ExcludeGlobs = s.ExcludeGlobs
+	if len(s.ExcludeSubstrings) > 0 {
+		cfg.ExcludeSubstrings = s.ExcludeSubstrings
 	}
 	if s.TRMWeightsPath != "" {
 		cfg.TRMWeightsPath = s.TRMWeightsPath
@@ -329,16 +330,17 @@ func (c *Config) EffectiveBudget() int {
 	return DefaultBudget
 }
 
-// ContextExcludeGlobs returns a snapshot of the configured exclude-glob list.
-// The returned slice is safe for the caller to iterate without holding a lock.
-func (c *Config) ContextExcludeGlobs() []string {
+// ContextExcludeSubstrings returns a snapshot of the configured
+// exclude-substring list. The returned slice is safe for the caller to iterate
+// without holding a lock.
+func (c *Config) ContextExcludeSubstrings() []string {
 	c.gatingMu.RLock()
 	defer c.gatingMu.RUnlock()
-	if len(c.ExcludeGlobs) == 0 {
+	if len(c.ExcludeSubstrings) == 0 {
 		return nil
 	}
-	out := make([]string, len(c.ExcludeGlobs))
-	copy(out, c.ExcludeGlobs)
+	out := make([]string, len(c.ExcludeSubstrings))
+	copy(out, c.ExcludeSubstrings)
 	return out
 }
 

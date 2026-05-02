@@ -635,7 +635,7 @@ func TestEvictForBudgetSingletonsPreferHighCombinedScore(t *testing.T) {
 	}
 }
 
-// ── default_budget and exclude_globs (issue #77) ────────────────────────────
+// ── default_budget and exclude_substrings (issue #77) ──────────────────────
 
 // TestEffectiveBudgetFallback verifies that EffectiveBudget() returns the
 // package-level DefaultBudget constant when the config field is zero (not
@@ -687,15 +687,15 @@ func TestExplicitBudgetOverridesDefault(t *testing.T) {
 	}
 }
 
-// TestExcludeGlobsFiltersMatchingPaths verifies that paths matching any entry
-// in cfg.ExcludeGlobs are excluded from the foveated candidate set even when
-// they score above the salience floor.
-func TestExcludeGlobsFiltersMatchingPaths(t *testing.T) {
+// TestExcludeSubstringsFiltersMatchingPaths verifies that paths matching any
+// entry in cfg.ExcludeSubstrings are excluded from the foveated candidate set
+// even when they score above the salience floor.
+func TestExcludeSubstringsFiltersMatchingPaths(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
 	cfg.SalienceFloor = 0 // floor off so exclusion is the only filter
-	cfg.ExcludeGlobs = []string{"/sensitive/"}
+	cfg.ExcludeSubstrings = []string{"/sensitive/"}
 	p := NewProcess(cfg, makeNucleus("T", "r"))
 
 	memDir := filepath.Join(root, ".cog", "mem")
@@ -727,18 +727,18 @@ func TestExcludeGlobsFiltersMatchingPaths(t *testing.T) {
 
 	for _, doc := range pkg.FovealDocs {
 		if strings.Contains(filepath.ToSlash(doc.Path), "/sensitive/") {
-			t.Errorf("excluded glob path leaked into foveal context: %s", doc.Path)
+			t.Errorf("excluded substring path leaked into foveal context: %s", doc.Path)
 		}
 	}
 }
 
-// TestPathMatchesExcludeGlobs exercises the helper directly with edge cases.
-func TestPathMatchesExcludeGlobs(t *testing.T) {
+// TestPathMatchesExcludeSubstrings exercises the helper directly with edge cases.
+func TestPathMatchesExcludeSubstrings(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		path   string
-		globs  []string
-		expect bool
+		path       string
+		substrings []string
+		expect     bool
 	}{
 		{"/workspace/.cog/mem/inbox/foo.cog.md", []string{"/inbox/"}, true},
 		{"/workspace/.cog/mem/semantic/foo.cog.md", []string{"/inbox/"}, false},
@@ -747,32 +747,33 @@ func TestPathMatchesExcludeGlobs(t *testing.T) {
 		{"/workspace/.cog/mem/semantic/foo.cog.md", []string{""}, false}, // empty entry ignored
 	}
 	for _, tc := range cases {
-		got := pathMatchesExcludeGlobs(tc.path, tc.globs)
+		got := pathMatchesExcludeSubstrings(tc.path, tc.substrings)
 		if got != tc.expect {
-			t.Errorf("pathMatchesExcludeGlobs(%q, %v) = %v; want %v", tc.path, tc.globs, got, tc.expect)
+			t.Errorf("pathMatchesExcludeSubstrings(%q, %v) = %v; want %v", tc.path, tc.substrings, got, tc.expect)
 		}
 	}
 }
 
-// TestContextExcludeGlobsSnapshot verifies that ContextExcludeGlobs returns a
-// copy of the configured slice (not the live pointer) and handles nil safely.
-func TestContextExcludeGlobsSnapshot(t *testing.T) {
+// TestContextExcludeSubstringsSnapshot verifies that ContextExcludeSubstrings
+// returns a copy of the configured slice (not the live pointer) and handles
+// nil safely.
+func TestContextExcludeSubstringsSnapshot(t *testing.T) {
 	t.Parallel()
 	cfg := &Config{}
-	if globs := cfg.ContextExcludeGlobs(); globs != nil {
-		t.Errorf("empty config: ContextExcludeGlobs = %v; want nil", globs)
+	if subs := cfg.ContextExcludeSubstrings(); subs != nil {
+		t.Errorf("empty config: ContextExcludeSubstrings = %v; want nil", subs)
 	}
 
-	cfg.ExcludeGlobs = []string{"/inbox/", "/sensitive/"}
-	got := cfg.ContextExcludeGlobs()
+	cfg.ExcludeSubstrings = []string{"/inbox/", "/sensitive/"}
+	got := cfg.ContextExcludeSubstrings()
 	if len(got) != 2 || got[0] != "/inbox/" || got[1] != "/sensitive/" {
-		t.Errorf("ContextExcludeGlobs = %v; want [/inbox/ /sensitive/]", got)
+		t.Errorf("ContextExcludeSubstrings = %v; want [/inbox/ /sensitive/]", got)
 	}
 
 	// Mutation of the returned slice must not affect the config.
 	got[0] = "/mutated/"
-	if cfg.ExcludeGlobs[0] != "/inbox/" {
-		t.Error("ContextExcludeGlobs returned live slice instead of copy")
+	if cfg.ExcludeSubstrings[0] != "/inbox/" {
+		t.Error("ContextExcludeSubstrings returned live slice instead of copy")
 	}
 }
 
