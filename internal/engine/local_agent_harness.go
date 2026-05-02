@@ -141,6 +141,12 @@ type LocalHarnessController struct {
 	started  time.Time
 	interval time.Duration
 
+	// localProviderTimeout is the HTTP timeout (seconds) applied to providers
+	// constructed by buildLocalProvider for this controller's dispatches.
+	// Resolved once at construction time from providers(.local).yaml; 0 means
+	// "fall back to localProviderDefaultTimeoutSec".
+	localProviderTimeout int
+
 	// autonomicCfg holds escalation-predicate tunables. Safe to read from
 	// multiple goroutines — written once before Start().
 	autonomicCfg AutonomicConfig
@@ -209,15 +215,16 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 	}
 
 	return &LocalHarnessController{
-		cfg:             cfg,
-		nucleus:         nucleus,
-		process:         process,
-		toolRegistry:    registry,
-		dispatchTools:   dispatchTools,
-		backgroundTools: dispatchTools,
-		agentID:         DefaultAgentID,
-		started:         time.Now().UTC(),
-		interval:        interval,
+		cfg:                  cfg,
+		nucleus:              nucleus,
+		process:              process,
+		toolRegistry:         registry,
+		dispatchTools:        dispatchTools,
+		backgroundTools:      dispatchTools,
+		agentID:              DefaultAgentID,
+		started:              time.Now().UTC(),
+		interval:             interval,
+		localProviderTimeout: resolveLocalProviderTimeout(cfg),
 	}, nil
 }
 
@@ -409,7 +416,7 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 	}
 	outcome.record.Model = model
 
-	provider := buildLocalProvider(target, model)
+	provider := buildLocalProvider(target, model, c.localProviderTimeout)
 	assessment, err := c.assessCycle(ctx, provider, outcome.record.Observation)
 	if err != nil {
 		outcome.record.Action = "error"
@@ -816,7 +823,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		}
 	}
 
-	provider := buildLocalProvider(target, model)
+	provider := buildLocalProvider(target, model, c.localProviderTimeout)
 	batch := &DispatchBatchResult{
 		Results: make([]DispatchResult, req.N),
 	}
