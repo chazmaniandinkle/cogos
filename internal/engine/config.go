@@ -118,6 +118,12 @@ type Config struct {
 	// Providers that advertise CapToolUse are trusted and skip this guardrail.
 	ToolCallValidationEnabled bool
 
+	// EnableSkillExec gates the POST /v1/skills/{name}/exec HTTP endpoint.
+	// Default false: any local process on the same host could otherwise plant
+	// a workspace skill and trigger code execution via loopback. The CLI
+	// (`cog skill exec`) is unaffected — it runs in the user's own session.
+	EnableSkillExec bool
+
 	// DigestPaths maps stream tailer adapter names to JSONL file/directory paths.
 	// Empty map means external digestion is disabled.
 	DigestPaths map[string]string
@@ -159,6 +165,7 @@ type kernelConfigSection struct {
 	OllamaEmbedEndpoint   string            `yaml:"ollama_embed_endpoint"`
 	OllamaEmbedModel      string            `yaml:"ollama_embed_model"`
 	ToolCallValidation    *bool             `yaml:"tool_call_validation_enabled"`
+	EnableSkillExec       *bool             `yaml:"enable_skill_exec"`
 	LocalModel            string            `yaml:"local_model"`
 	DigestPaths           map[string]string `yaml:"digest_paths"`
 	KernelLogPath         string            `yaml:"kernel_log_path"`
@@ -280,6 +287,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	}
 	if s.ToolCallValidation != nil {
 		cfg.ToolCallValidationEnabled = *s.ToolCallValidation
+	}
+	if s.EnableSkillExec != nil {
+		cfg.EnableSkillExec = *s.EnableSkillExec
 	}
 	if s.LocalModel != "" {
 		cfg.LocalModel = s.LocalModel

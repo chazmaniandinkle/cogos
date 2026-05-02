@@ -261,6 +261,11 @@ func (s *Server) handleSkillList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSkillExec(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil || !s.cfg.EnableSkillExec {
+		http.Error(w, `{"error":"disabled","detail":"skill exec via HTTP is disabled; set enable_skill_exec: true in kernel.yaml"}`, http.StatusForbidden)
+		return
+	}
+
 	name := r.PathValue("name")
 
 	skill, err := s.findSkill(name)
