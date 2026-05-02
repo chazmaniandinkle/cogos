@@ -288,7 +288,7 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 	}
 
 	var tools []ollamaTool
-	if len(req.Tools) > 0 {
+	if len(req.Tools) > 0 && req.ToolChoice != "none" {
 		tools = make([]ollamaTool, 0, len(req.Tools))
 		for _, t := range req.Tools {
 			tools = append(tools, ollamaTool{
