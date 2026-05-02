@@ -218,6 +218,18 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 		frame.Blocks = append(frame.Blocks, *blk)
 	}
 
+	// Tier 2, stability 50: Peer-session awareness.
+	// Closes the awareness loop for non-hook consumers (harness dispatches,
+	// bus-native agents, mod3 sessions). Reuses the same render path as
+	// GET /v1/peer-awareness and emits the anti-echo beacon on
+	// bus_peer_awareness. Collapsed to one line when no peers are active.
+	if req.SessionID != "" {
+		peerDeps := NewPeerAwarenessDepsFromServer(s)
+		if blk := buildPeersBlock(req.SessionID, peerDeps, DefaultPeerBlockBudget); blk != nil {
+			frame.Blocks = append(frame.Blocks, *blk)
+		}
+	}
+
 	// Tier 2, stability 40: Attentional field top-10
 	if blk := buildFieldBlock(s.process, s.cfg.WorkspaceRoot); blk != nil {
 		frame.Blocks = append(frame.Blocks, *blk)
