@@ -575,6 +575,134 @@ func TestOllamaCapabilitiesUseKnownModelProfile(t *testing.T) {
 	}
 }
 
+// ── decodeOllamaToolArguments ─────────────────────────────────────────────────
+
+func TestDecodeOllamaToolArguments(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		input   string
+		wantMap map[string]interface{} // non-nil means we expect a map with these keys/values
+		wantStr string                 // non-empty means we expect a raw string back
+	}{
+		{
+			name:    "object input",
+			input:   `{"query":"hello","limit":5}`,
+			wantMap: map[string]interface{}{"query": "hello", "limit": json.Number("5")},
+		},
+		{
+			name:    "string input wrapping JSON object",
+			input:   `"{\"query\":\"hello\",\"limit\":5}"`,
+			wantMap: map[string]interface{}{"query": "hello", "limit": json.Number("5")},
+		},
+		{
+			name:    "empty string",
+			input:   "",
+			wantMap: map[string]interface{}{},
+		},
+		{
+			name:    "whitespace only",
+			input:   "   ",
+			wantMap: map[string]interface{}{},
+		},
+		{
+			name:    "null literal",
+			input:   "null",
+			wantMap: nil, // null decodes to nil interface; encodeOllamaToolArguments must handle it
+		},
+		{
+			name:    "malformed JSON",
+			input:   `{not valid json`,
+			wantStr: `{not valid json`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := decodeOllamaToolArguments(tc.input)
+
+			if tc.wantStr != "" {
+				s, ok := got.(string)
+				if !ok {
+					t.Fatalf("expected string result, got %T: %v", got, got)
+				}
+				if s != tc.wantStr {
+					t.Errorf("got %q; want %q", s, tc.wantStr)
+				}
+				return
+			}
+
+			if tc.wantMap == nil {
+				// null input — result should be nil or an empty/null interface
+				// encodeOllamaToolArguments should still produce valid JSON
+				encoded := encodeOllamaToolArguments(got)
+				if encoded != "null" && encoded != "{}" {
+					t.Errorf("encodeOllamaToolArguments(nil) = %q; want null or {}", encoded)
+				}
+				return
+			}
+
+			gotMap, ok := got.(map[string]interface{})
+			if !ok {
+				t.Fatalf("expected map[string]interface{}, got %T: %v", got, got)
+			}
+			for k, wantV := range tc.wantMap {
+				gotV, exists := gotMap[k]
+				if !exists {
+					t.Errorf("key %q missing from decoded map", k)
+					continue
+				}
+				if fmt.Sprintf("%v", gotV) != fmt.Sprintf("%v", wantV) {
+					t.Errorf("key %q: got %v (%T); want %v (%T)", k, gotV, gotV, wantV, wantV)
+				}
+			}
+			// Also verify round-trip through encodeOllamaToolArguments produces valid JSON.
+			encoded := encodeOllamaToolArguments(got)
+			var roundtrip map[string]interface{}
+			if err := json.Unmarshal([]byte(encoded), &roundtrip); err != nil {
+				t.Errorf("encodeOllamaToolArguments round-trip not valid JSON: %v (got %q)", err, encoded)
+			}
+		})
+	}
+}
+
+// TestEncodeOllamaToolArgumentsNil verifies nil input produces "{}".
+func TestEncodeOllamaToolArgumentsNil(t *testing.T) {
+	t.Parallel()
+	got := encodeOllamaToolArguments(nil)
+	if got != "{}" {
+		t.Errorf("encodeOllamaToolArguments(nil) = %q; want {}", got)
+	}
+}
+
+// TestDecodeEncodeRoundTrip verifies that the string-wrapped shape commonly
+// produced by Ollama (e.g. llama3.1, qwen2.5 tool calls) normalizes to the
+// same object shape as a direct JSON object input.
+func TestDecodeEncodeRoundTrip(t *testing.T) {
+	t.Parallel()
+	objectInput := `{"query":"test","n":3}`
+	// Simulate Ollama wrapping the JSON object in a string.
+	stringInput := `"{\"query\":\"test\",\"n\":3}"`
+
+	decodedObj := decodeOllamaToolArguments(objectInput)
+	decodedStr := decodeOllamaToolArguments(stringInput)
+
+	encodedObj := encodeOllamaToolArguments(decodedObj)
+	encodedStr := encodeOllamaToolArguments(decodedStr)
+
+	var mapObj, mapStr map[string]interface{}
+	if err := json.Unmarshal([]byte(encodedObj), &mapObj); err != nil {
+		t.Fatalf("encodedObj not valid JSON: %v", err)
+	}
+	if err := json.Unmarshal([]byte(encodedStr), &mapStr); err != nil {
+		t.Fatalf("encodedStr not valid JSON: %v", err)
+	}
+	if fmt.Sprintf("%v", mapObj) != fmt.Sprintf("%v", mapStr) {
+		t.Errorf("object path and string path produce different results:\n  obj: %v\n  str: %v", mapObj, mapStr)
+	}
+}
+
 func containsCapability(caps []Capability, want Capability) bool {
 	for _, cap := range caps {
 		if cap == want {
