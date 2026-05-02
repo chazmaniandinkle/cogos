@@ -458,9 +458,14 @@ const (
 //
 // Replay query params:
 //
-//	no_replay=1  skip historical events (only live from this point forward)
-//	consumer_id  optional identity for dedup (replaces any prior connection
-//	             with the same ID)
+//	no_replay=1   skip historical events (only live from this point forward)
+//	since=<N>     replay only events with seq > N; mutually exclusive with no_replay=1
+//	consumer_id   optional identity for dedup (replaces any prior connection
+//	              with the same ID)
+//
+// since=<N> edge cases:
+//   - N == current highest seq: replay is skipped, stream proceeds live
+//   - N > current highest seq: 416 Range Not Satisfiable (before SSE upgrade)
 //
 // The stream runs until the client disconnects or the server shuts down.
 // There is no max_duration cap on bus streams — they are intended for
@@ -478,13 +483,44 @@ func (s *Server) handleBusStream(w http.ResponseWriter, r *http.Request, busID s
 		return
 	}
 
+	q := r.URL.Query()
+	noReplay := q.Get("no_replay") == "1"
+	sinceRaw := q.Get("since")
+	consumerID := q.Get("consumer_id")
+
+	// since and no_replay are mutually exclusive.
+	if sinceRaw != "" && noReplay {
+		http.Error(w, `{"error":"since and no_replay are mutually exclusive"}`, http.StatusBadRequest)
+		return
+	}
+
+	var sinceSeq int
+	hasSince := sinceRaw != ""
+	if hasSince {
+		n, err := strconv.Atoi(sinceRaw)
+		if err != nil || n < 0 {
+			http.Error(w, `{"error":"since must be a non-negative integer"}`, http.StatusBadRequest)
+			return
+		}
+		sinceSeq = n
+	}
+
+	// Validate since range before upgrading to SSE — must not exceed current tip.
+	if hasSince && s.busSessions != nil {
+		events, err := s.busSessions.ReadEvents(busID)
+		if err == nil && len(events) > 0 {
+			maxSeq := events[len(events)-1].Seq
+			if sinceSeq > maxSeq {
+				http.Error(w, `{"error":"since exceeds current tip","code":"range_not_satisfiable"}`, http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Connection", "keep-alive")
-
-	noReplay := r.URL.Query().Get("no_replay") == "1"
-	consumerID := r.URL.Query().Get("consumer_id")
 
 	rc := http.NewResponseController(w)
 
@@ -504,13 +540,25 @@ func (s *Server) handleBusStream(w http.ResponseWriter, r *http.Request, busID s
 		busID, time.Now().UTC().Format(time.RFC3339))
 	flusher.Flush()
 
-	// Replay historical events from disk so the subscriber sees the full
-	// tail on connect (mirrors cog bus tail behaviour). Skip if no_replay=1.
+	// Replay historical events from disk. Behaviour depends on query params:
+	//   default       replay all events
+	//   no_replay=1   skip replay
+	//   since=N       replay only events with seq > N
 	if !noReplay && s.busSessions != nil {
 		events, err := s.busSessions.ReadEvents(busID)
 		if err == nil {
-			for i := range events {
-				evt := &events[i]
+			var replayEvents []BusBlock
+			if hasSince {
+				for _, e := range events {
+					if e.Seq > sinceSeq {
+						replayEvents = append(replayEvents, e)
+					}
+				}
+			} else {
+				replayEvents = events
+			}
+			for i := range replayEvents {
+				evt := &replayEvents[i]
 				env := busSSEEnvelope{
 					ID:        "replay_" + evt.Hash,
 					Type:      evt.Type,
@@ -525,7 +573,7 @@ func (s *Server) handleBusStream(w http.ResponseWriter, r *http.Request, busID s
 				fmt.Fprintf(w, "data: %s\n\n", b)
 				broker.TouchWrite(busID, ch)
 			}
-			if len(events) > 0 {
+			if len(replayEvents) > 0 {
 				flusher.Flush()
 			}
 		}
