@@ -128,6 +128,13 @@ type agentChatRequest struct {
 	Think    bool                   `json:"think"`             // explicit thinking control
 	Format   string                 `json:"format,omitempty"`  // "json" for structured output
 	Options  map[string]interface{} `json:"options,omitempty"` // Ollama model options (num_ctx, temperature, etc.)
+	// KeepAlive controls how long Ollama keeps the model resident after the
+	// request completes. -1 keeps the model loaded indefinitely, 0 unloads
+	// immediately. Set to -1 by callers so dispatch cycles spaced past
+	// Ollama's 5-minute default keep-alive don't pay cold-start. Dropped
+	// on the OpenAI-compat path (chatCompletionOpenAI translates to its
+	// own struct that does not forward this field).
+	KeepAlive any `json:"keep_alive,omitempty"`
 }
 
 // agentChatMessage is a single message in the conversation.
@@ -249,12 +256,13 @@ func (h *AgentHarness) Assess(ctx context.Context, systemPrompt, observation str
 	}
 
 	req := agentChatRequest{
-		Model:    h.model,
-		Messages: messages,
-		Stream:   false,
-		Think:    false, // disable thinking — we want clean JSON output
-		Format:   "json",
-		Options:  map[string]interface{}{"num_ctx": 8192}, // 8K context is plenty for assessment
+		Model:     h.model,
+		Messages:  messages,
+		Stream:    false,
+		Think:     false, // disable thinking — we want clean JSON output
+		Format:    "json",
+		Options:   map[string]interface{}{"num_ctx": 8192}, // 8K context is plenty for assessment
+		KeepAlive: -1,                                      // pin model in VRAM between cycles
 	}
 
 	resp, err := h.chatCompletion(ctx, req)
@@ -292,12 +300,13 @@ func (h *AgentHarness) Execute(ctx context.Context, systemPrompt, task string) (
 
 	for turn := 0; turn < h.maxTurns; turn++ {
 		req := agentChatRequest{
-			Model:    h.model,
-			Messages: messages,
-			Tools:    h.tools,
-			Stream:   false,
-			Think:    false,                                   // disable thinking for tool loop
-			Options:  map[string]interface{}{"num_ctx": 8192}, // 8K context for tool loop
+			Model:     h.model,
+			Messages:  messages,
+			Tools:     h.tools,
+			Stream:    false,
+			Think:     false,                                   // disable thinking for tool loop
+			Options:   map[string]interface{}{"num_ctx": 8192}, // 8K context for tool loop
+			KeepAlive: -1,                                      // pin model in VRAM between turns
 		}
 
 		resp, err := h.chatCompletion(ctx, req)
@@ -572,12 +581,13 @@ func (h *AgentHarness) ExecuteScoped(ctx context.Context, task string, opts Exec
 
 	for turn := 0; turn < maxTurns; turn++ {
 		req := agentChatRequest{
-			Model:    model,
-			Messages: messages,
-			Tools:    allowedDefs,
-			Stream:   false,
-			Think:    think,
-			Options:  map[string]interface{}{"num_ctx": 8192},
+			Model:     model,
+			Messages:  messages,
+			Tools:     allowedDefs,
+			Stream:    false,
+			Think:     think,
+			Options:   map[string]interface{}{"num_ctx": 8192},
+			KeepAlive: -1, // pin model in VRAM across dispatch turns
 		}
 
 		resp, err := h.chatCompletionTo(ctx, backendURL, backendKind, req)

@@ -202,6 +202,12 @@ type ollamaChatRequest struct {
 	Stream   bool            `json:"stream"`
 	Think    bool            `json:"think"` // false = disable thinking mode (qwen3)
 	Options  map[string]any  `json:"options,omitempty"`
+	// KeepAlive controls how long Ollama keeps the model resident after the
+	// request completes. Accepts a Go duration string ("5m", "1h") or a
+	// number of seconds; -1 keeps the model loaded indefinitely, 0 unloads
+	// immediately. Defaulted to -1 in buildOllamaRequest so cycles spaced
+	// past Ollama's 5-minute default keep-alive don't pay cold-start.
+	KeepAlive any `json:"keep_alive,omitempty"`
 }
 
 type ollamaChatResponse struct {
@@ -276,12 +282,13 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 	}
 
 	return &ollamaChatRequest{
-		Model:    model,
-		Messages: msgs,
-		Tools:    tools,
-		Stream:   stream,
-		Think:    false, // prevent silent token burn in qwen3 thinking mode
-		Options:  opts,
+		Model:     model,
+		Messages:  msgs,
+		Tools:     tools,
+		Stream:    stream,
+		Think:     false, // prevent silent token burn in qwen3 thinking mode
+		Options:   opts,
+		KeepAlive: -1, // pin model in VRAM; Ollama's 5m default evicts between cycles
 	}
 }
 
