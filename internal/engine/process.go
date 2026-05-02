@@ -765,6 +765,11 @@ func (p *Process) NodeHealth() *NodeHealth {
 	return p.nodeHealth
 }
 
+// NodeManifest returns the parsed node manifest (nil if not loaded).
+func (p *Process) NodeManifest() *NodeManifest {
+	return p.nodeManifest
+}
+
 // emitHeartbeat fires during the dormant state.
 func (p *Process) emitHeartbeat() {
 	// Only emit heartbeat if not already in an active state.

@@ -185,6 +185,10 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// ambient-awareness loop; Phase 1A populates channel.<sid>.activity).
 	s.registerPeerAwarenessRoutes(mux)
 
+	// Read-only services API: GET /v1/services and GET /v1/services/{name}.
+	// Phase 2 will add mutations (start/stop/restart).
+	s.registerServiceRoutes(mux)
+
 	// Replay bus_sessions + bus_handoffs into the in-memory registries so
 	// the kernel starts with an accurate derived view. Bus is authoritative
 	// either way; this just warms the read path.

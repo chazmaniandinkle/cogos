@@ -123,6 +123,7 @@ func classifyHTTPFamily(path string) string {
 		{"/v1/constellation", "attention"},
 		{"/v1/observer", "attention"},
 		{"/v1/lightcone", "attention"},
+		{"/v1/services", "services"},
 		{"/v1/card", "compat"},
 		{"/v1/providers", "compat"},
 		{"/v1/taa", "compat"},
