@@ -1,4 +1,8 @@
-// cmd_skill_test.go — Tests for `cog skill list` and `cog skill exec` (issues #96, #97).
+// cmd_skill_test.go — Smoke tests for the `cog skill` CLI wrappers.
+//
+// The heavy lifting (discovery, tier classification, exec) is tested in
+// pkg/skills/skills_test.go. These tests verify that the CLI-level wrappers
+// (DiscoverSkills, FindSkill, execSkill) wire through correctly.
 
 package main
 
@@ -9,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/cogos-dev/cogos/pkg/skills"
 )
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────────
@@ -44,14 +50,14 @@ func makeExecScript(t *testing.T, dir, relPath, body string) string {
 	return full
 }
 
-// ─── loadSkillRecord ────────────────────────────────────────────────────────────
+// ─── skills.LoadRecord (via pkg/skills) ─────────────────────────────────────
 
 func TestLoadSkillRecord_Tier0_PraseOnly(t *testing.T) {
 	root := t.TempDir()
 	md := "# My Prose Skill\n\nThis skill only has documentation.\n"
 	dir := makeSkillDir(t, root, "prose-skill", md)
 
-	rec, err := loadSkillRecord("prose-skill", dir)
+	rec, err := skills.LoadRecord("prose-skill", dir)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -83,7 +89,7 @@ func TestLoadSkillRecord_Tier1_Scripts(t *testing.T) {
 		t.Fatalf("write helper.sh: %v", err)
 	}
 
-	rec, err := loadSkillRecord("helper-skill", dir)
+	rec, err := skills.LoadRecord("helper-skill", dir)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -102,7 +108,7 @@ func TestLoadSkillRecord_Tier2_WithBin(t *testing.T) {
 	dir := makeSkillDir(t, root, "exec-skill", md)
 	makeExecScript(t, dir, "bin/run", "#!/bin/sh\necho hello\n")
 
-	rec, err := loadSkillRecord("exec-skill", dir)
+	rec, err := skills.LoadRecord("exec-skill", dir)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -133,7 +139,7 @@ func TestLoadSkillRecord_Tier3_WithSchema(t *testing.T) {
 	dir := makeSkillDir(t, root, "typed-skill", md)
 	makeExecScript(t, dir, "bin/typed", "#!/bin/sh\necho '{}'\n")
 
-	rec, err := loadSkillRecord("typed-skill", dir)
+	rec, err := skills.LoadRecord("typed-skill", dir)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -146,7 +152,7 @@ func TestLoadSkillRecord_Tier3_WithSchema(t *testing.T) {
 	}
 }
 
-// ─── DiscoverSkills ─────────────────────────────────────────────────────────────
+// ─── DiscoverSkills ─────────────────────────────────────────────────────────
 
 func TestDiscoverSkills_Empty(t *testing.T) {
 	// Override skillDirs to point at a temp directory with no skills.
@@ -156,12 +162,12 @@ func TestDiscoverSkills_Empty(t *testing.T) {
 	defer os.Setenv("HOME", origHome)
 
 	// No workspace — ResolveWorkspace will fail, but DiscoverSkills handles that.
-	skills, err := DiscoverSkills()
+	skillList, err := DiscoverSkills()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(skills) != 0 {
-		t.Errorf("want 0 skills in empty dir, got %d", len(skills))
+	if len(skillList) != 0 {
+		t.Errorf("want 0 skills in empty dir, got %d", len(skillList))
 	}
 }
 
@@ -177,17 +183,17 @@ func TestDiscoverSkills_MultipleSkills(t *testing.T) {
 	os.Setenv("HOME", tmpHome)
 	defer os.Setenv("HOME", origHome)
 
-	skills, err := DiscoverSkills()
+	skillList, err := DiscoverSkills()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(skills) != 2 {
-		t.Fatalf("want 2 skills, got %d", len(skills))
+	if len(skillList) != 2 {
+		t.Fatalf("want 2 skills, got %d", len(skillList))
 	}
 
 	byName := make(map[string]SkillRecord)
-	for _, s := range skills {
+	for _, s := range skillList {
 		byName[s.Name] = s
 	}
 
@@ -199,7 +205,7 @@ func TestDiscoverSkills_MultipleSkills(t *testing.T) {
 	}
 }
 
-// ─── JSON output shape ──────────────────────────────────────────────────────────
+// ─── JSON output shape ──────────────────────────────────────────────────────
 
 func TestSkillRecord_JSONShape(t *testing.T) {
 	// Verify the JSON output has the contract fields the issue requires.
@@ -235,12 +241,12 @@ func TestSkillRecord_JSONShape(t *testing.T) {
 	}
 }
 
-// ─── execSkill ──────────────────────────────────────────────────────────────────
+// ─── execSkill (CLI wrapper) ─────────────────────────────────────────────────
 
 func TestExecSkill_Tier0_Rejected(t *testing.T) {
 	root := t.TempDir()
 	dir := makeSkillDir(t, root, "prose", "# Prose skill\n")
-	skill, err := loadSkillRecord("prose", dir)
+	skill, err := skills.LoadRecord("prose", dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -260,7 +266,7 @@ func TestExecSkill_Tier1_Rejected(t *testing.T) {
 	// Add a .sh to make it tier-1
 	os.WriteFile(filepath.Join(dir, "helper.sh"), []byte("#!/bin/sh\necho hi\n"), 0755)
 
-	skill, err := loadSkillRecord("scripts", dir)
+	skill, err := skills.LoadRecord("scripts", dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -283,7 +289,7 @@ func TestExecSkill_Tier2_Success(t *testing.T) {
 	dir := makeSkillDir(t, root, "greet", md)
 	makeExecScript(t, dir, "bin/greet", "#!/bin/sh\necho 'hello from skill'\n")
 
-	skill, err := loadSkillRecord("greet", dir)
+	skill, err := skills.LoadRecord("greet", dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -313,7 +319,7 @@ func TestExecSkill_NonZeroExit(t *testing.T) {
 	dir := makeSkillDir(t, root, "fail-skill", md)
 	makeExecScript(t, dir, "bin/fail", "#!/bin/sh\necho 'some error' >&2\nexit 42\n")
 
-	skill, err := loadSkillRecord("fail-skill", dir)
+	skill, err := skills.LoadRecord("fail-skill", dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -340,7 +346,7 @@ func TestExecSkill_Timeout(t *testing.T) {
 	dir := makeSkillDir(t, root, "slow-skill", md)
 	makeExecScript(t, dir, "bin/slow", "#!/bin/sh\nsleep 10\n")
 
-	skill, err := loadSkillRecord("slow-skill", dir)
+	skill, err := skills.LoadRecord("slow-skill", dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -368,7 +374,7 @@ func TestExecSkill_StdinInput(t *testing.T) {
 	// Script reads stdin and echoes it
 	makeExecScript(t, dir, "bin/echo-in", "#!/bin/sh\ncat\n")
 
-	skill, err := loadSkillRecord("echo-skill", dir)
+	skill, err := skills.LoadRecord("echo-skill", dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
