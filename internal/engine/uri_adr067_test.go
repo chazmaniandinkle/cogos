@@ -116,13 +116,26 @@ func TestResolveURI_NonDigestQueryAllowed(t *testing.T) {
 
 // ── 3. Round-trip equivalence ─────────────────────────────────────────────────
 
+// TestPathToURI_RoundTrip verifies parse → emit → parse round-trip equivalence
+// for projection URIs (ADR-067).
+//
+// The claim in this file's header ("parse → emit → parse gives identical
+// resolution") requires calling ResolveURI on the emitted URI and comparing
+// the resolved path back to the original absolute path.  The previous
+// implementation called PathToURI twice without ever calling ResolveURI,
+// making it a path-only stability test rather than a genuine round-trip.
+//
+// Covers both local projection form (cog:projection/path) and confirms
+// bare-form URIs resolve to the expected filesystem paths.
 func TestPathToURI_RoundTrip(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 
-	// Set up a minimal workspace structure so round-trip resolves correctly.
+	// Set up a minimal workspace structure so ResolveURI can construct paths.
+	// "direct" and "singleton" projections do not require files to exist; they
+	// compute the path deterministically.
 	for _, dir := range []string{
-		".cog/mem/semantic",
+		".cog/mem/semantic/insights",
 		".cog/config",
 		".cog/ontology",
 		".cog/docs",
@@ -133,33 +146,39 @@ func TestPathToURI_RoundTrip(t *testing.T) {
 	}
 
 	cases := []struct {
+		name    string
 		absPath string
 		wantURI string
 	}{
 		{
-			filepath.Join(root, ".cog/mem/semantic/insights/foo.cog.md"),
-			"cog:mem/semantic/insights/foo.cog.md",
+			name:    "mem bare form",
+			absPath: filepath.Join(root, ".cog/mem/semantic/insights/foo.cog.md"),
+			wantURI: "cog:mem/semantic/insights/foo.cog.md",
 		},
 		{
-			filepath.Join(root, ".cog/config/kernel.yaml"),
-			"cog:conf/kernel.yaml",
+			name:    "conf bare form",
+			absPath: filepath.Join(root, ".cog/config/kernel.yaml"),
+			wantURI: "cog:conf/kernel.yaml",
 		},
 		{
-			filepath.Join(root, ".cog/ontology/crystal.cog.md"),
-			"cog:ontology/crystal",
+			// ontology strips .cog.md from the URI; ResolveURI re-adds it.
+			name:    "ontology extension-stripped",
+			absPath: filepath.Join(root, ".cog/ontology/crystal.cog.md"),
+			wantURI: "cog:ontology/crystal",
 		},
 		{
-			filepath.Join(root, ".cog/docs/framework-status.md"),
-			"cog:docs/framework-status.md",
+			name:    "docs bare form",
+			absPath: filepath.Join(root, ".cog/docs/framework-status.md"),
+			wantURI: "cog:docs/framework-status.md",
 		},
 	}
 
 	for _, tc := range cases {
 		tc := tc
-		t.Run(tc.wantURI, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			// Step 1: path → URI
+			// Step 1: path → URI (emit).
 			uri, err := PathToURI(root, tc.absPath)
 			if err != nil {
 				t.Fatalf("PathToURI(%q): %v", tc.absPath, err)
@@ -168,14 +187,15 @@ func TestPathToURI_RoundTrip(t *testing.T) {
 				t.Errorf("PathToURI = %q; want %q", uri, tc.wantURI)
 			}
 
-			// Step 2: URI → resolution (parse back)
-			// We only verify the round-trip produces the same URI without error.
-			uri2, err := PathToURI(root, tc.absPath)
+			// Step 2: URI → resolved path (parse).  This is the round-trip leg
+			// the previous test was missing: call ResolveURI on the emitted URI
+			// and verify the resolved filesystem path matches the original input.
+			res, err := ResolveURI(root, uri)
 			if err != nil {
-				t.Fatalf("second PathToURI(%q): %v", tc.absPath, err)
+				t.Fatalf("ResolveURI(%q): %v", uri, err)
 			}
-			if uri != uri2 {
-				t.Errorf("round-trip mismatch: %q != %q", uri, uri2)
+			if res.Path != tc.absPath {
+				t.Errorf("round-trip path mismatch:\n  PathToURI input:   %q\n  ResolveURI output: %q", tc.absPath, res.Path)
 			}
 		})
 	}
