@@ -421,6 +421,176 @@ sync: read-only
 	}
 }
 
+// ─── Tests: Codex Bug 2 — Digest fail-closed (declared digest, empty live) ───
+
+// TestComputePlan_DeclaredDigest_EmptyLive_Red verifies that when a pin record
+// declares a digest but the resolver returns an empty live digest, ComputePlan
+// produces a RED (Degraded/OutOfSync) health state rather than silently passing.
+//
+// This is the fail-closed behaviour mandated by the ADR-067 amendment:
+// "if a pin record declares digest: sha256:X and the resolver can't compute a
+// live digest, the result must be RED, not GREEN."
+func TestComputePlan_DeclaredDigest_EmptyLive_Red(t *testing.T) {
+	root := setupWorkspace(t)
+	const target = "cogos-dev/cogos"
+	writePinYAML(t, root, "cogos-dev_cogos", `
+target: cogos-dev/cogos
+pin:
+  ref: abc1234567890
+  digest: sha256:deadbeef
+sync: read-only
+`)
+
+	// Resolver returns a ref but NO digest (empty string) — simulates the
+	// localGitHeadResolver's current behaviour where digest computation is
+	// deferred to v1.
+	s := &stubResolver{refs: map[string]struct {
+		ref    string
+		digest string
+		err    error
+	}{
+		target: {ref: "abc1234567890", digest: ""},
+	}}
+
+	p := pin.New(s)
+	cfg, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	live, err := p.FetchLive(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	plan, err := p.ComputePlan(cfg, live, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+
+	h := p.Health()
+	if h.Health != reconcile.HealthDegraded {
+		t.Errorf("declared digest + empty live: want Degraded, got %s: %s", h.Health, h.Message)
+	}
+	if h.Sync != reconcile.SyncStatusOutOfSync {
+		t.Errorf("declared digest + empty live: want OutOfSync, got %s", h.Sync)
+	}
+
+	// Verify the plan action reason is "digest_unverifiable".
+	found := false
+	for _, a := range plan.Actions {
+		if a.Name == target {
+			reason, _ := a.Details["reason"].(string)
+			if reason != "digest_unverifiable" {
+				t.Errorf("plan action reason: want digest_unverifiable, got %q", reason)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no plan action found for target %q", target)
+	}
+}
+
+// ─── Tests: Codex Bug 3 — verify plan reflects digest/unreachable state ──────
+
+// TestComputePlan_VerifyDigestMismatch_PlanHasReason verifies that when a pin
+// record declares a digest that mismatches the live digest, the plan action
+// carries reason="digest_mismatch" in its Details map.
+//
+// This is the ground truth for cmdPinVerify: the CLI now reads from plan.Actions
+// directly (Bug 3 fix) instead of re-resolving refs. Correct plan action details
+// are the necessary precondition for correct verify output.
+func TestComputePlan_VerifyDigestMismatch_PlanHasReason(t *testing.T) {
+	root := setupWorkspace(t)
+	const target = "cogos-dev/cogos"
+	writePinYAML(t, root, "cogos-dev_cogos", `
+target: cogos-dev/cogos
+pin:
+  ref: abc1234567890
+  digest: sha256:aaaa
+sync: read-only
+`)
+
+	s := &stubResolver{refs: map[string]struct {
+		ref    string
+		digest string
+		err    error
+	}{
+		target: {ref: "abc1234567890", digest: "sha256:bbbb"},
+	}}
+
+	p := pin.New(s)
+	cfg, _ := p.LoadConfig(root)
+	live, _ := p.FetchLive(context.Background(), cfg)
+	plan, err := p.ComputePlan(cfg, live, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+
+	found := false
+	for _, a := range plan.Actions {
+		if a.Name == target {
+			reason, _ := a.Details["reason"].(string)
+			if reason != "digest_mismatch" {
+				t.Errorf("plan action reason: want digest_mismatch, got %q", reason)
+			}
+			pinnedDigest, _ := a.Details["pinned_digest"].(string)
+			liveDigest, _ := a.Details["live_digest"].(string)
+			if pinnedDigest == "" {
+				t.Error("plan action missing pinned_digest detail")
+			}
+			if liveDigest == "" {
+				t.Error("plan action missing live_digest detail")
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no plan action found for target %q", target)
+	}
+
+	// Health must also reflect the mismatch.
+	h := p.Health()
+	if h.Health != reconcile.HealthDegraded {
+		t.Errorf("digest mismatch: want Degraded, got %s: %s", h.Health, h.Message)
+	}
+}
+
+// TestComputePlan_VerifyUnreachable_PlanHasReason verifies that when a target
+// is unreachable, the plan action carries reason="target_unreachable" so that
+// cmdPinVerify surfaces it correctly.
+func TestComputePlan_VerifyUnreachable_PlanHasReason(t *testing.T) {
+	root := setupWorkspace(t)
+	const target = "cogos-dev/cogos"
+	writePinYAML(t, root, "cogos-dev_cogos", `
+target: cogos-dev/cogos
+pin:
+  ref: abc1234567890
+sync: read-only
+`)
+
+	p := pin.New(newStubWithErr(target, os.ErrNotExist))
+	cfg, _ := p.LoadConfig(root)
+	live, _ := p.FetchLive(context.Background(), cfg)
+	plan, err := p.ComputePlan(cfg, live, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+
+	found := false
+	for _, a := range plan.Actions {
+		if a.Name == target {
+			reason, _ := a.Details["reason"].(string)
+			if reason != "target_unreachable" {
+				t.Errorf("plan action reason: want target_unreachable, got %q", reason)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no plan action found for target %q", target)
+	}
+}
+
 // ─── helper ──────────────────────────────────────────────────────────────────
 
 // runAndCheck runs a full reconcile cycle (LoadConfig→FetchLive→ComputePlan)
