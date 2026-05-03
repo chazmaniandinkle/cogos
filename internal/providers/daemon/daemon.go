@@ -23,6 +23,8 @@
 //
 // The component provider is already fully extracted to
 // internal/providers/component and is wired here via blank import.
+// The pin provider (internal/providers/pin) is fully extracted and registered
+// here directly — its Health() delegates to the extracted package.
 // The other seven are implemented as minimal structs below.
 //
 // cmd/cogos/providers_wire.go imports this package (triggering init()) and
@@ -38,6 +40,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/cogos-dev/cogos/internal/providers/pin"
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 
 	// Trigger internal/providers/component's init() which registers "component".
@@ -68,6 +71,44 @@ func SetWorkspaceRoot(root string) {
 	workspaceRoot = root
 }
 
+// pinProvider is the daemon-side wrapper around the fully-extracted pin provider.
+// It delegates Health() directly to pin.New(), wiring the workspace root at
+// probe time via resolveRoot(). The non-health methods are provided by
+// the embedded stubMethods (daemon only needs Health() for the proprioception block).
+type pinProvider struct {
+	stubMethods
+	mu   sync.Mutex
+	impl *pin.Provider
+}
+
+func (p *pinProvider) Type() string { return "pin" }
+
+func (p *pinProvider) Health() reconcile.ResourceStatus {
+	root, bad := resolveRoot()
+	if bad != nil {
+		return *bad
+	}
+	p.mu.Lock()
+	if p.impl == nil {
+		p.impl = pin.New(nil)
+	}
+	impl := p.impl
+	p.mu.Unlock()
+
+	// Wire the workspace root into the pin provider so its Health() can
+	// inspect .cog/pins/. LoadConfig is idempotent; call it cheaply here so
+	// the provider's internal root field is always current.
+	if _, err := impl.LoadConfig(root); err != nil {
+		return reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusUnknown,
+			Health:    reconcile.HealthDegraded,
+			Operation: reconcile.OperationIdle,
+			Message:   fmt.Sprintf("pin LoadConfig: %v", err),
+		}
+	}
+	return impl.Health()
+}
+
 func init() {
 	reconcile.RegisterProvider("agent", &agentProvider{})
 	reconcile.RegisterProvider("discord", &discordProvider{})
@@ -76,6 +117,7 @@ func init() {
 	reconcile.RegisterProvider("openclaw-agents", &openclawAgentsProvider{})
 	reconcile.RegisterProvider("openclaw-cron", &openclawCronProvider{})
 	reconcile.RegisterProvider("openclaw-gateway", &openclawGatewayProvider{})
+	reconcile.RegisterProvider("pin", &pinProvider{stubMethods: stubMethods{name: "pin"}})
 	reconcile.RegisterProvider("service", &serviceProvider{})
 }
 
