@@ -4684,6 +4684,12 @@ Workspace (Multi-Workspace Management):
   workspace remove <name>    Unregister a workspace
   ws                         Alias for workspace
 
+Aliases (cog://authority shortnames):
+  alias list                 List aliases (marks stale entries)
+  alias add <name> <ws>      Create or update an alias
+  alias remove <name>        Remove an alias
+  alias resolve <name>       Debug: show resolution chain
+
 Observability:
   tui, dashboard   Interactive TUI dashboard (TAA, coherence, events)
   ontology show    Display parsed ontology structure
@@ -5746,6 +5752,11 @@ func main() {
 		}
 	case "constellation":
 		if err := cmdConstellation(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			code = 1
+		}
+	case "alias":
+		if err := cmdAlias(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			code = 1
 		}

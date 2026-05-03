@@ -811,29 +811,16 @@ type grepFilesInput struct {
 // ── Tool Implementations ─────────────────────────────────────────────────────
 
 // toolResolveURI — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
+//
+// Delegates entirely to ResolveURI, which now handles the full fallback chain:
+//  1. Projection lookup (local fast path)
+//  2. URIRegistry delegation (cross-workspace aliases + workspace registry)
+//  3. ErrUnknownAuthority if neither can resolve
+//
+// The prior double-dispatch (registry first, then ResolveURI) is removed; the
+// registry delegation now lives inside ResolveURI itself so every canonical
+// path (cogdoc patching, content service, etc.) benefits automatically.
 func (m *MCPServer) toolResolveURI(ctx context.Context, req *mcp.CallToolRequest, input resolveURIInput) (*mcp.CallToolResult, any, error) {
-	// Try v2 registry first (multi-scheme)
-	if URIRegistry != nil {
-		content, err := URIRegistry.Resolve(ctx, input.URI)
-		if err == nil {
-			result := map[string]any{
-				"uri":      input.URI,
-				"resolved": true,
-				"metadata": content.Metadata,
-			}
-			if path, ok := content.Metadata["path"]; ok {
-				result["path"] = path
-				if _, statErr := os.Stat(path.(string)); statErr == nil {
-					result["exists"] = true
-				} else {
-					result["exists"] = false
-				}
-			}
-			return marshalResult(result)
-		}
-	}
-
-	// Fallback to legacy resolver
 	res, err := ResolveURI(m.cfg.WorkspaceRoot, input.URI)
 	if err != nil {
 		return marshalResult(map[string]any{

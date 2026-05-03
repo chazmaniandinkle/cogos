@@ -18,6 +18,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -25,6 +26,11 @@ import (
 	"sort"
 	"strings"
 )
+
+// resolveURIContext is the context passed to URIRegistry.Resolve when
+// ResolveURI delegates to the registry for cross-workspace URIs.  It is
+// background because ResolveURI has no caller-supplied context.
+var resolveURIContext = context.Background()
 
 // ErrUnknownAuthority is returned when a cog://workspace/... URI references a
 // workspace name that is not registered in the local URIRegistry.  The URI
@@ -147,6 +153,11 @@ var cogURIPattern = regexp.MustCompile(
 // (cog://projection/path) are accepted per ADR-067.
 // The #fragment part (section anchor) is separated and returned in
 // URIResolution.Fragment without modifying the path resolution.
+//
+// For cross-workspace URIs (cog://non-projection-authority/...) the function
+// delegates to URIRegistry when it is non-nil.  This means all canonical paths
+// (cogdoc patching, content service, etc.) benefit from the registry chain
+// without needing to call it directly.
 func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
 	if !strings.HasPrefix(uri, "cog:") {
 		return nil, fmt.Errorf("not a cog: URI: %q", uri)
@@ -186,9 +197,12 @@ func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
 	// For the authority form (cog://...) the first component might be a workspace
 	// name (cross-workspace reference) or a projection name.  Discriminate by
 	// checking projections first.  If the first component is not a known projection,
-	// and the original URI used the authority form, it is a cross-workspace ref —
-	// return ErrUnknownAuthority so callers can handle it without treating it as a
-	// parse error.
+	// and the original URI used the authority form, it is a cross-workspace ref.
+	//
+	// Fallback chain:
+	//  1. projection lookup (local, fast path — always checked first)
+	//  2. URIRegistry delegation (handles aliases + workspace registry)
+	//  3. ErrUnknownAuthority if registry is nil or also unknown
 	isAuthorityForm := strings.HasPrefix(uri, "cog://")
 
 	// Split type from path (path may be empty for singletons like cog:crystal).
@@ -197,7 +211,20 @@ func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
 	proj, ok := projections[uriType]
 	if !ok {
 		if isAuthorityForm {
-			// Not a known projection in the authority slot — cross-workspace ref.
+			// Not a known projection — attempt registry delegation before giving up.
+			if URIRegistry != nil {
+				content, regErr := URIRegistry.Resolve(resolveURIContext, uri)
+				if regErr == nil {
+					path, _ := content.Metadata["path"].(string)
+					frag, _ := content.Metadata["fragment"].(string)
+					if frag == "" {
+						frag = fragment
+					}
+					return &URIResolution{Path: path, Fragment: frag}, nil
+				}
+				// If the registry also can't resolve it, fall through to
+				// ErrUnknownAuthority (preserves fail-closed semantics).
+			}
 			return nil, fmt.Errorf("%w: workspace %q in URI %q", ErrUnknownAuthority, uriType, uri)
 		}
 		return nil, fmt.Errorf("unknown cog: projection %q in URI %q", uriType, uri)
