@@ -114,7 +114,17 @@ func (r *uriRegistryImpl) Resolve(ctx context.Context, rawURI string) (*uriConte
 	// cog://authority/path form — parse authority and path.
 	rest := strings.TrimPrefix(rawURI, "cog://")
 
-	// Strip optional digest query param before further parsing.
+	// RFC 3986 §3: URI = scheme ":" hier-part ["?" query] ["#" fragment]
+	// Fragment always trails query; strip #fragment FIRST so the query value
+	// never accidentally includes the fragment text (e.g. ?digest=hex#frag
+	// must not fold "#frag" into the digest hex).
+	fragment := ""
+	if idx := strings.IndexByte(rest, '#'); idx >= 0 {
+		fragment = rest[idx+1:]
+		rest = rest[:idx]
+	}
+
+	// Strip optional digest query param after fragment is already removed.
 	digestHex := ""
 	if idx := strings.Index(rest, "?"); idx >= 0 {
 		query := rest[idx+1:]
@@ -124,13 +134,6 @@ func (r *uriRegistryImpl) Resolve(ctx context.Context, rawURI string) (*uriConte
 				digestHex = strings.TrimPrefix(param, "digest=")
 			}
 		}
-	}
-
-	// Split fragment.
-	fragment := ""
-	if idx := strings.IndexByte(rest, '#'); idx >= 0 {
-		fragment = rest[idx+1:]
-		rest = rest[:idx]
 	}
 
 	// authority is everything up to the first slash.
