@@ -181,6 +181,11 @@ func cmdPinRemove(args []string) error {
 
 // cmdPinVerify resolves live HEAD for each pin and reports drift.
 // Optional argument: specific target to verify. Omit to verify all.
+//
+// The output is driven entirely from the ComputePlan result — the same plan
+// that Health() reads. This ensures that digest mismatches, unreachable targets,
+// and ref drift are all reflected correctly, matching the three-axis health
+// classification rather than a second ad-hoc ref comparison.
 func cmdPinVerify(args []string) error {
 	var filterTarget string
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -203,39 +208,66 @@ func cmdPinVerify(args []string) error {
 		return fmt.Errorf("pin verify: %w", err)
 	}
 
-	_, err = p.ComputePlan(cfgAny, liveAny, nil)
+	plan, err := p.ComputePlan(cfgAny, liveAny, nil)
 	if err != nil {
 		return fmt.Errorf("pin verify: %w", err)
 	}
 
-	// Print per-pin status.
-	entries, err := listPinRecords(root)
-	if err != nil {
-		return fmt.Errorf("pin verify: listing records: %w", err)
+	// Build a lookup from target → plan action so we read digest/unreachable
+	// state from the authoritative plan rather than re-resolving.
+	type verifyResult struct {
+		ok      bool
+		message string
+	}
+	results := make(map[string]verifyResult, len(plan.Actions))
+	for _, action := range plan.Actions {
+		target := action.Name
+		reason, _ := action.Details["reason"].(string)
+		pinnedRef, _ := action.Details["pinned_ref"].(string)
+		liveRef, _ := action.Details["live_ref"].(string)
+
+		switch reason {
+		case "in_sync":
+			results[target] = verifyResult{ok: true,
+				message: fmt.Sprintf("pinned %s == live %s", pinnedRef, liveRef)}
+		case "digest_unverifiable":
+			pinnedDigest, _ := action.Details["pinned_digest"].(string)
+			results[target] = verifyResult{ok: false,
+				message: fmt.Sprintf("digest unverifiable: pin declares %s, resolver returned no digest (fail-closed)", pinnedDigest)}
+		case "digest_mismatch":
+			pinnedDigest, _ := action.Details["pinned_digest"].(string)
+			liveDigest, _ := action.Details["live_digest"].(string)
+			results[target] = verifyResult{ok: false,
+				message: fmt.Sprintf("digest mismatch: want %s, got %s (ref: pinned %s, live %s)", pinnedDigest, liveDigest, pinnedRef, liveRef)}
+		case "target_unreachable":
+			errStr, _ := action.Details["error"].(string)
+			results[target] = verifyResult{ok: false,
+				message: fmt.Sprintf("unreachable: %s", errStr)}
+		default:
+			// ActionUpdate: ref drift.
+			if liveRef != "" {
+				results[target] = verifyResult{ok: false,
+					message: fmt.Sprintf("drift: pinned %s, live %s", pinnedRef, liveRef)}
+			} else {
+				results[target] = verifyResult{ok: false,
+					message: fmt.Sprintf("unexpected plan action %q for %s", action.Action, target)}
+			}
+		}
 	}
 
 	found := false
 	drifted := 0
-	for _, rec := range entries {
-		if filterTarget != "" && rec.Target != filterTarget {
+	for target, vr := range results {
+		if filterTarget != "" && target != filterTarget {
 			continue
 		}
 		found = true
-		status := p.Health()
-		// Health is aggregate; for per-pin detail we run verify logic inline.
-		live2, err2 := resolveOneLive(root, rec.Target)
-		if err2 != nil {
-			fmt.Printf("[WARN] %s: cannot resolve live HEAD: %v\n", rec.Target, err2)
-			drifted++
-			continue
-		}
-		if live2 == rec.Pin.Ref || strings.HasPrefix(live2, rec.Pin.Ref) || strings.HasPrefix(rec.Pin.Ref, live2) {
-			fmt.Printf("[OK]   %s: pinned %s == live %s\n", rec.Target, rec.Pin.Ref, live2)
+		if vr.ok {
+			fmt.Printf("[OK]    %s: %s\n", target, vr.message)
 		} else {
-			fmt.Printf("[DRIFT] %s: pinned %s, live %s\n", rec.Target, rec.Pin.Ref, live2)
+			fmt.Printf("[DRIFT] %s: %s\n", target, vr.message)
 			drifted++
 		}
-		_ = status
 	}
 
 	if filterTarget != "" && !found {
@@ -392,44 +424,6 @@ func listPinRecords(root string) ([]*pin.PinRecord, error) {
 // pinsDirPath returns the .cog/pins path for a workspace root.
 func pinsDirPath(root string) string {
 	return root + "/.cog/pins"
-}
-
-// resolveOneLive resolves live HEAD for a single target using the default
-// local resolver. Used by cmdPinVerify for per-pin display.
-func resolveOneLive(workspaceRoot, target string) (string, error) {
-	r := &localPinResolver{}
-	ref, _, err := r.resolveOne(context.Background(), target, workspaceRoot)
-	return ref, err
-}
-
-// localPinResolver is a small wrapper so cmdPinVerify can call the production
-// resolver without importing unexported types from the pin package.
-type localPinResolver struct{}
-
-func (r *localPinResolver) resolveOne(ctx context.Context, target, workspaceRoot string) (string, string, error) {
-	// Re-use pin.New with nil resolver (defaults to local git).
-	p := pin.New(nil)
-	cfgAny, err := p.LoadConfig(workspaceRoot)
-	if err != nil {
-		return "", "", err
-	}
-	liveAny, err := p.FetchLive(ctx, cfgAny)
-	if err != nil {
-		return "", "", err
-	}
-	// BuildState so we can extract the live ref.
-	state, err := p.BuildState(cfgAny, liveAny, nil)
-	if err != nil {
-		return "", "", err
-	}
-	for _, res := range state.Resources {
-		if res.ExternalID == target {
-			if lv, ok := res.Attributes["live_ref"].(string); ok {
-				return lv, "", nil
-			}
-		}
-	}
-	return "", "", fmt.Errorf("target %q not found in state", target)
 }
 
 // parseYAMLInto is a thin wrapper over yaml.Unmarshal for local use.
