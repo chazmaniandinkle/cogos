@@ -378,17 +378,37 @@ func verifyDigest(path, expectedHex string) error {
 //
 // Returns ("", ErrUnknownAuthority) when the workspace is not registered.
 // All other errors are I/O or parse failures in the global.yaml registry file.
+//
+// name must be the raw workspace name as registered in global.yaml (e.g.
+// "cogos-dev/cogos"). It must NOT be constructed as a URI authority component:
+// synthesising "cog://"+name and re-parsing would split the authority at the
+// first slash, looking up "cogos-dev" instead of "cogos-dev/cogos".
 func ResolveWorkspacePath(ctx context.Context, name string) (string, error) {
 	if URIRegistry == nil {
 		return "", fmt.Errorf("%w: URIRegistry not initialised", ErrUnknownAuthority)
 	}
-	content, err := URIRegistry.Resolve(ctx, "cog://"+name)
+	// Type-assert to *uriRegistryImpl so we can call resolveAuthority directly
+	// with the raw name.  This avoids the "cog://"+name round-trip through
+	// Resolve → strings.Cut(rest, "/") which splits "cogos-dev/cogos" into
+	// authority="cogos-dev" and path="cogos", losing the slash-bearing key.
+	impl, ok := URIRegistry.(*uriRegistryImpl)
+	if !ok {
+		// Fallback for test doubles that only implement uriResolver.
+		// The name is treated as a single-component authority (no slash).
+		content, err := URIRegistry.Resolve(ctx, "cog://"+name)
+		if err != nil {
+			return "", fmt.Errorf("%w: %v", ErrUnknownAuthority, err)
+		}
+		path, _ := content.Metadata["path"].(string)
+		if path == "" {
+			return "", fmt.Errorf("%w: URIRegistry returned empty path for %q", ErrUnknownAuthority, name)
+		}
+		return path, nil
+	}
+	nodeDir := impl.nodeDirFn()
+	wsRoot, err := impl.resolveAuthority(nodeDir, name)
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrUnknownAuthority, err)
 	}
-	path, _ := content.Metadata["path"].(string)
-	if path == "" {
-		return "", fmt.Errorf("%w: URIRegistry returned empty path for %q", ErrUnknownAuthority, name)
-	}
-	return path, nil
+	return wsRoot, nil
 }

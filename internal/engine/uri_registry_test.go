@@ -292,3 +292,69 @@ func TestResolveFragmentBeforeQuery_Rejected(t *testing.T) {
 		t.Fatalf("Resolve(%q): expected error for fragment-before-query, got nil (digest bypass)", malformed)
 	}
 }
+
+// ── ResolveWorkspacePath: slash-bearing name regression (#175 fixup) ─────────
+
+// testNodeSetupWithSlashName creates a node dir whose global.yaml has a
+// slash-bearing workspace name ("cogos-dev/cogos"), swaps URIRegistry for the
+// duration of the test, and returns the node dir and workspace root.
+func testNodeSetupWithSlashName(t *testing.T) (nd, wsSlash string) {
+	t.Helper()
+	base := t.TempDir()
+	nd = filepath.Join(base, "node")
+	if err := os.MkdirAll(nd, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	wsSlash = filepath.Join(base, "cogos-dev", "cogos")
+	if err := os.MkdirAll(wsSlash, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	global := "version: \"1.0\"\nworkspaces:\n" +
+		"  cogos-dev/cogos:\n    path: " + wsSlash + "\n"
+	if err := os.WriteFile(filepath.Join(nd, "global.yaml"), []byte(global), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	testReg := &uriRegistryImpl{nodeDirFn: func() string { return nd }}
+	orig := URIRegistry
+	URIRegistry = testReg
+	t.Cleanup(func() { URIRegistry = orig })
+
+	return nd, wsSlash
+}
+
+// TestResolveWorkspacePathSlashBearing is the regression test for the bug found
+// by Codex review of PR #180.
+//
+// Before the fix, ResolveWorkspacePath built "cog://cogos-dev/cogos" and called
+// URIRegistry.Resolve, which split the authority at the first slash and looked
+// up workspace "cogos-dev" instead of "cogos-dev/cogos". The test would have
+// returned ErrUnknownAuthority.
+//
+// After the fix, ResolveWorkspacePath resolves the raw name directly via
+// resolveAuthority, bypassing URI authority splitting.
+func TestResolveWorkspacePathSlashBearing(t *testing.T) {
+	_, wsSlash := testNodeSetupWithSlashName(t)
+
+	got, err := ResolveWorkspacePath(context.Background(), "cogos-dev/cogos")
+	if err != nil {
+		t.Fatalf("ResolveWorkspacePath(cogos-dev/cogos): %v", err)
+	}
+	if got != wsSlash {
+		t.Errorf("path: got %q, want %q", got, wsSlash)
+	}
+}
+
+// TestResolveWorkspacePathSlashBearing_NotFound verifies that looking up a
+// name not in the registry returns ErrUnknownAuthority (not a panic or empty
+// string).
+func TestResolveWorkspacePathSlashBearing_NotFound(t *testing.T) {
+	testNodeSetupWithSlashName(t) // sets up URIRegistry with cogos-dev/cogos only
+
+	_, err := ResolveWorkspacePath(context.Background(), "cogos-dev/other-repo")
+	if err == nil {
+		t.Fatal("expected ErrUnknownAuthority for unknown slash-bearing name, got nil")
+	}
+}
