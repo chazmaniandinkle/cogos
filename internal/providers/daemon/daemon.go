@@ -73,15 +73,22 @@ func SetWorkspaceRoot(root string) {
 }
 
 // pinProvider is the daemon-side wrapper around the fully-extracted pin provider.
-// It delegates Health() to pin.New() after running the full Reconcile cycle
-// (LoadConfig → FetchLive → ComputePlan) so that pinStates is populated before
-// Health() is called. Without the full cycle, pinStates is always empty and
-// Health() always reports green ("no pins declared") even when pin files
-// declare drift.
+// It delegates Health() to pin.New() after running the read-only refresh cycle
+// (LoadConfig → FetchLive → ComputePlan, no ApplyPlan) so that pinStates is
+// populated before Health() is called. Without the read-only cycle, pinStates is
+// always empty and Health() always reports green ("no pins declared") even when
+// pin files declare drift.
 //
-// The Reconcile call is time-bounded to 10 s to avoid blocking the proprioception
-// tick. staleAfter controls how long a prior cycle result is reused to avoid
-// hammering the filesystem on every foveated-context refresh.
+// The refresh is time-bounded to 10 s to avoid blocking the proprioception tick.
+// staleAfter controls how long a prior cycle result is reused to avoid hammering
+// the filesystem on every foveated-context refresh.
+//
+// Concurrency: mu is held from the staleness check through the entire refresh
+// so that concurrent Health() calls serialise on the lock. Only the first
+// stale caller runs the refresh; subsequent callers reuse the result already
+// being computed (they block on mu.Lock() and see a fresh lastProbe when they
+// acquire it). This eliminates parallel RefreshState invocations and the
+// associated parallel bumpPinFile race.
 type pinProvider struct {
 	stubMethods
 	mu        sync.Mutex
@@ -98,33 +105,35 @@ func (p *pinProvider) Health() reconcile.ResourceStatus {
 	if bad != nil {
 		return *bad
 	}
+
+	// Hold mu for the entire probe so that concurrent Health() calls serialise
+	// here. The first caller that finds a stale result runs RefreshState; any
+	// other concurrent callers block on Lock() and re-check freshness once they
+	// acquire it (finding the result already fresh).
 	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if p.impl == nil {
 		p.impl = pin.New(nil)
 	}
-	impl := p.impl
-	// Reuse the last Reconcile result if it is still fresh.
-	stale := time.Since(p.lastProbe) >= pinProbeStaleAfter
-	p.mu.Unlock()
 
-	if stale {
-		// Run the full reconcile cycle so pinStates reflects live drift.
+	if time.Since(p.lastProbe) >= pinProbeStaleAfter {
+		// Run the read-only refresh cycle (no ApplyPlan, no filesystem writes).
 		// A 10 s context prevents blocking the proprioception tick indefinitely.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if _, err := impl.Reconcile(ctx, root); err != nil {
+		if err := p.impl.RefreshState(ctx, root); err != nil {
 			return reconcile.ResourceStatus{
 				Sync:      reconcile.SyncStatusUnknown,
 				Health:    reconcile.HealthDegraded,
 				Operation: reconcile.OperationIdle,
-				Message:   fmt.Sprintf("pin reconcile: %v", err),
+				Message:   fmt.Sprintf("pin refresh: %v", err),
 			}
 		}
-		p.mu.Lock()
 		p.lastProbe = time.Now()
-		p.mu.Unlock()
 	}
-	return impl.Health()
+
+	return p.impl.Health()
 }
 
 func init() {

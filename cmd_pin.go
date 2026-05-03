@@ -182,10 +182,8 @@ func cmdPinRemove(args []string) error {
 // cmdPinVerify resolves live HEAD for each pin and reports drift.
 // Optional argument: specific target to verify. Omit to verify all.
 //
-// The output is driven entirely from the ComputePlan result — the same plan
-// that Health() reads. This ensures that digest mismatches, unreachable targets,
-// and ref drift are all reflected correctly, matching the three-axis health
-// classification rather than a second ad-hoc ref comparison.
+// This is a thin shim over pin.RunVerify so the core logic is testable
+// independently of workspace resolution and os.Stdout.
 func cmdPinVerify(args []string) error {
 	var filterTarget string
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -197,86 +195,8 @@ func cmdPinVerify(args []string) error {
 		return err
 	}
 
-	p := pin.New(nil)
-	cfgAny, err := p.LoadConfig(root)
-	if err != nil {
-		return fmt.Errorf("pin verify: %w", err)
-	}
-
-	liveAny, err := p.FetchLive(context.Background(), cfgAny)
-	if err != nil {
-		return fmt.Errorf("pin verify: %w", err)
-	}
-
-	plan, err := p.ComputePlan(cfgAny, liveAny, nil)
-	if err != nil {
-		return fmt.Errorf("pin verify: %w", err)
-	}
-
-	// Build a lookup from target → plan action so we read digest/unreachable
-	// state from the authoritative plan rather than re-resolving.
-	type verifyResult struct {
-		ok      bool
-		message string
-	}
-	results := make(map[string]verifyResult, len(plan.Actions))
-	for _, action := range plan.Actions {
-		target := action.Name
-		reason, _ := action.Details["reason"].(string)
-		pinnedRef, _ := action.Details["pinned_ref"].(string)
-		liveRef, _ := action.Details["live_ref"].(string)
-
-		switch reason {
-		case "in_sync":
-			results[target] = verifyResult{ok: true,
-				message: fmt.Sprintf("pinned %s == live %s", pinnedRef, liveRef)}
-		case "digest_unverifiable":
-			pinnedDigest, _ := action.Details["pinned_digest"].(string)
-			results[target] = verifyResult{ok: false,
-				message: fmt.Sprintf("digest unverifiable: pin declares %s, resolver returned no digest (fail-closed)", pinnedDigest)}
-		case "digest_mismatch":
-			pinnedDigest, _ := action.Details["pinned_digest"].(string)
-			liveDigest, _ := action.Details["live_digest"].(string)
-			results[target] = verifyResult{ok: false,
-				message: fmt.Sprintf("digest mismatch: want %s, got %s (ref: pinned %s, live %s)", pinnedDigest, liveDigest, pinnedRef, liveRef)}
-		case "target_unreachable":
-			errStr, _ := action.Details["error"].(string)
-			results[target] = verifyResult{ok: false,
-				message: fmt.Sprintf("unreachable: %s", errStr)}
-		default:
-			// ActionUpdate: ref drift.
-			if liveRef != "" {
-				results[target] = verifyResult{ok: false,
-					message: fmt.Sprintf("drift: pinned %s, live %s", pinnedRef, liveRef)}
-			} else {
-				results[target] = verifyResult{ok: false,
-					message: fmt.Sprintf("unexpected plan action %q for %s", action.Action, target)}
-			}
-		}
-	}
-
-	found := false
-	drifted := 0
-	for target, vr := range results {
-		if filterTarget != "" && target != filterTarget {
-			continue
-		}
-		found = true
-		if vr.ok {
-			fmt.Printf("[OK]    %s: %s\n", target, vr.message)
-		} else {
-			fmt.Printf("[DRIFT] %s: %s\n", target, vr.message)
-			drifted++
-		}
-	}
-
-	if filterTarget != "" && !found {
-		return fmt.Errorf("pin verify: no pin record found for target %q", filterTarget)
-	}
-	if drifted > 0 {
-		return fmt.Errorf("pin verify: %d pin(s) drifted or unreachable", drifted)
-	}
-	return nil
+	_, err = pin.RunVerify(context.Background(), root, filterTarget, nil, os.Stdout)
+	return err
 }
 
 // ─── bump ────────────────────────────────────────────────────────────────────

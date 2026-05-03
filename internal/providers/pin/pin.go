@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -819,6 +820,36 @@ func firstN(msgs []string, n int) string {
 	return strings.Join(msgs[:n], "; ") + fmt.Sprintf(" (+%d more)", len(msgs)-n)
 }
 
+// ─── RefreshState (read-only cycle) ─────────────────────────────────────────
+
+// RefreshState runs the read-only subset of the reconcile lifecycle:
+// LoadConfig → FetchLive → ComputePlan (no ApplyPlan, no filesystem writes).
+//
+// This is the correct method for health probes. Unlike Reconcile, it never
+// calls ApplyPlan and therefore never calls bumpPinFile, so it is safe to call
+// from Health() without risk of mutating pin YAML files.
+func (p *Provider) RefreshState(ctx context.Context, root string) error {
+	p.mu.Lock()
+	p.operation = reconcile.OperationSyncing
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.operation = reconcile.OperationIdle
+		p.mu.Unlock()
+	}()
+
+	cfg, err := p.LoadConfig(root)
+	if err != nil {
+		return err
+	}
+	live, err := p.FetchLive(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	_, err = p.ComputePlan(cfg, live, nil)
+	return err
+}
+
 // ─── Reconcile (full cycle) ──────────────────────────────────────────────────
 
 // Reconcile runs the full LoadConfig → FetchLive → ComputePlan → ApplyPlan cycle.
@@ -846,6 +877,107 @@ func (p *Provider) Reconcile(ctx context.Context, root string) ([]reconcile.Resu
 		return nil, err
 	}
 	return p.ApplyPlan(ctx, plan)
+}
+
+// ─── Verify (read-only plan-driven check) ────────────────────────────────────
+
+// VerifyResult describes the outcome for a single pin after a verify run.
+type VerifyResult struct {
+	Target  string
+	OK      bool
+	Message string
+}
+
+// RunVerify runs the read-only pin verification cycle against root and writes
+// human-readable output to w. filterTarget, if non-empty, restricts output to
+// that single pin. resolver, if non-nil, overrides the default local git
+// resolver (useful for testing).
+//
+// Returns a non-nil error when any pin is drifted or unreachable, or when
+// filterTarget is specified but no matching record exists.
+//
+// cmdPinVerify in cmd_pin.go is a thin shim over this function that supplies
+// the resolved workspace root, os.Stdout, and a nil resolver.
+func RunVerify(ctx context.Context, root, filterTarget string, resolver GitHeadResolver, w io.Writer) ([]VerifyResult, error) {
+	p := New(resolver) // nil resolver → default localGitHeadResolver
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		return nil, fmt.Errorf("pin verify: %w", err)
+	}
+	liveAny, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		return nil, fmt.Errorf("pin verify: %w", err)
+	}
+	plan, err := p.ComputePlan(cfgAny, liveAny, nil)
+	if err != nil {
+		return nil, fmt.Errorf("pin verify: %w", err)
+	}
+
+	// Build results from the authoritative plan.
+	type vr struct {
+		ok      bool
+		message string
+	}
+	byTarget := make(map[string]vr, len(plan.Actions))
+	for _, action := range plan.Actions {
+		target := action.Name
+		reason, _ := action.Details["reason"].(string)
+		pinnedRef, _ := action.Details["pinned_ref"].(string)
+		liveRef, _ := action.Details["live_ref"].(string)
+
+		switch reason {
+		case "in_sync":
+			byTarget[target] = vr{ok: true,
+				message: fmt.Sprintf("pinned %s == live %s", pinnedRef, liveRef)}
+		case "digest_unverifiable":
+			pinnedDigest, _ := action.Details["pinned_digest"].(string)
+			byTarget[target] = vr{ok: false,
+				message: fmt.Sprintf("digest unverifiable: pin declares %s, resolver returned no digest (fail-closed)", pinnedDigest)}
+		case "digest_mismatch":
+			pinnedDigest, _ := action.Details["pinned_digest"].(string)
+			liveDigest, _ := action.Details["live_digest"].(string)
+			byTarget[target] = vr{ok: false,
+				message: fmt.Sprintf("digest mismatch: want %s, got %s (ref: pinned %s, live %s)", pinnedDigest, liveDigest, pinnedRef, liveRef)}
+		case "target_unreachable":
+			errStr, _ := action.Details["error"].(string)
+			byTarget[target] = vr{ok: false,
+				message: fmt.Sprintf("unreachable: %s", errStr)}
+		default:
+			// ActionUpdate: ref drift (no digest involved).
+			if liveRef != "" {
+				byTarget[target] = vr{ok: false,
+					message: fmt.Sprintf("drift: pinned %s, live %s", pinnedRef, liveRef)}
+			} else {
+				byTarget[target] = vr{ok: false,
+					message: fmt.Sprintf("unexpected plan action %q for %s", action.Action, target)}
+			}
+		}
+	}
+
+	var results []VerifyResult
+	found := false
+	drifted := 0
+	for target, r := range byTarget {
+		if filterTarget != "" && target != filterTarget {
+			continue
+		}
+		found = true
+		results = append(results, VerifyResult{Target: target, OK: r.ok, Message: r.message})
+		if r.ok {
+			fmt.Fprintf(w, "[OK]    %s: %s\n", target, r.message)
+		} else {
+			fmt.Fprintf(w, "[DRIFT] %s: %s\n", target, r.message)
+			drifted++
+		}
+	}
+
+	if filterTarget != "" && !found {
+		return nil, fmt.Errorf("pin verify: no pin record found for target %q", filterTarget)
+	}
+	if drifted > 0 {
+		return results, fmt.Errorf("pin verify: %d pin(s) drifted or unreachable", drifted)
+	}
+	return results, nil
 }
 
 // ─── File helpers (used by CLI write operations) ─────────────────────────────
