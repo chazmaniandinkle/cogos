@@ -4,7 +4,7 @@
 //
 //	GET  /health                           — liveness + readiness probe
 //	GET  /v1/context                       — current attentional field (debug)
-//	GET  /v1/resolve                       — resolve a cog:// URI to a filesystem path
+//	GET  /v1/resolve                       — resolve a cog: URI to a filesystem path
 //	POST /v1/chat/completions              — OpenAI-compatible chat (streaming + non-streaming)
 //	POST /v1/messages                      — Anthropic Messages-compatible chat
 //	POST /v1/context/foveated              — foveated context assembly for Claude Code hook
@@ -369,9 +369,9 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleResolve resolves a cog:// URI to a filesystem path.
+// handleResolve resolves a cog: URI to a filesystem path.
 //
-// GET /v1/resolve?uri=cog://mem/semantic/foo.cog.md
+// GET /v1/resolve?uri=cog:mem/semantic/foo.cog.md
 //
 //	200 → { uri, path, fragment, exists }
 //	400 → { error }
@@ -402,9 +402,9 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleCogDocRead resolves a cog:// URI and returns the file content as text.
+// handleCogDocRead resolves a cog: URI and returns the file content as text.
 //
-//	GET /v1/cogdoc/read?uri=cog://mem/semantic/insights/foo.md
+//	GET /v1/cogdoc/read?uri=cog:mem/semantic/insights/foo.md
 //	200 → { uri, path, content, exists }
 func (s *Server) handleCogDocRead(w http.ResponseWriter, r *http.Request) {
 	uri := r.URL.Query().Get("uri")

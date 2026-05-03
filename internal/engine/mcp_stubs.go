@@ -93,7 +93,7 @@ func searchMemoryFTS(dbPath, workspaceRoot, query string, limit int, sector stri
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 
-		// Derive a cog:// URI from the filesystem path.
+		// Derive a cog: URI from the filesystem path (bare form per ADR-067).
 		uri := pathToMemURI(workspaceRoot, path)
 
 		// Normalise BM25 rank to a 0–1 relevance score.
@@ -194,7 +194,7 @@ func searchMemoryGrep(workspaceRoot, query string, limit int, sector string) (ma
 		title := extractTitleFromFrontmatter(content)
 
 		results = append(results, map[string]any{
-			"uri":   "cog://mem/" + rel,
+			"uri":   "cog:mem/" + rel,
 			"path":  path,
 			"title": title,
 			"score": 0.0, // no relevance scoring in grep fallback

@@ -82,24 +82,26 @@ const localHarnessExecutePrompt = `You are the resident local CogOS maintenance 
 Stay local-only. Use the provided kernel tools when they materially improve the answer.
 Prefer inspection and diagnosis over mutation. Finish with a concise plain-text result.
 
-CogDoc URIs use the form cog://<type>/<path>. Valid types:
+CogDoc URIs use the bare form cog:<type>/<path>. Valid types:
   mem, adr, role, skill, agent, spec, status, ledger, crystal,
   kernel, canonical, config, ontology, work, handoff, artifact, docs, hooks
 Examples:
-  cog://adr/077                    (ADRs resolve by numeric prefix)
-  cog://mem/semantic/foo/bar       (memory under .cog/mem/<sector>/...)
-  cog://spec/rfc-022-foo           (specs under .cog/specs/)
-Invalid: cog://adrs/..., cog://workspace/..., cog://docs/... with raw fs paths.
+  cog:adr/077                    (ADRs resolve by numeric prefix)
+  cog:mem/semantic/foo/bar       (memory under .cog/mem/<sector>/...)
+  cog:spec/rfc-022-foo           (specs under .cog/specs/)
+Cross-workspace refs use authority form: cog://other-workspace/mem/...
+Invalid: cog://adrs/..., cog://docs/... with raw fs paths.
 If cog_search_memory returns a bus event path (".cog/.state/buses/.../events.jsonl#N"),
 that is a chat log entry, not a readable CogDoc — do not try to read it.`
 
 const localHarnessDispatchPrompt = `You are the resident local CogOS harness.
 Stay local-only. Use only the provided kernel tools. Be concise and finish with a direct answer.
 
-CogDoc URIs use the form cog://<type>/<path>. Valid types:
+CogDoc URIs use the bare form cog:<type>/<path>. Valid types:
   mem, adr, role, skill, agent, spec, status, ledger, crystal,
   kernel, canonical, config, ontology, work, handoff, artifact, docs, hooks
-Example: cog://adr/077 (ADRs resolve by numeric prefix).
+Example: cog:adr/077 (ADRs resolve by numeric prefix).
+Cross-workspace refs use authority form: cog://other-workspace/mem/...
 If cog_search_memory returns ".cog/.state/buses/.../events.jsonl#N", that's a chat log entry,
 not a readable CogDoc — do not try to read it.`
 
