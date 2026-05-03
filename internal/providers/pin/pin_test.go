@@ -1,9 +1,11 @@
 package pin_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -610,4 +612,132 @@ func runAndCheck(t *testing.T, p *pin.Provider, root string, check func(reconcil
 		t.Fatalf("ComputePlan: %v", err)
 	}
 	check(p.Health())
+}
+
+// ─── Tests: Bug C — direct cmdPinVerify via pin.RunVerify ────────────────────
+//
+// These tests invoke pin.RunVerify (the extracted helper that cmdPinVerify
+// wraps) directly, so reverting the CLI shim to its old broken form would
+// cause the tests here — not just the plan-reason tests — to fail.
+
+// TestRunVerify_DigestUnverifiable calls RunVerify against a workspace where
+// the pin declares a digest but the stub resolver returns no digest (empty
+// string). Expects [DRIFT] output containing "digest unverifiable" and a
+// non-nil error.
+func TestRunVerify_DigestUnverifiable(t *testing.T) {
+	root := setupWorkspace(t)
+	const target = "cogos-dev/cogos"
+	writePinYAML(t, root, "cogos-dev_cogos", `
+target: cogos-dev/cogos
+pin:
+  ref: abc1234567890
+  digest: sha256:aabbcc
+sync: read-only
+`)
+
+	// Stub returns a ref but no digest — simulates a resolver that cannot
+	// compute content digests (the current localGitHeadResolver behaviour).
+	s := &stubResolver{refs: map[string]struct {
+		ref    string
+		digest string
+		err    error
+	}{
+		target: {ref: "abc1234567890", digest: ""},
+	}}
+
+	var buf bytes.Buffer
+	results, err := pin.RunVerify(context.Background(), root, "", s, &buf)
+	if err == nil {
+		t.Fatal("RunVerify: expected error for digest_unverifiable, got nil")
+	}
+	if !strings.Contains(err.Error(), "drifted or unreachable") {
+		t.Errorf("RunVerify error: want 'drifted or unreachable', got %q", err.Error())
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "[DRIFT]") {
+		t.Errorf("RunVerify output missing [DRIFT] marker; got:\n%s", out)
+	}
+	if !strings.Contains(out, "digest unverifiable") {
+		t.Errorf("RunVerify output missing 'digest unverifiable'; got:\n%s", out)
+	}
+
+	if len(results) != 1 || results[0].OK {
+		t.Errorf("RunVerify results: want 1 NOT-OK result, got %+v", results)
+	}
+}
+
+// TestRunVerify_DigestMismatch calls RunVerify against a workspace where the
+// pin declares a digest that does not match what the resolver returns.
+// Expects [DRIFT] output containing "digest mismatch".
+func TestRunVerify_DigestMismatch(t *testing.T) {
+	root := setupWorkspace(t)
+	const target = "cogos-dev/cogos"
+	writePinYAML(t, root, "cogos-dev_cogos", `
+target: cogos-dev/cogos
+pin:
+  ref: abc1234567890
+  digest: sha256:aaaa
+sync: read-only
+`)
+
+	s := &stubResolver{refs: map[string]struct {
+		ref    string
+		digest string
+		err    error
+	}{
+		target: {ref: "abc1234567890", digest: "sha256:bbbb"},
+	}}
+
+	var buf bytes.Buffer
+	results, err := pin.RunVerify(context.Background(), root, "", s, &buf)
+	if err == nil {
+		t.Fatal("RunVerify: expected error for digest_mismatch, got nil")
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "[DRIFT]") {
+		t.Errorf("RunVerify output missing [DRIFT] marker; got:\n%s", out)
+	}
+	if !strings.Contains(out, "digest mismatch") {
+		t.Errorf("RunVerify output missing 'digest mismatch'; got:\n%s", out)
+	}
+
+	if len(results) != 1 || results[0].OK {
+		t.Errorf("RunVerify results: want 1 NOT-OK result, got %+v", results)
+	}
+}
+
+// TestRunVerify_TargetUnreachable calls RunVerify against a workspace where
+// the stub resolver returns an error (target not found). Expects [DRIFT]
+// output containing "unreachable".
+func TestRunVerify_TargetUnreachable(t *testing.T) {
+	root := setupWorkspace(t)
+	const target = "cogos-dev/cogos"
+	writePinYAML(t, root, "cogos-dev_cogos", `
+target: cogos-dev/cogos
+pin:
+  ref: abc1234567890
+sync: read-only
+`)
+
+	s := newStubWithErr(target, os.ErrNotExist)
+
+	var buf bytes.Buffer
+	results, err := pin.RunVerify(context.Background(), root, "", s, &buf)
+	if err == nil {
+		t.Fatal("RunVerify: expected error for target_unreachable, got nil")
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "[DRIFT]") {
+		t.Errorf("RunVerify output missing [DRIFT] marker; got:\n%s", out)
+	}
+	if !strings.Contains(out, "unreachable") {
+		t.Errorf("RunVerify output missing 'unreachable'; got:\n%s", out)
+	}
+
+	if len(results) != 1 || results[0].OK {
+		t.Errorf("RunVerify results: want 1 NOT-OK result, got %+v", results)
+	}
 }
