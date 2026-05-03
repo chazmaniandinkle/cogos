@@ -4,7 +4,7 @@
 //  1. COG_ROOT environment variable (explicit)
 //  2. COG_WORKSPACE env var (lookup in global config)
 //  3. Local git repo detection (if inside a workspace)
-//  4. current-workspace from ~/.cog/config
+//  4. current-workspace from ~/.cog/node/global.yaml
 //
 // This package is dependency-injected: the main package wires global-config
 // loading and git-root detection at init time. This avoids pulling the full
@@ -35,7 +35,7 @@ type ConfigProvider interface {
 // hook before ResolveWorkspace is called. If either is nil, the corresponding
 // resolution tier is skipped gracefully.
 var (
-	// LoadConfig loads the global config (~/.cog/config).
+	// LoadConfig loads the global config (~/.cog/node/global.yaml).
 	LoadConfig func() (ConfigProvider, error)
 	// GitRoot returns the path of the enclosing git repository.
 	GitRoot func() (string, error)
@@ -55,7 +55,7 @@ var workspaceCache struct {
 //  1. COG_ROOT environment variable (explicit)
 //  2. COG_WORKSPACE env var (lookup in global config)
 //  3. Local git repo detection (if inside a workspace)
-//  4. current-workspace from ~/.cog/config
+//  4. current-workspace from ~/.cog/node/global.yaml
 //
 // Returns (workspaceRoot, source, error) where source describes how it was
 // resolved.

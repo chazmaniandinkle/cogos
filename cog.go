@@ -867,7 +867,8 @@ type CacheStats struct {
 
 // === GLOBAL CONFIG (Multi-Workspace Support) ===
 
-// GlobalConfig represents ~/.cog/config for multi-workspace management
+// GlobalConfig represents the global workspace registry stored at
+// ~/.cog/node/global.yaml for multi-workspace management.
 type GlobalConfig struct {
 	Version          string                     `yaml:"version"`
 	CurrentWorkspace string                     `yaml:"current-workspace,omitempty"`
@@ -881,8 +882,22 @@ type WorkspaceEntry struct {
 	Description string `yaml:"description,omitempty"`
 }
 
-// globalConfigPath returns the path to ~/.cog/config
+// globalConfigPath returns the path to ~/.cog/node/global.yaml.
+// The registry lives under node/ because it is node-local state (which
+// workspaces this node knows about). This frees ~/.cog/config/ to be the
+// workspace config directory for the home-directory workspace.
 func globalConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".cog", "node", "global.yaml")
+}
+
+// globalConfigLegacyPath returns the old path (~/.cog/config) used before
+// the migration introduced in cogos-dev/cogos#161. Used only by the one-time
+// migration helper; callers must not persist to this path.
+func globalConfigLegacyPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -890,9 +905,82 @@ func globalConfigPath() string {
 	return filepath.Join(home, ".cog", "config")
 }
 
-// loadGlobalConfig loads ~/.cog/config, returning empty config if missing
+// migrateGlobalConfig performs a one-time, idempotent migration of the global
+// workspace registry from the old flat file at ~/.cog/config to the new
+// location at ~/.cog/node/global.yaml.
+//
+// Behaviour:
+//   - Old exists, new does not: move the file, log a notice.
+//   - Old does not exist: nothing to do (no-op, no log).
+//   - New already exists (with or without old): no-op; if old also exists, log
+//     a warning naming it so the user can inspect/remove it manually.
+//   - Move fails (permissions, disk full, etc.): log an error, return the
+//     error. The caller (loadGlobalConfig) falls back to the old path so the
+//     kernel still starts.
+func migrateGlobalConfig() error {
+	oldPath := globalConfigLegacyPath()
+	newPath := globalConfigPath()
+	if oldPath == "" || newPath == "" {
+		return nil // can't determine home dir; nothing we can do
+	}
+
+	oldExists := fileExists(oldPath)
+	newExists := fileExists(newPath)
+
+	switch {
+	case newExists && oldExists:
+		// Both present: prefer new (already migrated or manually created).
+		// Warn so user can clean up the orphaned old file.
+		fmt.Fprintf(os.Stderr, "[kernel] WARN: global workspace registry exists at both old path (%s) and new path (%s); using new path. You may safely remove the old file.\n", oldPath, newPath)
+		return nil
+
+	case newExists:
+		// New already exists, old gone — fully migrated; pure no-op.
+		return nil
+
+	case oldExists:
+		// Old exists, new does not — perform the migration.
+		// Ensure the destination directory exists.
+		if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "[kernel] ERROR: failed to create directory for global config migration (%s): %v — falling back to old path\n", filepath.Dir(newPath), err)
+			return err
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			fmt.Fprintf(os.Stderr, "[kernel] ERROR: failed to migrate global config from %s to %s: %v — falling back to old path\n", oldPath, newPath, err)
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "[kernel] INFO: migrated global workspace registry from %s to %s\n", oldPath, newPath)
+		return nil
+
+	default:
+		// Neither exists — fresh install; no migration needed.
+		return nil
+	}
+}
+
+// fileExists returns true if path names a regular file (not a directory).
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+// loadGlobalConfig loads ~/.cog/node/global.yaml, returning empty config if missing.
+// On first call after a kernel upgrade it transparently migrates the old
+// ~/.cog/config flat file to the new location (see migrateGlobalConfig).
 func loadGlobalConfig() (*GlobalConfig, error) {
+	// One-time migration: move old flat file → new path.
+	// If migration fails we fall back to the old path below so the kernel
+	// still starts — loadGlobalConfig is not fatal on migration error.
+	migErr := migrateGlobalConfig()
+
 	path := globalConfigPath()
+	if migErr != nil {
+		// Migration failed; try the old path so we don't silently lose workspaces.
+		if old := globalConfigLegacyPath(); old != "" && fileExists(old) {
+			path = old
+		}
+	}
+
 	if path == "" {
 		return &GlobalConfig{
 			Version:    "1.0",
@@ -926,14 +1014,14 @@ func loadGlobalConfig() (*GlobalConfig, error) {
 	return &config, nil
 }
 
-// saveGlobalConfig writes ~/.cog/config atomically
+// saveGlobalConfig writes ~/.cog/node/global.yaml atomically.
 func saveGlobalConfig(config *GlobalConfig) error {
 	path := globalConfigPath()
 	if path == "" {
 		return fmt.Errorf("could not determine home directory")
 	}
 
-	// Ensure ~/.cog/ exists
+	// Ensure ~/.cog/node/ exists
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
