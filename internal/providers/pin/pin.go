@@ -425,9 +425,44 @@ func (p *Provider) ComputePlan(config any, live any, state *reconcile.State) (*r
 
 		ps.LiveRef = lr.Ref
 
-		// Digest verification (when declared).
-		if rec.Pin.Digest != "" && lr.Digest != "" {
+		// Digest verification (fail-closed per ADR-067 amendment).
+		//
+		// The local resolver (localGitHeadResolver) does not compute a content
+		// digest — it returns empty string for digest. This is expected: git SHA
+		// resolution does not produce a sha256 content hash without reading
+		// and hashing the tree, which is deferred to v1 (TODO #167 / URIRegistry).
+		//
+		// However, per the ADR-067 fail-closed amendment: if the pin record
+		// DECLARES a digest, the reconciler MUST treat an unverifiable live
+		// digest as a RED condition rather than silently ignoring the integrity
+		// constraint. Three cases:
+		//   1. pinned == "" → no digest check; fall through to ref comparison.
+		//   2. pinned != "" and live == "" → RED: "digest unverifiable".
+		//   3. pinned != "" and live != "" and mismatch → RED: "digest mismatch".
+		//   4. pinned != "" and live != "" and match → proceed to ref comparison.
+		if rec.Pin.Digest != "" {
 			pinnedDigest := normaliseDigest(rec.Pin.Digest)
+			if lr.Digest == "" {
+				// Case 2: declared digest, resolver returned nothing — fail closed.
+				ps.Sync = reconcile.SyncStatusOutOfSync
+				ps.Health = reconcile.HealthDegraded
+				ps.Message = fmt.Sprintf("digest unverifiable: pin declares %s but resolver returned no digest (fail-closed per ADR-067)", pinnedDigest)
+				plan.Actions = append(plan.Actions, reconcile.Action{
+					Action:       reconcile.ActionSkip,
+					ResourceType: "pin",
+					Name:         rec.Target,
+					Details: map[string]any{
+						"reason":        "digest_unverifiable",
+						"pinned_ref":    rec.Pin.Ref,
+						"pinned_digest": rec.Pin.Digest,
+						"live_ref":      lr.Ref,
+					},
+				})
+				plan.Summary.Skipped++
+				newStates[rec.Target] = ps
+				continue
+			}
+			// Case 3: both present, compare.
 			liveDigest := normaliseDigest(lr.Digest)
 			if pinnedDigest != liveDigest {
 				ps.Sync = reconcile.SyncStatusOutOfSync
@@ -438,17 +473,18 @@ func (p *Provider) ComputePlan(config any, live any, state *reconcile.State) (*r
 					ResourceType: "pin",
 					Name:         rec.Target,
 					Details: map[string]any{
-						"reason":       "digest_mismatch",
-						"pinned_ref":   rec.Pin.Ref,
+						"reason":        "digest_mismatch",
+						"pinned_ref":    rec.Pin.Ref,
 						"pinned_digest": rec.Pin.Digest,
-						"live_ref":     lr.Ref,
-						"live_digest":  lr.Digest,
+						"live_ref":      lr.Ref,
+						"live_digest":   lr.Digest,
 					},
 				})
 				plan.Summary.Skipped++
 				newStates[rec.Target] = ps
 				continue
 			}
+			// Case 4: match — fall through to ref comparison.
 		}
 
 		// Ref comparison.
