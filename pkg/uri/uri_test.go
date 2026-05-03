@@ -290,3 +290,94 @@ func TestIsCogURI(t *testing.T) {
 		t.Error("expected false for empty string")
 	}
 }
+
+// ── ADR-067 compliance ─────────────────────────────────────────────────────────
+
+// TestParseDigestFailClosed verifies that a URI carrying ?digest=sha256:...
+// is rejected by Parse per ADR-067 §170 (fail-closed integrity contract).
+func TestParseDigestFailClosed(t *testing.T) {
+	t.Parallel()
+	digests := []string{
+		"cog:mem/semantic/foo.cog.md?digest=sha256:abc123",
+		"cog://mem/semantic/foo.cog.md?digest=sha256:abc123",
+		"cog:conf/kernel.yaml?digest=sha256:deadbeef",
+		// digest alongside other params
+		"cog:mem/foo.cog.md?ref=main&digest=sha256:111",
+	}
+	for _, raw := range digests {
+		raw := raw
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+			_, err := Parse(raw)
+			if err == nil {
+				t.Fatalf("Parse(%q): expected error (digest fail-closed), got nil", raw)
+			}
+			if !errors.Is(err, ErrInvalidURI) {
+				t.Errorf("Parse(%q): got %v; want errors.Is ErrInvalidURI (digest fail-closed)", raw, err)
+			}
+		})
+	}
+}
+
+// TestParseNonDigestQueryAllowed verifies non-digest query params do not trigger
+// the digest fail-closed check.
+func TestParseNonDigestQueryAllowed(t *testing.T) {
+	t.Parallel()
+	_, err := Parse("cog:mem/semantic/foo.cog.md?ref=main")
+	if err != nil {
+		t.Errorf("non-digest query: unexpected error %v", err)
+	}
+}
+
+// TestParseBothFormsRoundTrip verifies that both URI forms parse successfully
+// and that String() always emits the canonical bare form, so a second Parse
+// of the emitted form reproduces an identical URI.
+func TestParseBothFormsRoundTrip(t *testing.T) {
+	t.Parallel()
+	pairs := []struct {
+		bare      string
+		authority string
+	}{
+		{"cog:mem/semantic/insights/eigenform.cog.md", "cog://mem/semantic/insights/eigenform.cog.md"},
+		{"cog:conf/kernel.yaml", "cog://conf/kernel.yaml"},
+		{"cog:crystal", "cog://crystal"},
+		{"cog:thread/current#last-10", "cog://thread/current#last-10"},
+	}
+	for _, p := range pairs {
+		p := p
+		t.Run(p.bare, func(t *testing.T) {
+			t.Parallel()
+
+			uBare, err := Parse(p.bare)
+			if err != nil {
+				t.Fatalf("Parse(bare %q): %v", p.bare, err)
+			}
+			uAuth, err := Parse(p.authority)
+			if err != nil {
+				t.Fatalf("Parse(authority %q): %v", p.authority, err)
+			}
+
+			// Both must emit the same canonical string.
+			if uBare.String() != uAuth.String() {
+				t.Errorf("bare.String()=%q != auth.String()=%q", uBare.String(), uAuth.String())
+			}
+
+			// Round-trip: re-parse the emitted string → must succeed and reproduce.
+			reparse, err := Parse(uBare.String())
+			if err != nil {
+				t.Fatalf("Parse(round-trip %q): %v", uBare.String(), err)
+			}
+			if reparse.String() != uBare.String() {
+				t.Errorf("round-trip mismatch: %q → %q", uBare.String(), reparse.String())
+			}
+
+			// Namespace and Path must be identical for both forms.
+			if uBare.Namespace != uAuth.Namespace {
+				t.Errorf("Namespace: bare=%q auth=%q", uBare.Namespace, uAuth.Namespace)
+			}
+			if uBare.Path != uAuth.Path {
+				t.Errorf("Path: bare=%q auth=%q", uBare.Path, uAuth.Path)
+			}
+		})
+	}
+}
