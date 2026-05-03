@@ -322,15 +322,16 @@ func uriToFSPath(workspaceRoot, uri string) string {
 	return ""
 }
 
-// fsPathToURI converts an absolute filesystem path to a cog:// URI.
+// fsPathToURI converts an absolute filesystem path to a cog: URI.
+// Projection references use the bare form (no //) per ADR-067.
 func fsPathToURI(workspaceRoot, path string) string {
 	rel := strings.TrimPrefix(path, workspaceRoot+"/")
 	prefixes := [][2]string{
-		{".cog/mem/", "cog://mem/"},
-		{".cog/docs/", "cog://docs/"},
-		{".cog/adr/", "cog://adr/"},
-		{".cog/hooks/", "cog://hooks/"},
-		{".claude/", "cog://claude/"},
+		{".cog/mem/", "cog:mem/"},
+		{".cog/docs/", "cog:docs/"},
+		{".cog/adr/", "cog:adr/"},
+		{".cog/hooks/", "cog:hooks/"},
+		{".claude/", "cog:claude/"},
 	}
 	for _, p := range prefixes {
 		if strings.HasPrefix(rel, p[0]) {

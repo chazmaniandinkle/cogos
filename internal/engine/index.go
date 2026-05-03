@@ -144,7 +144,7 @@ func indexFile(workspaceRoot, path string) *IndexedCogdoc {
 	if err != nil {
 		// File is in .cog/mem/ but PathToURI failed — use a best-effort URI.
 		rel, _ := filepath.Rel(workspaceRoot, path)
-		uri = "cog://mem/" + filepath.ToSlash(strings.TrimPrefix(rel, ".cog/mem/"))
+		uri = "cog:mem/" + filepath.ToSlash(strings.TrimPrefix(rel, ".cog/mem/"))
 	}
 
 	fm, body := parseCogdocFrontmatter(content)

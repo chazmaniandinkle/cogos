@@ -68,31 +68,31 @@ func FieldKeyToURI(workspaceRoot, absPath string) string {
 		return absPath
 	}
 
-	// .cog/mem/ → cog://mem/
+	// .cog/mem/ → cog:mem/
 	if strings.HasPrefix(rel, ".cog/mem/") {
-		return "cog://mem/" + strings.TrimPrefix(rel, ".cog/mem/")
+		return "cog:mem/" + strings.TrimPrefix(rel, ".cog/mem/")
 	}
-	// .cog/docs/ → cog://docs/
+	// .cog/docs/ → cog:docs/
 	if strings.HasPrefix(rel, ".cog/docs/") {
-		return "cog://docs/" + strings.TrimPrefix(rel, ".cog/docs/")
+		return "cog:docs/" + strings.TrimPrefix(rel, ".cog/docs/")
 	}
-	// .cog/adr/ → cog://adr/
+	// .cog/adr/ → cog:adr/
 	if strings.HasPrefix(rel, ".cog/adr/") {
-		return "cog://adr/" + strings.TrimPrefix(rel, ".cog/adr/")
+		return "cog:adr/" + strings.TrimPrefix(rel, ".cog/adr/")
 	}
-	// .cog/config/ → cog://conf/
+	// .cog/config/ → cog:conf/
 	if strings.HasPrefix(rel, ".cog/config/") {
-		return "cog://conf/" + strings.TrimPrefix(rel, ".cog/config/")
+		return "cog:conf/" + strings.TrimPrefix(rel, ".cog/config/")
 	}
-	// .cog/ontology/ → cog://ontology/
+	// .cog/ontology/ → cog:ontology/
 	if strings.HasPrefix(rel, ".cog/ontology/") {
 		stem := strings.TrimPrefix(rel, ".cog/ontology/")
 		stem = strings.TrimSuffix(stem, ".cog.md")
-		return "cog://ontology/" + stem
+		return "cog:ontology/" + stem
 	}
-	// .claude/skills/ → cog://skill/
+	// .claude/skills/ → cog:skill/
 	if strings.HasPrefix(rel, ".claude/skills/") {
-		return "cog://skill/" + strings.TrimPrefix(rel, ".claude/skills/")
+		return "cog:skill/" + strings.TrimPrefix(rel, ".claude/skills/")
 	}
 
 	// Can't map — return the relative path as a workspace URI.
