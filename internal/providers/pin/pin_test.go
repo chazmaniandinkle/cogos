@@ -3,7 +3,10 @@ package pin_test
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -739,5 +742,144 @@ sync: read-only
 
 	if len(results) != 1 || results[0].OK {
 		t.Errorf("RunVerify results: want 1 NOT-OK result, got %+v", results)
+	}
+}
+
+// ─── WorkspaceLocator integration tests (issue #175) ─────────────────────────
+
+// stubLocator is a test implementation of pin.WorkspaceLocator.
+type stubLocator struct {
+	// paths maps workspace name → filesystem path.
+	// An absent or empty entry means ErrWorkspaceNotFound.
+	paths map[string]string
+	// calls records the names that were looked up (in order).
+	calls []string
+}
+
+func (l *stubLocator) LocateWorkspace(_ context.Context, name string) (string, error) {
+	l.calls = append(l.calls, name)
+	p, ok := l.paths[name]
+	if !ok || p == "" {
+		return "", pin.ErrWorkspaceNotFound
+	}
+	return p, nil
+}
+
+// TestSetWorkspaceLocator_ConsultedBeforeFallback verifies that after
+// SetWorkspaceLocator is called, the locator is queried for every target
+// workspace before the sibling-directory scan fires.
+//
+// The locator returns ErrWorkspaceNotFound so the fallback scan fires; the
+// test only asserts the locator was consulted, not that resolution succeeded.
+func TestSetWorkspaceLocator_ConsultedBeforeFallback(t *testing.T) {
+	t.Parallel()
+	root := setupWorkspace(t)
+	const target = "cogos-dev/cogos"
+
+	writePinYAML(t, root, "cogos-dev_cogos", `
+target: cogos-dev/cogos
+pin:
+  ref: abc1234567890
+sync: read-only
+`)
+
+	locator := &stubLocator{paths: map[string]string{}} // always not-found
+	p := pin.New(nil)
+	p.SetWorkspaceLocator(locator)
+
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	_, _ = p.FetchLive(context.Background(), cfgAny) // error expected (no real git repo)
+
+	found := false
+	for _, name := range locator.calls {
+		if name == target {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("WorkspaceLocator not consulted for target %q; calls = %v", target, locator.calls)
+	}
+}
+
+// TestSetWorkspaceLocator_RegistryPathUsed verifies the end-to-end happy path:
+// locator returns a real git repo root → FetchLive resolves HEAD without error.
+func TestSetWorkspaceLocator_RegistryPathUsed(t *testing.T) {
+	t.Parallel()
+	source := setupWorkspace(t)
+	const target = "myorg/myrepo"
+	const pinnedRef = "abc1234567890abcdef1234567890abcdef123456"
+
+	writePinYAML(t, source, "myorg_myrepo", `
+target: myorg/myrepo
+pin:
+  ref: `+pinnedRef+`
+sync: read-only
+`)
+
+	// Create a minimal git repo to serve as the target workspace.
+	targetDir := t.TempDir()
+	for _, args := range [][]string{
+		{"git", "-C", targetDir, "init"},
+		{"git", "-C", targetDir, "config", "user.email", "test@example.com"},
+		{"git", "-C", targetDir, "config", "user.name", "Test"},
+		{"git", "-C", targetDir, "commit", "--allow-empty", "-m", "initial"},
+	} {
+		out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+		if err != nil {
+			t.Skipf("git setup failed (%v): %s — skipping registry-path test", err, out)
+		}
+	}
+
+	locator := &stubLocator{paths: map[string]string{target: targetDir}}
+	p := pin.New(nil)
+	p.SetWorkspaceLocator(locator)
+
+	cfgAny, err := p.LoadConfig(source)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	liveAny, err := p.FetchLive(context.Background(), cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+
+	// Verify the locator was consulted.
+	found := false
+	for _, name := range locator.calls {
+		if name == target {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("WorkspaceLocator not consulted for target %q; calls = %v", target, locator.calls)
+	}
+
+	// Verify FetchLive succeeded by running ComputePlan — if liveAny is valid,
+	// ComputePlan won't panic.
+	planAny, err := p.ComputePlan(cfgAny, liveAny, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+	if planAny == nil {
+		t.Fatal("ComputePlan returned nil plan")
+	}
+}
+
+// TestErrWorkspaceNotFound_SentinelExported verifies the exported sentinel error
+// is the right type for errors.Is checks in callers.
+func TestErrWorkspaceNotFound_SentinelExported(t *testing.T) {
+	t.Parallel()
+	if pin.ErrWorkspaceNotFound == nil {
+		t.Fatal("ErrWorkspaceNotFound is nil")
+	}
+	// Ensure wrapping works.
+	wrapped := fmt.Errorf("wrapped: %w", pin.ErrWorkspaceNotFound)
+	if !errors.Is(wrapped, pin.ErrWorkspaceNotFound) {
+		t.Errorf("errors.Is(wrapped, ErrWorkspaceNotFound) = false; wrapping broken")
 	}
 }

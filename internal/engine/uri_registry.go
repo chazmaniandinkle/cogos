@@ -359,3 +359,25 @@ func verifyDigest(path, expectedHex string) error {
 	}
 	return nil
 }
+
+// ResolveWorkspacePath returns the filesystem root for the named workspace by
+// consulting URIRegistry. It is the canonical public surface for packages that
+// need workspace-root resolution without holding a reference to the unexported
+// uriResolver interface.
+//
+// Returns ("", ErrUnknownAuthority) when the workspace is not registered.
+// All other errors are I/O or parse failures in the global.yaml registry file.
+func ResolveWorkspacePath(ctx context.Context, name string) (string, error) {
+	if URIRegistry == nil {
+		return "", fmt.Errorf("%w: URIRegistry not initialised", ErrUnknownAuthority)
+	}
+	content, err := URIRegistry.Resolve(ctx, "cog://"+name)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrUnknownAuthority, err)
+	}
+	path, _ := content.Metadata["path"].(string)
+	if path == "" {
+		return "", fmt.Errorf("%w: URIRegistry returned empty path for %q", ErrUnknownAuthority, name)
+	}
+	return path, nil
+}
