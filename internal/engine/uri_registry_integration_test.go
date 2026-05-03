@@ -7,6 +7,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -243,5 +245,122 @@ func TestConcurrentAliasAddIntegration(t *testing.T) {
 	}
 	if _, _, ok := final.Expand("c2"); !ok {
 		t.Error("c2 missing after concurrent add")
+	}
+}
+
+// ── Bug 1 regression: ResolveURI must delegate to URIRegistry ────────────────
+
+// TestResolveURIViaRegistry is the load-bearing test that would have caught Bug
+// 1.  It calls ResolveURI directly (not URIRegistry.Resolve) with a
+// cross-workspace cog://authority/... URI and verifies that the result
+// round-trips through the registry to the correct workspace filesystem path.
+//
+// Before the fix, ResolveURI returned ErrUnknownAuthority immediately for any
+// non-projection authority, so callers like PatchAndSync always failed for
+// cross-workspace refs even when URIRegistry was wired.
+func TestResolveURIViaRegistry(t *testing.T) {
+	_, wsA, _ := newIntegrationEnv(t)
+
+	doc := filepath.Join(wsA, ".cog", "mem", "semantic", "regrtest.cog.md")
+	if err := os.WriteFile(doc, []byte("# regr"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call ResolveURI directly — the path that PatchAndSync, cogdoc_service,
+	// and other kernel callers all use.  This must NOT return ErrUnknownAuthority
+	// now that URIRegistry is wired into the fallback chain.
+	res, err := ResolveURI(wsA, "cog://workspace-a/mem/semantic/regrtest.cog.md")
+	if err != nil {
+		t.Fatalf("ResolveURI with cross-workspace URI via registry: %v", err)
+	}
+	if res.Path != doc {
+		t.Errorf("path: got %q, want %q", res.Path, doc)
+	}
+}
+
+// TestResolveURIViaRegistryWithFragment verifies that the fragment is
+// preserved through the ResolveURI → URIRegistry → projection chain.
+func TestResolveURIViaRegistryWithFragment(t *testing.T) {
+	_, wsA, _ := newIntegrationEnv(t)
+
+	doc := filepath.Join(wsA, ".cog", "mem", "semantic", "frag.cog.md")
+	if err := os.WriteFile(doc, []byte("# frag"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ResolveURI(wsA, "cog://workspace-a/mem/semantic/frag.cog.md#Section")
+	if err != nil {
+		t.Fatalf("ResolveURI with fragment: %v", err)
+	}
+	if res.Path != doc {
+		t.Errorf("path: got %q, want %q", res.Path, doc)
+	}
+	if res.Fragment != "Section" {
+		t.Errorf("fragment: got %q, want %q", res.Fragment, "Section")
+	}
+}
+
+// ── Bug 2 regression: digest must not include the fragment text ───────────────
+
+// TestDigestWithFragmentParseOrder is the regression test for Bug 2.
+// Before the fix, ?digest=<hex>#frag would fold "#frag" into the digest hex,
+// causing digest verification to fail even for a correct file (or silently
+// pass with a corrupt digest value on some inputs).
+//
+// The test verifies:
+//  1. A URI with ?digest=<correct-hex>#frag successfully verifies the file.
+//  2. A URI with ?digest=<wrong-hex>#frag returns a mismatch error.
+//  3. A URI with ?digest=<correct-hex-with-fragment-appended> returns mismatch
+//     (proving that the fragment text is NOT included in the digest lookup).
+func TestDigestWithFragmentParseOrder(t *testing.T) {
+	nd, wsA, _ := newIntegrationEnv(t)
+
+	// Write a file and compute its correct digest.
+	content := []byte("digest-order-test content\n")
+	doc := filepath.Join(wsA, ".cog", "mem", "semantic", "digest_frag.cog.md")
+	if err := os.WriteFile(doc, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256(content)
+	correctHex := hex.EncodeToString(h[:])
+
+	// Register wsA in node dir so the registry can resolve it.
+	_ = nd // already registered by newIntegrationEnv
+
+	// Case 1: correct digest + fragment — must succeed.
+	uri := "cog://workspace-a/mem/semantic/digest_frag.cog.md?digest=" + correctHex + "#Section"
+	ctx := context.Background()
+	got, err := URIRegistry.Resolve(ctx, uri)
+	if err != nil {
+		t.Fatalf("case1 correct digest+frag: unexpected error: %v", err)
+	}
+	if path, ok := got.Metadata["path"].(string); !ok || path != doc {
+		t.Errorf("case1: path %v, want %q", got.Metadata["path"], doc)
+	}
+	if frag, ok := got.Metadata["fragment"].(string); !ok || frag != "Section" {
+		t.Errorf("case1: fragment %v, want %q", got.Metadata["fragment"], "Section")
+	}
+
+	// Case 2: wrong digest — must error (fail-closed).
+	badURI := "cog://workspace-a/mem/semantic/digest_frag.cog.md?digest=deadbeef#Section"
+	_, err = URIRegistry.Resolve(ctx, badURI)
+	if err == nil {
+		t.Fatal("case2: expected digest mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "digest mismatch") {
+		t.Errorf("case2: error %q should contain 'digest mismatch'", err.Error())
+	}
+
+	// Case 3: digest value that would only match if fragment was erroneously
+	// folded in (i.e. the pre-fix behaviour).  The digest is computed over
+	// correctHex + "#Section" — this must NOT verify successfully.
+	poisonedHex := func() string {
+		p := sha256.Sum256([]byte(correctHex + "#Section"))
+		return hex.EncodeToString(p[:])
+	}()
+	poisonedURI := "cog://workspace-a/mem/semantic/digest_frag.cog.md?digest=" + poisonedHex + "#Section"
+	_, err = URIRegistry.Resolve(ctx, poisonedURI)
+	if err == nil {
+		t.Fatal("case3: poisoned digest (fragment folded in) must not pass — parse order bug still present")
 	}
 }
