@@ -6,8 +6,12 @@ import (
 	"strings"
 )
 
-// Scheme is the cog URI scheme prefix.
-const Scheme = "cog://"
+// Scheme is the canonical (bare) cog URI scheme prefix per ADR-067.
+// The legacy authority form cog:// is still accepted by Parse.
+const Scheme = "cog:"
+
+// SchemeLegacy is the legacy authority form, accepted for backward compatibility.
+const SchemeLegacy = "cog://"
 
 // URI represents a parsed cog:// URI with its components.
 //
@@ -29,14 +33,16 @@ type URI struct {
 	Raw string
 }
 
-// Parse parses a cog:// URI string into its components.
+// Parse parses a cog: URI string into its components.
+// Both the bare form (cog:namespace/path) and the legacy authority form
+// (cog://namespace/path) are accepted per ADR-067.
 //
 // Returns ErrInvalidURI if the URI is malformed or uses an unknown scheme.
 // Returns ErrUnknownNamespace if the namespace is not recognized.
 //
 // Example:
 //
-//	u, err := uri.Parse("cog://mem/semantic/insights?q=topic&limit=10")
+//	u, err := uri.Parse("cog:mem/semantic/insights?q=topic&limit=10")
 //	// u.Namespace = "mem"
 //	// u.Path = "semantic/insights"
 //	// u.Query = {"q": ["topic"], "limit": ["10"]}
@@ -49,8 +55,27 @@ func Parse(rawURI string) (*URI, error) {
 		return nil, &Error{Op: "Parse", URI: rawURI, Err: fmt.Errorf("%w: must start with %s", ErrInvalidURI, Scheme)}
 	}
 
-	// Parse as standard URL (replacing cog:// with http:// for url.Parse).
-	httpURI := "http://" + strings.TrimPrefix(rawURI, Scheme)
+	// Fail-closed on digest integrity constraint (ADR-067 §170).
+	if idx := strings.IndexByte(rawURI, '?'); idx >= 0 {
+		query := rawURI[idx+1:]
+		if fragIdx := strings.IndexByte(query, '#'); fragIdx >= 0 {
+			query = query[:fragIdx]
+		}
+		for _, param := range strings.Split(query, "&") {
+			if strings.HasPrefix(param, "digest=") {
+				return nil, &Error{Op: "Parse", URI: rawURI, Err: fmt.Errorf("%w: digest verification not implemented: fail-closed per ADR-067", ErrInvalidURI)}
+			}
+		}
+	}
+
+	// Normalise both forms to an http:// URL for url.Parse.
+	var httpURI string
+	if strings.HasPrefix(rawURI, SchemeLegacy) {
+		httpURI = "http://" + strings.TrimPrefix(rawURI, SchemeLegacy)
+	} else {
+		httpURI = "http://" + strings.TrimPrefix(rawURI, Scheme)
+	}
+
 	parsed, err := url.Parse(httpURI)
 	if err != nil {
 		return nil, &Error{Op: "Parse", URI: rawURI, Err: fmt.Errorf("%w: %s", ErrInvalidURI, err.Error())}
@@ -77,9 +102,10 @@ func Parse(rawURI string) (*URI, error) {
 }
 
 // String returns the canonical string representation of the URI.
+// Always uses the bare cog: form (no //) per ADR-067.
 func (u *URI) String() string {
 	var sb strings.Builder
-	sb.WriteString(Scheme)
+	sb.WriteString(Scheme) // "cog:"
 	sb.WriteString(u.Namespace)
 	if u.Path != "" {
 		sb.WriteString("/")
@@ -163,7 +189,7 @@ func (u *URI) IsNamespace() bool {
 	return u.Path == ""
 }
 
-// IsCogURI reports whether s begins with the cog:// scheme.
+// IsCogURI reports whether s begins with the cog: scheme (bare or authority form).
 func IsCogURI(s string) bool {
-	return strings.HasPrefix(s, Scheme)
+	return strings.HasPrefix(s, Scheme) // "cog:" matches both "cog:x" and "cog://x"
 }
