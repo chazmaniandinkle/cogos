@@ -381,3 +381,33 @@ func TestParseBothFormsRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// ── Fragment-before-query rejection in canonical parser (issue #171 follow-up) ──
+
+// TestParseFragmentBeforeQuery_Rejected verifies that pkg/uri.Parse rejects a URI
+// where '#' appears before '?' — the canonical parser must enforce RFC 3986 ordering
+// so every caller (resolver, registry, future callers) gets consistent protection.
+//
+// Without the fix: url.Parse folds "?digest=..." into the Fragment field, so the
+// digest fail-closed check never fires and digest verification can be bypassed.
+func TestParseFragmentBeforeQuery_Rejected(t *testing.T) {
+	t.Parallel()
+	malformed := []string{
+		"cog:mem/foo.cog.md#Section?digest=sha256:abc",
+		"cog://mem/semantic/x#Anchor?digest=sha256:deadbeef",
+		"cog:conf/kernel.yaml#top?ref=main",
+	}
+	for _, raw := range malformed {
+		raw := raw
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+			_, err := Parse(raw)
+			if err == nil {
+				t.Fatalf("Parse(%q): expected error for fragment-before-query URI, got nil", raw)
+			}
+			if !errors.Is(err, ErrInvalidURI) {
+				t.Errorf("Parse(%q): got %v; want errors.Is ErrInvalidURI", raw, err)
+			}
+		})
+	}
+}

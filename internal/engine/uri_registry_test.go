@@ -265,3 +265,30 @@ func TestResolveBareLocalForm(t *testing.T) {
 		t.Errorf("path: got %v, want %q", content.Metadata["path"], doc)
 	}
 }
+
+// ── Resolve: fragment-before-query rejection (issue #171 follow-up) ───────────
+
+// TestResolveFragmentBeforeQuery_Rejected verifies that URIRegistry.Resolve
+// rejects a URI where '#' appears before '?' in the cog://authority form.
+//
+// PR #176 added the rejection only inside ResolveURI; the registry-direct path
+// was not covered.  Without this fix, cog://ws/mem/x#frag?digest=... reaches
+// the digest-verification block with digestHex="" because the earlier
+// fragment-strip consumed the entire tail including the query string.
+func TestResolveFragmentBeforeQuery_Rejected(t *testing.T) {
+	_, wsA, _, reg := testNodeSetup(t)
+
+	doc := filepath.Join(wsA, ".cog", "mem", "semantic", "bypass.cog.md")
+	if err := os.WriteFile(doc, []byte("# bypass attempt\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	digest := fileDigest(t, doc)
+
+	// Fragment-before-query: the '#frag' should NOT cause the digest param to be
+	// ignored.  The registry must reject this URI as malformed.
+	malformed := "cog://ws-a/mem/semantic/bypass.cog.md#frag?digest=" + digest
+	_, err := reg.Resolve(context.Background(), malformed)
+	if err == nil {
+		t.Fatalf("Resolve(%q): expected error for fragment-before-query, got nil (digest bypass)", malformed)
+	}
+}

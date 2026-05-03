@@ -187,11 +187,20 @@ func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
 	// signals an integrity constraint.  The local projection resolver does not
 	// implement digest verification, so it MUST error rather than silently
 	// ignoring the integrity constraint.
+	//
+	// Fragment capture: when the URI is well-formed (?query#fragment), the
+	// fragment follows the query string in the tail.  We capture it here so that
+	// truncating `rest` at '?' does not lose the fragment (the subsequent
+	// fragment-extraction pass below would find no '#' in the already-truncated
+	// rest and silently drop it — regression introduced by PR #176).
+	fragment := ""
 	if idx := strings.IndexByte(rest, '?'); idx >= 0 {
 		query := rest[idx+1:]
 		rest = rest[:idx]
-		// Strip fragment from query tail if present (well-formed: ?q#frag).
+		// Separate fragment from query tail if present (well-formed: ?q#frag).
+		// Capture the fragment text before stripping it from the query.
 		if fIdx := strings.IndexByte(query, '#'); fIdx >= 0 {
+			fragment = query[fIdx+1:]
 			query = query[:fIdx]
 		}
 		for _, param := range strings.Split(query, "&") {
@@ -204,7 +213,9 @@ func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
 	}
 
 	// Split off fragment (always follows query per RFC 3986).
-	fragment := ""
+	// This handles the no-query case: cog:mem/foo#section.
+	// If a fragment was already captured from the query tail above, this block
+	// is a no-op (rest contains no '#' after the query was stripped).
 	if idx := strings.IndexByte(rest, '#'); idx >= 0 {
 		fragment = rest[idx+1:]
 		rest = rest[:idx]
