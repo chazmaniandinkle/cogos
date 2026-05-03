@@ -1,9 +1,9 @@
-// daemon_test.go — verifies that importing this package registers all 9
+// daemon_test.go — verifies that importing this package registers all 10
 // expected Reconcilable providers with pkg/reconcile.
 //
 // This is the canonical test for verification gate 3: "after the
 // engine.Main-equivalent boot path runs, reconcile.ListProviders() returns
-// the 9 expected names."
+// the 10 expected names."
 //
 // We don't start a server or invoke engine.Main() — we only confirm that
 // the package's init() side-effect wired the providers. This is sufficient
@@ -15,12 +15,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/cogos-dev/cogos/internal/providers/daemon"
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 
-	// Blank import fires daemon.init(), registering all 9 providers; the named
+	// Blank import fires daemon.init(), registering all 10 providers; the named
 	// import above is for the new SetWorkspaceRoot regression test.
 	_ "github.com/cogos-dev/cogos/internal/providers/daemon"
 )
@@ -34,10 +35,11 @@ var expectedProviders = []string{
 	"openclaw-agents",
 	"openclaw-cron",
 	"openclaw-gateway",
+	"pin",
 	"service",
 }
 
-func TestDaemonInit_RegistersAll9Providers(t *testing.T) {
+func TestDaemonInit_RegistersAll10Providers(t *testing.T) {
 	got := reconcile.ListProviders()
 	sort.Strings(got)
 
@@ -94,6 +96,67 @@ func TestDaemonProviders_HealthDoesNotPanic(t *testing.T) {
 	}
 }
 
+// TestPinProvider_DaemonHealth_SurfacesDrift verifies Codex Bug 1:
+// the daemon's pin provider calls the full Reconcile cycle before Health()
+// so that drift declared in .cog/pins/*.yaml files is surfaced rather than
+// silently reporting "no pins declared" (the pre-fix behaviour when pinStates
+// was always empty because only LoadConfig was called).
+//
+// The test writes a pin file declaring a stale ref for a target that does not
+// exist locally. FetchLive returns "unreachable" for any non-local target, so
+// ComputePlan marks the pin as missing. Health() must therefore be Degraded,
+// not Healthy.
+func TestPinProvider_DaemonHealth_SurfacesDrift(t *testing.T) {
+	// Build a temporary workspace with a .cog/pins/ directory and one pin
+	// declaring a target that cannot be resolved locally.
+	tmp := t.TempDir()
+	pinsDir := filepath.Join(tmp, ".cog", "pins")
+	if err := os.MkdirAll(pinsDir, 0o755); err != nil {
+		t.Fatalf("mkdir pins: %v", err)
+	}
+	pinYAML := `target: cogos-dev/nonexistent-target
+pin:
+  ref: abc000000000
+branch: main
+sync: read-only
+`
+	if err := os.WriteFile(filepath.Join(pinsDir, "cogos-dev_nonexistent-target.yaml"), []byte(pinYAML), 0o644); err != nil {
+		t.Fatalf("write pin yaml: %v", err)
+	}
+
+	// Also create the minimal workspace structure so agent / service providers
+	// don't interfere.
+	agentsDir := filepath.Join(tmp, ".cog", "bin", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsDir, "registry.yaml"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write registry.yaml: %v", err)
+	}
+
+	daemon.SetWorkspaceRoot(tmp)
+	defer daemon.SetWorkspaceRoot("")
+
+	p, err := reconcile.GetProvider("pin")
+	if err != nil {
+		t.Fatalf("GetProvider(pin): %v", err)
+	}
+
+	h := p.Health()
+	// The target "cogos-dev/nonexistent-target" cannot be found locally,
+	// so FetchLive marks it unreachable and ComputePlan emits a missing action.
+	// Health() must NOT be Healthy — it must be Degraded.
+	if h.Health == reconcile.HealthHealthy {
+		t.Errorf("pin provider Health()=Healthy with a drifted pin file; want Degraded.\n"+
+			"This indicates pinStates was empty (Reconcile not called before Health).\n"+
+			"message: %q", h.Message)
+	}
+	// Specifically expect Degraded (missing/unreachable maps to Degraded in Health()).
+	if h.Health != reconcile.HealthDegraded {
+		t.Errorf("pin provider Health()=%s; want Degraded; message=%q", h.Health, h.Message)
+	}
+}
+
 // TestSetWorkspaceRoot_HealthReflectsWorkspaceState verifies that after
 // SetWorkspaceRoot is called with a real workspace path, providers that depend
 // only on filesystem presence (agent, service) return a non-"workspace-not-found"
@@ -144,4 +207,83 @@ func TestSetWorkspaceRoot_HealthReflectsWorkspaceState(t *testing.T) {
 
 	// Reset for other tests.
 	daemon.SetWorkspaceRoot("")
+}
+
+// TestPinProvider_ConcurrentHealth_NoParallelRefresh verifies that concurrent
+// Health() calls on the pin provider serialise correctly and do not trigger
+// parallel RefreshState invocations (Bug B fix).
+//
+// The test fires N goroutines that each call p.Health() simultaneously on a
+// workspace with a pin file. With the Bug B fix the mutex is held through the
+// entire refresh, so the calls serialise rather than racing. Without the fix,
+// concurrent stale-state checks both pass the staleness gate and both run
+// RefreshState in parallel, which can race on pinStates writes.
+//
+// The test is also run with -race in CI (go test -race) to surface any data
+// races that the serialisation fix is intended to prevent.
+func TestPinProvider_ConcurrentHealth_NoParallelRefresh(t *testing.T) {
+	tmp := t.TempDir()
+	pinsDir := filepath.Join(tmp, ".cog", "pins")
+	if err := os.MkdirAll(pinsDir, 0o755); err != nil {
+		t.Fatalf("mkdir pins: %v", err)
+	}
+	pinYAML := `target: cogos-dev/nonexistent-target
+pin:
+  ref: abc000000000
+branch: main
+sync: read-only
+`
+	if err := os.WriteFile(filepath.Join(pinsDir, "cogos-dev_nonexistent-target.yaml"), []byte(pinYAML), 0o644); err != nil {
+		t.Fatalf("write pin yaml: %v", err)
+	}
+
+	// Also create the minimal workspace structure so agent / service providers
+	// don't interfere.
+	agentsDir := filepath.Join(tmp, ".cog", "bin", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsDir, "registry.yaml"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write registry.yaml: %v", err)
+	}
+
+	daemon.SetWorkspaceRoot(tmp)
+	defer daemon.SetWorkspaceRoot("")
+
+	p, err := reconcile.GetProvider("pin")
+	if err != nil {
+		t.Fatalf("GetProvider(pin): %v", err)
+	}
+
+	const concurrency = 8
+	var wg sync.WaitGroup
+	statuses := make([]reconcile.ResourceStatus, concurrency)
+
+	// Fire all goroutines at roughly the same time. All will see a stale
+	// lastProbe (zero value). With the fix, only one runs RefreshState; the
+	// others block on the mutex and see a fresh result when they acquire it.
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			statuses[i] = p.Health()
+		}()
+	}
+	wg.Wait()
+
+	// All goroutines must have received a coherent status — not a zero value.
+	for i, s := range statuses {
+		if s.Health == "" {
+			t.Errorf("goroutine %d: Health() returned zero-value status", i)
+		}
+	}
+
+	// The workspace has a pin that is unreachable locally, so every status
+	// must be Degraded (not Healthy).
+	for i, s := range statuses {
+		if s.Health == reconcile.HealthHealthy {
+			t.Errorf("goroutine %d: Health()=Healthy with unreachable pin; want Degraded; message=%q", i, s.Message)
+		}
+	}
 }

@@ -23,6 +23,8 @@
 //
 // The component provider is already fully extracted to
 // internal/providers/component and is wired here via blank import.
+// The pin provider (internal/providers/pin) is fully extracted and registered
+// here directly — its Health() delegates to the extracted package.
 // The other seven are implemented as minimal structs below.
 //
 // cmd/cogos/providers_wire.go imports this package (triggering init()) and
@@ -37,7 +39,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
+	"github.com/cogos-dev/cogos/internal/providers/pin"
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 
 	// Trigger internal/providers/component's init() which registers "component".
@@ -68,6 +72,70 @@ func SetWorkspaceRoot(root string) {
 	workspaceRoot = root
 }
 
+// pinProvider is the daemon-side wrapper around the fully-extracted pin provider.
+// It delegates Health() to pin.New() after running the read-only refresh cycle
+// (LoadConfig → FetchLive → ComputePlan, no ApplyPlan) so that pinStates is
+// populated before Health() is called. Without the read-only cycle, pinStates is
+// always empty and Health() always reports green ("no pins declared") even when
+// pin files declare drift.
+//
+// The refresh is time-bounded to 10 s to avoid blocking the proprioception tick.
+// staleAfter controls how long a prior cycle result is reused to avoid hammering
+// the filesystem on every foveated-context refresh.
+//
+// Concurrency: mu is held from the staleness check through the entire refresh
+// so that concurrent Health() calls serialise on the lock. Only the first
+// stale caller runs the refresh; subsequent callers reuse the result already
+// being computed (they block on mu.Lock() and see a fresh lastProbe when they
+// acquire it). This eliminates parallel RefreshState invocations and the
+// associated parallel bumpPinFile race.
+type pinProvider struct {
+	stubMethods
+	mu        sync.Mutex
+	impl      *pin.Provider
+	lastProbe time.Time
+}
+
+const pinProbeStaleAfter = 30 * time.Second
+
+func (p *pinProvider) Type() string { return "pin" }
+
+func (p *pinProvider) Health() reconcile.ResourceStatus {
+	root, bad := resolveRoot()
+	if bad != nil {
+		return *bad
+	}
+
+	// Hold mu for the entire probe so that concurrent Health() calls serialise
+	// here. The first caller that finds a stale result runs RefreshState; any
+	// other concurrent callers block on Lock() and re-check freshness once they
+	// acquire it (finding the result already fresh).
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.impl == nil {
+		p.impl = pin.New(nil)
+	}
+
+	if time.Since(p.lastProbe) >= pinProbeStaleAfter {
+		// Run the read-only refresh cycle (no ApplyPlan, no filesystem writes).
+		// A 10 s context prevents blocking the proprioception tick indefinitely.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := p.impl.RefreshState(ctx, root); err != nil {
+			return reconcile.ResourceStatus{
+				Sync:      reconcile.SyncStatusUnknown,
+				Health:    reconcile.HealthDegraded,
+				Operation: reconcile.OperationIdle,
+				Message:   fmt.Sprintf("pin refresh: %v", err),
+			}
+		}
+		p.lastProbe = time.Now()
+	}
+
+	return p.impl.Health()
+}
+
 func init() {
 	reconcile.RegisterProvider("agent", &agentProvider{})
 	reconcile.RegisterProvider("discord", &discordProvider{})
@@ -76,6 +144,7 @@ func init() {
 	reconcile.RegisterProvider("openclaw-agents", &openclawAgentsProvider{})
 	reconcile.RegisterProvider("openclaw-cron", &openclawCronProvider{})
 	reconcile.RegisterProvider("openclaw-gateway", &openclawGatewayProvider{})
+	reconcile.RegisterProvider("pin", &pinProvider{stubMethods: stubMethods{name: "pin"}})
 	reconcile.RegisterProvider("service", &serviceProvider{})
 }
 
