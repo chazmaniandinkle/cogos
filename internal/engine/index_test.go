@@ -17,14 +17,14 @@ tags: [alpha, physics]
 status: active
 created: "2026-01-01"
 refs:
-  - uri: cog://mem/semantic/guide/test-guide.cog.md
+  - uri: cog:mem/semantic/guide/test-guide.cog.md
     rel: related
 ---
 
 # Test Insight
 
-See cog://mem/semantic/guide/test-guide.cog.md for the companion guide.
-Also references cog://conf/kernel.yaml inline.
+See cog:mem/semantic/guide/test-guide.cog.md for the companion guide.
+Also references cog:conf/kernel.yaml inline.
 `
 
 const fixtureGuide = `---
@@ -87,7 +87,7 @@ func TestBuildIndexByURI(t *testing.T) {
 	}
 
 	// The URI for insight.cog.md under .cog/mem/semantic/.
-	wantURI := "cog://mem/semantic/insight.cog.md"
+	wantURI := "cog:mem/semantic/insight.cog.md"
 	doc, ok := idx.ByURI[wantURI]
 	if !ok {
 		t.Fatalf("URI %q not found; have: %v", wantURI, uriKeys(idx))
@@ -173,7 +173,7 @@ func TestBuildIndexRefGraph(t *testing.T) {
 		t.Fatalf("BuildIndex: %v", err)
 	}
 
-	srcURI := "cog://mem/semantic/insight.cog.md"
+	srcURI := "cog:mem/semantic/insight.cog.md"
 	refs, ok := idx.RefGraph[srcURI]
 	if !ok {
 		t.Fatalf("RefGraph missing entry for %q", srcURI)
@@ -181,8 +181,8 @@ func TestBuildIndexRefGraph(t *testing.T) {
 	if len(refs) != 1 {
 		t.Fatalf("RefGraph[%q] has %d refs; want 1", srcURI, len(refs))
 	}
-	if refs[0].URI != "cog://mem/semantic/guide/test-guide.cog.md" {
-		t.Errorf("refs[0].URI = %q; want cog://mem/semantic/guide/test-guide.cog.md", refs[0].URI)
+	if refs[0].URI != "cog:mem/semantic/guide/test-guide.cog.md" {
+		t.Errorf("refs[0].URI = %q; want cog:mem/semantic/guide/test-guide.cog.md", refs[0].URI)
 	}
 	if refs[0].Rel != "related" {
 		t.Errorf("refs[0].Rel = %q; want related", refs[0].Rel)
@@ -199,13 +199,13 @@ func TestBuildIndexInverseRefs(t *testing.T) {
 		t.Fatalf("BuildIndex: %v", err)
 	}
 
-	targetURI := "cog://mem/semantic/guide/test-guide.cog.md"
+	targetURI := "cog:mem/semantic/guide/test-guide.cog.md"
 	sources := idx.InverseRefs[targetURI]
 	if len(sources) != 1 {
 		t.Fatalf("InverseRefs[%q] = %d sources; want 1", targetURI, len(sources))
 	}
-	if sources[0] != "cog://mem/semantic/insight.cog.md" {
-		t.Errorf("sources[0] = %q; want cog://mem/semantic/insight.cog.md", sources[0])
+	if sources[0] != "cog:mem/semantic/insight.cog.md" {
+		t.Errorf("sources[0] = %q; want cog:mem/semantic/insight.cog.md", sources[0])
 	}
 }
 
@@ -219,28 +219,28 @@ func TestBuildIndexInlineRefs(t *testing.T) {
 		t.Fatalf("BuildIndex: %v", err)
 	}
 
-	doc := idx.ByURI["cog://mem/semantic/insight.cog.md"]
+	doc := idx.ByURI["cog:mem/semantic/insight.cog.md"]
 	if doc == nil {
 		t.Fatal("document not found in index")
 	}
 	if len(doc.InlineRefs) == 0 {
 		t.Fatal("expected inline refs from body content")
 	}
-	// Should find cog://mem/... and cog://conf/... in the body.
+	// Should find cog:mem/... and cog:conf/... in the body.
 	var foundMem, foundConf bool
 	for _, r := range doc.InlineRefs {
-		if strings.HasPrefix(r, "cog://mem/") {
+		if strings.HasPrefix(r, "cog:mem/") {
 			foundMem = true
 		}
-		if strings.HasPrefix(r, "cog://conf/") {
+		if strings.HasPrefix(r, "cog:conf/") {
 			foundConf = true
 		}
 	}
 	if !foundMem {
-		t.Errorf("cog://mem/ inline ref not found; got: %v", doc.InlineRefs)
+		t.Errorf("cog:mem/ inline ref not found; got: %v", doc.InlineRefs)
 	}
 	if !foundConf {
-		t.Errorf("cog://conf/ inline ref not found; got: %v", doc.InlineRefs)
+		t.Errorf("cog:conf/ inline ref not found; got: %v", doc.InlineRefs)
 	}
 }
 
@@ -257,7 +257,7 @@ func TestBuildIndexBrokenFrontmatter(t *testing.T) {
 	if len(idx.ByURI) == 0 {
 		t.Error("broken-frontmatter file should still appear in index")
 	}
-	doc := idx.ByURI["cog://mem/semantic/broken.cog.md"]
+	doc := idx.ByURI["cog:mem/semantic/broken.cog.md"]
 	if doc == nil {
 		t.Error("expected broken.cog.md to be indexed")
 		return

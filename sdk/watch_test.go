@@ -293,7 +293,7 @@ func TestPathToURI(t *testing.T) {
 
 	pattern := &watchPattern{namespace: "mem"}
 	mapping := map[string]string{
-		memDir: "cog://mem",
+		memDir: "cog:mem",
 	}
 
 	tests := []struct {
@@ -302,15 +302,15 @@ func TestPathToURI(t *testing.T) {
 	}{
 		{
 			filePath: filepath.Join(memDir, "semantic", "test.cog.md"),
-			wantURI:  "cog://mem/semantic/test",
+			wantURI:  "cog:mem/semantic/test",
 		},
 		{
 			filePath: filepath.Join(memDir, "semantic", "test.md"),
-			wantURI:  "cog://mem/semantic/test",
+			wantURI:  "cog:mem/semantic/test",
 		},
 		{
 			filePath: filepath.Join(memDir, "episodic", "session.cog.md"),
-			wantURI:  "cog://mem/episodic/session",
+			wantURI:  "cog:mem/episodic/session",
 		},
 	}
 

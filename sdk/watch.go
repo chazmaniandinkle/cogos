@@ -254,7 +254,7 @@ func (w *Watcher) convertFSEvent(event fsnotify.Event, pattern *watchPattern, pa
 	return watchEvent
 }
 
-// pathToURI converts a file path back to a cog:// URI.
+// pathToURI converts a file path back to a cog: URI (bare form per ADR-067).
 func (w *Watcher) pathToURI(filePath string, pattern *watchPattern, pathMapping map[string]string) string {
 	// Check if path matches any known mapping
 	for basePath, baseURI := range pathMapping {
@@ -263,7 +263,7 @@ func (w *Watcher) pathToURI(filePath string, pattern *watchPattern, pathMapping 
 			relPath = strings.TrimPrefix(relPath, "/")
 
 			// Remove .cog.md or .md extension for memory URIs
-			if pattern.namespace == "memory" {
+			if pattern.namespace == "memory" || pattern.namespace == "mem" {
 				relPath = strings.TrimSuffix(relPath, ".cog.md")
 				relPath = strings.TrimSuffix(relPath, ".md")
 			}
@@ -283,7 +283,7 @@ func (w *Watcher) pathToURI(filePath string, pattern *watchPattern, pathMapping 
 		relPath := strings.TrimPrefix(filePath, memDir+"/")
 		relPath = strings.TrimSuffix(relPath, ".cog.md")
 		relPath = strings.TrimSuffix(relPath, ".md")
-		return "cog://mem/" + relPath
+		return "cog:mem/" + relPath
 	}
 
 	if strings.HasPrefix(filePath, cogDir) {
@@ -295,19 +295,19 @@ func (w *Watcher) pathToURI(filePath string, pattern *watchPattern, pathMapping 
 			case "adr":
 				if len(parts) > 1 {
 					name := strings.TrimSuffix(parts[1], ".md")
-					return "cog://adr/" + name
+					return "cog:adr/" + name
 				}
-				return "cog://adr"
+				return "cog:adr"
 			case "ledger":
 				if len(parts) > 1 {
-					return "cog://ledger/" + parts[1]
+					return "cog:ledger/" + parts[1]
 				}
-				return "cog://ledger"
+				return "cog:ledger"
 			case "signals":
 				if len(parts) > 1 {
-					return "cog://signals/" + parts[1]
+					return "cog:signals/" + parts[1]
 				}
-				return "cog://signals"
+				return "cog:signals"
 			}
 		}
 	}
@@ -324,13 +324,19 @@ type watchPattern struct {
 	raw       string
 }
 
-// parseWatchPattern parses a cog:// URI pattern for watching.
+// parseWatchPattern parses a cog: URI pattern for watching.
+// Accepts both cog:namespace/... (bare) and cog://namespace/... (legacy).
 func parseWatchPattern(pattern string) (*watchPattern, error) {
-	if !strings.HasPrefix(pattern, "cog://") {
-		return nil, InvalidURIError(pattern, "must start with cog://")
+	if !strings.HasPrefix(pattern, "cog:") {
+		return nil, InvalidURIError(pattern, "must start with cog:")
 	}
 
-	rest := strings.TrimPrefix(pattern, "cog://")
+	var rest string
+	if strings.HasPrefix(pattern, "cog://") {
+		rest = strings.TrimPrefix(pattern, "cog://")
+	} else {
+		rest = strings.TrimPrefix(pattern, "cog:")
+	}
 	parts := strings.SplitN(rest, "/", 2)
 
 	if len(parts) == 0 || parts[0] == "" {
@@ -383,12 +389,12 @@ func (k *Kernel) resolveWatchPaths(pattern *watchPattern) ([]string, map[string]
 	mapping := make(map[string]string)
 
 	switch pattern.namespace {
-	case "memory":
+	case "memory", "mem":
 		basePath := k.MemoryDir()
 		if pattern.path != "" {
 			basePath = filepath.Join(basePath, pattern.path)
 		}
-		baseURI := "cog://memory"
+		baseURI := "cog:mem"
 		if pattern.path != "" {
 			baseURI += "/" + pattern.path
 		}
@@ -402,7 +408,7 @@ func (k *Kernel) resolveWatchPaths(pattern *watchPattern) ([]string, map[string]
 				for _, entry := range entries {
 					paths = append(paths, entry)
 					relPath := strings.TrimPrefix(entry, k.MemoryDir()+"/")
-					mapping[entry] = "cog://mem/" + relPath
+					mapping[entry] = "cog:mem/" + relPath
 				}
 			}
 		}
@@ -410,7 +416,7 @@ func (k *Kernel) resolveWatchPaths(pattern *watchPattern) ([]string, map[string]
 	case "signals":
 		basePath := filepath.Join(k.CogDir(), "signals")
 		paths = append(paths, basePath)
-		mapping[basePath] = "cog://signals"
+		mapping[basePath] = "cog:signals"
 
 	case "ledger":
 		basePath := filepath.Join(k.CogDir(), "ledger")
@@ -418,20 +424,20 @@ func (k *Kernel) resolveWatchPaths(pattern *watchPattern) ([]string, map[string]
 			basePath = filepath.Join(basePath, pattern.path)
 		}
 		paths = append(paths, basePath)
-		mapping[basePath] = "cog://ledger"
+		mapping[basePath] = "cog:ledger"
 		if pattern.path != "" {
-			mapping[basePath] = "cog://ledger/" + pattern.path
+			mapping[basePath] = "cog:ledger/" + pattern.path
 		}
 
 	case "adr":
 		basePath := filepath.Join(k.CogDir(), "adr")
 		paths = append(paths, basePath)
-		mapping[basePath] = "cog://adr"
+		mapping[basePath] = "cog:adr"
 
 	case "coherence":
 		statePath := k.StateDir()
 		paths = append(paths, statePath)
-		mapping[statePath] = "cog://coherence"
+		mapping[statePath] = "cog:coherence"
 
 	default:
 		return nil, nil, NewURIError("Watch", pattern.raw, ErrUnknownNamespace)
