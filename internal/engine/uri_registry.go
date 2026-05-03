@@ -79,6 +79,17 @@ func defaultNodeDir() string {
 	return filepath.Join(home, ".cog", "node")
 }
 
+// resolveLocalWorkspace returns the workspace root for the current process.
+// Unlike workspace.ResolveWorkspace(), it checks COG_ROOT directly before
+// falling back to the cached resolver, so tests can set COG_ROOT via
+// t.Setenv and get a fresh read rather than the cached value.
+func resolveLocalWorkspace() (string, string, error) {
+	if root := os.Getenv("COG_ROOT"); root != "" {
+		return root, "explicit", nil
+	}
+	return workspace.ResolveWorkspace()
+}
+
 // Resolve resolves a URI to a uriContent with filesystem metadata.
 //
 // Supported forms:
@@ -97,7 +108,7 @@ func (r *uriRegistryImpl) Resolve(ctx context.Context, rawURI string) (*uriConte
 	// local-workspace projection lookup.  We don't do alias expansion here
 	// because ADR-067 says bare cog: is always local.
 	if !strings.HasPrefix(rawURI, "cog://") {
-		workspaceRoot, _, err := workspace.ResolveWorkspace()
+		workspaceRoot, _, err := resolveLocalWorkspace()
 		if err != nil {
 			return nil, fmt.Errorf("uri_registry: no workspace: %w", err)
 		}
@@ -140,7 +151,7 @@ func (r *uriRegistryImpl) Resolve(ctx context.Context, rawURI string) (*uriConte
 
 	// Step 2: if authority is a known projection namespace, resolve locally.
 	if isProjectionNamespace(authority) {
-		workspaceRoot, _, err := workspace.ResolveWorkspace()
+		workspaceRoot, _, err := resolveLocalWorkspace()
 		if err != nil {
 			return nil, fmt.Errorf("uri_registry: no workspace: %w", err)
 		}
