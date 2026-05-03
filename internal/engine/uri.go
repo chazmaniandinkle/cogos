@@ -171,20 +171,29 @@ func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
 		rest = strings.TrimPrefix(uri, "cog:")
 	}
 
-	// Split off fragment.
-	fragment := ""
-	if idx := strings.IndexByte(rest, '#'); idx >= 0 {
-		fragment = rest[idx+1:]
-		rest = rest[:idx]
+	// RFC 3986 ordering requires ?query before #fragment.  Reject malformed
+	// URIs where '#' appears before '?' — they would cause the fragment stripper
+	// to consume the query string, silently bypassing digest fail-closed (ADR-067
+	// §170).  Malformed input is not required to be supported; rejecting it
+	// keeps the fail-closed contract unambiguous.
+	if qIdx := strings.IndexByte(rest, '?'); qIdx >= 0 {
+		if hIdx := strings.IndexByte(rest, '#'); hIdx >= 0 && hIdx < qIdx {
+			return nil, fmt.Errorf("malformed cog: URI (fragment before query): %q", uri)
+		}
 	}
 
-	// Split off query string and check for digest fail-closed (ADR-067 §170).
-	// A ?digest=sha256:... param signals an integrity constraint.  The local
-	// projection resolver does not verify content hashes, so it MUST error rather
-	// than silently ignoring the param.
+	// Split off query string first (RFC 3986: query precedes fragment).
+	// Check for digest fail-closed (ADR-067 §170): a ?digest=sha256:... param
+	// signals an integrity constraint.  The local projection resolver does not
+	// implement digest verification, so it MUST error rather than silently
+	// ignoring the integrity constraint.
 	if idx := strings.IndexByte(rest, '?'); idx >= 0 {
 		query := rest[idx+1:]
 		rest = rest[:idx]
+		// Strip fragment from query tail if present (well-formed: ?q#frag).
+		if fIdx := strings.IndexByte(query, '#'); fIdx >= 0 {
+			query = query[:fIdx]
+		}
 		for _, param := range strings.Split(query, "&") {
 			if strings.HasPrefix(param, "digest=") {
 				return nil, fmt.Errorf("%w: %q", ErrDigestNotVerified, uri)
@@ -192,6 +201,13 @@ func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
 		}
 		// Other query params (e.g. ?ref=, ?format=) are silently ignored at the
 		// filesystem level; higher-level handlers may interpret them.
+	}
+
+	// Split off fragment (always follows query per RFC 3986).
+	fragment := ""
+	if idx := strings.IndexByte(rest, '#'); idx >= 0 {
+		fragment = rest[idx+1:]
+		rest = rest[:idx]
 	}
 
 	// For the authority form (cog://...) the first component might be a workspace

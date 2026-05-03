@@ -222,3 +222,52 @@ func TestResolveURI_KnownProjectionAsAuthorityStillWorks(t *testing.T) {
 		t.Errorf("known projection in authority position: unexpected error %v", err)
 	}
 }
+
+// ── 5. Fragment-before-query rejection (issue #171) ───────────────────────────
+
+// TestResolveURI_FragmentBeforeQuery_Rejected verifies that a malformed URI
+// with '#' appearing before '?' is rejected rather than silently bypassing the
+// digest fail-closed check (ADR-067 §170).
+//
+// Without the fix: cog:adr/067#frag?digest=sha256:abc is parsed as
+// fragment="frag?digest=sha256:abc", leaving no '?' in rest, so
+// ErrDigestNotVerified is never returned.
+func TestResolveURI_FragmentBeforeQuery_Rejected(t *testing.T) {
+	t.Parallel()
+	root := "/workspace"
+
+	malformed := []string{
+		"cog:adr/067#frag?digest=sha256:abc",
+		"cog:mem/semantic/foo.cog.md#Section?digest=sha256:deadbeef",
+		"cog://mem/semantic/foo.cog.md#Anchor?ref=main",
+	}
+
+	for _, uri := range malformed {
+		uri := uri
+		t.Run(uri, func(t *testing.T) {
+			t.Parallel()
+			_, err := ResolveURI(root, uri)
+			if err == nil {
+				t.Fatalf("ResolveURI(%q): expected error for malformed fragment-before-query URI, got nil", uri)
+			}
+		})
+	}
+}
+
+// TestResolveURI_DigestWithFragment_WellFormed verifies that a well-formed URI
+// carrying both a query and a fragment in RFC 3986 order (?query#fragment) is
+// still correctly fail-closed on a digest param.
+func TestResolveURI_DigestWithFragment_WellFormed(t *testing.T) {
+	t.Parallel()
+	root := "/workspace"
+
+	// Well-formed: ?query#fragment — digest must still fail-closed.
+	uri := "cog:mem/semantic/foo.cog.md?digest=sha256:abc#Section"
+	_, err := ResolveURI(root, uri)
+	if err == nil {
+		t.Fatalf("ResolveURI(%q): expected ErrDigestNotVerified, got nil", uri)
+	}
+	if !errors.Is(err, ErrDigestNotVerified) {
+		t.Errorf("ResolveURI(%q): got %v; want errors.Is ErrDigestNotVerified", uri, err)
+	}
+}
