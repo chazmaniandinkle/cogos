@@ -11,7 +11,7 @@ import (
 func TestResolveToFieldKeyRoundTrip(t *testing.T) {
 	t.Parallel()
 	root := "/workspace"
-	uri := "cog://mem/semantic/insights/foo.cog.md"
+	uri := "cog:mem/semantic/insights/foo.cog.md"
 
 	key := ResolveToFieldKey(root, uri)
 	want := root + "/.cog/mem/semantic/insights/foo.cog.md"
@@ -29,6 +29,7 @@ func TestResolveToFieldKeyRoundTrip(t *testing.T) {
 func TestResolveToFieldKeyShortURI(t *testing.T) {
 	t.Parallel()
 	root := "/workspace"
+	// Both bare and authority forms resolve to the same field key.
 	short := "cog:mem/semantic/insights/foo.cog.md"
 	full := "cog://mem/semantic/insights/foo.cog.md"
 
@@ -36,7 +37,7 @@ func TestResolveToFieldKeyShortURI(t *testing.T) {
 	fullKey := ResolveToFieldKey(root, full)
 
 	if shortKey != fullKey {
-		t.Errorf("short URI key = %q; full URI key = %q; want same", shortKey, fullKey)
+		t.Errorf("bare URI key = %q; authority URI key = %q; want same", shortKey, fullKey)
 	}
 }
 
@@ -44,7 +45,7 @@ func TestResolveToFieldKeyMemoryRelative(t *testing.T) {
 	t.Parallel()
 	root := "/workspace"
 	rel := "semantic/insights/foo.cog.md"
-	full := "cog://mem/semantic/insights/foo.cog.md"
+	full := "cog://mem/semantic/insights/foo.cog.md" // test with authority form too
 
 	relKey := ResolveToFieldKey(root, rel)
 	fullKey := ResolveToFieldKey(root, full)
@@ -101,7 +102,7 @@ func TestFieldKeyToURIDocs(t *testing.T) {
 	abs := filepath.Join(root, ".cog/docs/foo.md")
 
 	got := FieldKeyToURI(root, abs)
-	want := "cog://docs/foo.md"
+	want := "cog:docs/foo.md"
 	if got != want {
 		t.Errorf("FieldKeyToURI(%q) = %q; want %q", abs, got, want)
 	}
@@ -113,7 +114,7 @@ func TestFieldKeyToURISkills(t *testing.T) {
 	abs := filepath.Join(root, ".claude/skills/foo/SKILL.md")
 
 	got := FieldKeyToURI(root, abs)
-	want := "cog://skill/foo/SKILL.md"
+	want := "cog:skill/foo/SKILL.md"
 	if got != want {
 		t.Errorf("FieldKeyToURI(%q) = %q; want %q", abs, got, want)
 	}
@@ -125,6 +126,7 @@ func TestFieldKeyToURIUnmapped(t *testing.T) {
 	abs := filepath.Join(root, "apps/someapp/main.go")
 
 	got := FieldKeyToURI(root, abs)
+	// Unmapped paths still use the authority form for cross-workspace refs.
 	want := "cog://workspace/apps/someapp/main.go"
 	if got != want {
 		t.Errorf("FieldKeyToURI(%q) = %q; want %q", abs, got, want)
@@ -137,7 +139,7 @@ func TestFieldKeyToURIConfig(t *testing.T) {
 	abs := filepath.Join(root, ".cog/config/kernel.yaml")
 
 	got := FieldKeyToURI(root, abs)
-	want := "cog://conf/kernel.yaml"
+	want := "cog:conf/kernel.yaml"
 	if got != want {
 		t.Errorf("FieldKeyToURI(%q) = %q; want %q", abs, got, want)
 	}
@@ -149,7 +151,7 @@ func TestFieldKeyToURIOntology(t *testing.T) {
 	abs := filepath.Join(root, ".cog/ontology/crystal.cog.md")
 
 	got := FieldKeyToURI(root, abs)
-	want := "cog://ontology/crystal"
+	want := "cog:ontology/crystal"
 	if got != want {
 		t.Errorf("FieldKeyToURI(%q) = %q; want %q", abs, got, want)
 	}

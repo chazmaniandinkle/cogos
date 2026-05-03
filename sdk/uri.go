@@ -35,47 +35,72 @@ type ParsedURI struct {
 	Raw string
 }
 
-// Namespaces defines all valid cog:// namespaces.
-// This mirrors the kernel's projection types.
+// Namespaces is the SDK-layer copy of the canonical namespace whitelist.
+// SINGLE SOURCE OF TRUTH: pkg/uri/namespace.go — keep in sync with that file.
+// The sdk module cannot import pkg/uri directly (separate Go modules); this
+// copy must be identical to pkg/uri.Namespaces.
 var Namespaces = map[string]bool{
-	// Core namespaces
-	"mem":       true, // cog://mem/* → Cogdocs
-	"signals":   true, // cog://signals/* → Signal field
-	"context":   true, // cog://context → 4-tier context
-	"thread":    true, // cog://thread/* → Conversation threads
-	"coherence": true, // cog://coherence → Coherence state
-	"identity":  true, // cog://identity → Workspace identity
-	"src":       true, // cog://src → SRC constants
-	"adr":       true, // cog://adr/* → Architecture Decision Records
-	"ledger":    true, // cog://ledger/* → Event ledger
-	"inference": true, // cog://inference → Inference endpoint
-	"kernel":    true, // cog://kernel/* → Kernel internal paths
-	"hooks":     true, // cog://hooks/* → Hook definitions
+	// ── Core memory / knowledge ────────────────────────────────────────────────
+	"mem":      true, // cog:mem/* → CogDocs memory corpus
+	"adr":      true, // cog:adr/* → Architecture Decision Records
+	"docs":     true, // cog:docs/* → Documentation
+	"ontology": true, // cog:ontology/* → Ontology definitions
 
-	// Extended namespaces (from kernel projections)
-	"spec":      true, // cog://spec/* → Specifications
-	"specs":     true, // cog://specs/* → Specifications (plural alias)
-	"status":    true, // cog://status/* → Status files (JSON)
-	"canonical": true, // cog://canonical → Holographic baseline hash
-	"handoff":   true, // cog://handoff/* → Handoff documents
-	"handoffs":  true, // cog://handoffs/* → Handoffs (plural alias)
-	"crystal":   true, // cog://crystal/* → Ledger crystals
-	"role":      true, // cog://role/* → Role definitions
-	"roles":     true, // cog://roles/* → Roles (plural alias)
-	"skill":     true, // cog://skill/* → Skill definitions
-	"skills":    true, // cog://skills/* → Skills (plural alias)
-	"agent":     true, // cog://agent/* → Agent definitions
-	"agents":    true, // cog://agents/* → Agents (plural alias)
+	// ── Config / kernel internals ──────────────────────────────────────────────
+	"conf":      true, // cog:conf/* → Configuration files (.cog/config/)
+	"config":    true, // cog:config/* → Configuration (alias for conf)
+	"kernel":    true, // cog:kernel/* → Kernel internal paths
+	"canonical": true, // cog:canonical → Holographic baseline hash
+
+	// ── Identity / session ────────────────────────────────────────────────────
+	"identity":  true, // cog:identity → Workspace identity
+	"src":       true, // cog:src → SRC constants
+	"coherence": true, // cog:coherence → Coherence state
+
+	// ── Hooks / lifecycle ─────────────────────────────────────────────────────
+	"hooks": true, // cog:hooks/* → Hook definitions
+
+	// ── Ledger / crystal ──────────────────────────────────────────────────────
+	"ledger":  true, // cog:ledger/* → Event ledger
+	"crystal": true, // cog:crystal → Ledger crystal state
+
+	// ── Specs / status ────────────────────────────────────────────────────────
+	"spec":   true, // cog:spec/* → Specifications
+	"specs":  true, // cog:specs/* → Specifications (plural alias)
+	"status": true, // cog:status/* → Status snapshots (JSON)
+	"work":   true, // cog:work/* → Work items
+
+	// ── Agents / roles / skills ────────────────────────────────────────────────
+	"agent":  true, // cog:agent/* → Agent definitions
+	"agents": true, // cog:agents/* → Agents (plural alias)
+	"role":   true, // cog:role/* → Role definitions
+	"roles":  true, // cog:roles/* → Roles (plural alias)
+	"skill":  true, // cog:skill/* → Skill definitions
+	"skills": true, // cog:skills/* → Skills (plural alias)
+
+	// ── Handoffs / artifacts ──────────────────────────────────────────────────
+	"handoff":   true, // cog:handoff/* → Handoff documents
+	"handoffs":  true, // cog:handoffs/* → Handoffs (plural alias)
+	"artifact":  true, // cog:artifact/* → Artifacts
+	"artifacts": true, // cog:artifacts/* → Artifacts (plural alias)
+
+	// ── Context / signal / thread (SDK-layer namespaces) ──────────────────────
+	"context":   true, // cog:context → 4-tier context assembly
+	"signals":   true, // cog:signals/* → Signal field
+	"thread":    true, // cog:thread/* → Conversation threads
+	"inference": true, // cog:inference → Inference endpoint
 }
 
-// ParseURI parses a cog:// URI into its components.
+// ParseURI parses a cog: URI into its components.
+// Both the bare form (cog:namespace/path) and the legacy authority form
+// (cog://namespace/path) are accepted per ADR-067.
 //
 // Returns ErrInvalidURI if the URI is malformed or uses an unknown scheme.
 // Returns ErrUnknownNamespace if the namespace is not recognized.
 //
 // Example:
 //
-//	parsed, err := sdk.ParseURI("cog://mem/semantic/insights?q=topic&limit=10")
+//	parsed, err := sdk.ParseURI("cog:mem/semantic/insights?q=topic&limit=10")
 //	// parsed.Namespace = "mem"
 //	// parsed.Path = "semantic/insights"
 //	// parsed.Query = {"q": ["topic"], "limit": ["10"]}
@@ -84,13 +109,34 @@ func ParseURI(rawURI string) (*ParsedURI, error) {
 		return nil, InvalidURIError(rawURI, "empty URI")
 	}
 
-	// Must start with cog://
-	if !strings.HasPrefix(rawURI, "cog://") {
-		return nil, InvalidURIError(rawURI, "must start with cog://")
+	if !strings.HasPrefix(rawURI, "cog:") {
+		return nil, InvalidURIError(rawURI, "must start with cog:")
 	}
 
-	// Parse as standard URL (replacing cog:// with http:// for parsing)
-	httpURI := "http://" + strings.TrimPrefix(rawURI, "cog://")
+	// Fail-closed on digest integrity constraint.
+	if strings.Contains(rawURI, "?") {
+		query := rawURI[strings.Index(rawURI, "?")+1:]
+		// strip fragment from query if present
+		if idx := strings.IndexByte(query, '#'); idx >= 0 {
+			query = query[:idx]
+		}
+		for _, param := range strings.Split(query, "&") {
+			if strings.HasPrefix(param, "digest=") {
+				return nil, InvalidURIError(rawURI, "digest verification not implemented: fail-closed per ADR-067")
+			}
+		}
+	}
+
+	// Normalise both cog://namespace/... and cog:namespace/... to http:// for parsing.
+	var httpURI string
+	if strings.HasPrefix(rawURI, "cog://") {
+		httpURI = "http://" + strings.TrimPrefix(rawURI, "cog://")
+	} else {
+		// Bare form: cog:namespace/path → treat first segment as host in http://
+		bare := strings.TrimPrefix(rawURI, "cog:")
+		httpURI = "http://" + bare
+	}
+
 	parsed, err := url.Parse(httpURI)
 	if err != nil {
 		return nil, InvalidURIError(rawURI, err.Error())
@@ -124,9 +170,10 @@ func ParseURI(rawURI string) (*ParsedURI, error) {
 }
 
 // String returns the canonical string representation of the URI.
+// Always emits the bare cog: form (no //) per ADR-067.
 func (p *ParsedURI) String() string {
 	var sb strings.Builder
-	sb.WriteString("cog://")
+	sb.WriteString("cog:")
 	sb.WriteString(p.Namespace)
 	if p.Path != "" {
 		sb.WriteString("/")

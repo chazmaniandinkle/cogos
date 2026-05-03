@@ -139,7 +139,7 @@ func TestPathToURIMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PathToURI: %v", err)
 	}
-	want := "cog://mem/semantic/insights/foo.cog.md"
+	want := "cog:mem/semantic/insights/foo.cog.md"
 	if got != want {
 		t.Errorf("got %q; want %q", got, want)
 	}
@@ -152,8 +152,8 @@ func TestPathToURIConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PathToURI: %v", err)
 	}
-	if !strings.HasPrefix(got, "cog://conf/") {
-		t.Errorf("got %q; want cog://conf/ prefix", got)
+	if !strings.HasPrefix(got, "cog:conf/") {
+		t.Errorf("got %q; want cog:conf/ prefix", got)
 	}
 }
 
@@ -165,7 +165,7 @@ func TestPathToURIAgents(t *testing.T) {
 		t.Fatalf("PathToURI: %v", err)
 	}
 	// .md stripped for agents
-	want := "cog://agents/cog"
+	want := "cog:agents/cog"
 	if got != want {
 		t.Errorf("got %q; want %q", got, want)
 	}
@@ -179,8 +179,8 @@ func TestPathToURIRelativePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PathToURI: %v", err)
 	}
-	if !strings.HasPrefix(got, "cog://mem/") {
-		t.Errorf("got %q; want cog://mem/ prefix", got)
+	if !strings.HasPrefix(got, "cog:mem/") {
+		t.Errorf("got %q; want cog:mem/ prefix", got)
 	}
 }
 
@@ -196,23 +196,24 @@ func TestPathToURIUnknownPath(t *testing.T) {
 
 func TestExtractInlineRefsBasic(t *testing.T) {
 	t.Parallel()
-	content := `See cog://mem/semantic/foo.cog.md and cog://conf/kernel.yaml for details.`
+	// Test with bare cog: form (ADR-067 canonical)
+	content := `See cog:mem/semantic/foo.cog.md and cog:conf/kernel.yaml for details.`
 	refs := ExtractInlineRefs(content)
 	if len(refs) != 2 {
 		t.Fatalf("got %d refs; want 2: %v", len(refs), refs)
 	}
 	// Sorted output.
-	if refs[0] != "cog://conf/kernel.yaml" {
-		t.Errorf("refs[0] = %q; want cog://conf/kernel.yaml", refs[0])
+	if refs[0] != "cog:conf/kernel.yaml" {
+		t.Errorf("refs[0] = %q; want cog:conf/kernel.yaml", refs[0])
 	}
-	if refs[1] != "cog://mem/semantic/foo.cog.md" {
-		t.Errorf("refs[1] = %q; want cog://mem/semantic/foo.cog.md", refs[1])
+	if refs[1] != "cog:mem/semantic/foo.cog.md" {
+		t.Errorf("refs[1] = %q; want cog:mem/semantic/foo.cog.md", refs[1])
 	}
 }
 
 func TestExtractInlineRefsDeduplicated(t *testing.T) {
 	t.Parallel()
-	content := `cog://mem/foo.md appears here and cog://mem/foo.md again here.`
+	content := `cog:mem/foo.md appears here and cog:mem/foo.md again here.`
 	refs := ExtractInlineRefs(content)
 	if len(refs) != 1 {
 		t.Errorf("got %d refs; want 1 (deduplicated): %v", len(refs), refs)
@@ -221,7 +222,7 @@ func TestExtractInlineRefsDeduplicated(t *testing.T) {
 
 func TestExtractInlineRefsWithFragment(t *testing.T) {
 	t.Parallel()
-	content := `Read cog://mem/doc.cog.md#the-seed for context.`
+	content := `Read cog:mem/doc.cog.md#the-seed for context.`
 	refs := ExtractInlineRefs(content)
 	if len(refs) != 1 {
 		t.Fatalf("got %d refs; want 1: %v", len(refs), refs)
@@ -243,7 +244,7 @@ func TestExtractInlineRefsEmpty(t *testing.T) {
 
 func TestExtractInlineRefsInMarkdownLink(t *testing.T) {
 	t.Parallel()
-	content := `[link](cog://mem/semantic/foo.cog.md) and plain cog://mem/bar.cog.md`
+	content := `[link](cog:mem/semantic/foo.cog.md) and plain cog:mem/bar.cog.md`
 	refs := ExtractInlineRefs(content)
 	// Both should be found; parenthesis is not captured by the pattern.
 	if len(refs) != 2 {
@@ -289,11 +290,14 @@ func TestResolveURIGlobNoMatch(t *testing.T) {
 
 func TestCogURIPatternDoesNotMatchHTTPS(t *testing.T) {
 	t.Parallel()
-	content := `See https://example.com/foo and cog://mem/bar.md`
+	content := `See https://example.com/foo and cog:mem/bar.md`
 	refs := ExtractInlineRefs(content)
 	for _, r := range refs {
 		if strings.HasPrefix(r, "https://") {
 			t.Errorf("https:// URI incorrectly matched: %q", r)
 		}
+	}
+	if len(refs) != 1 {
+		t.Errorf("expected 1 cog: ref; got %d: %v", len(refs), refs)
 	}
 }

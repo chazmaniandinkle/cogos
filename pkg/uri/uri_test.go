@@ -17,38 +17,48 @@ func TestParseBasic(t *testing.T) {
 		wantFrag  string
 		wantQuery map[string]string
 	}{
+		// Bare form (canonical per ADR-067)
 		{
-			raw:    "cog://mem/semantic/insights/eigenform",
+			raw:    "cog:mem/semantic/insights/eigenform",
 			wantNS: "mem", wantPath: "semantic/insights/eigenform",
 		},
 		{
-			raw:    "cog://mem/semantic/insights/eigenform.cog.md#Seed",
+			raw:    "cog:mem/semantic/insights/eigenform.cog.md#Seed",
 			wantNS: "mem", wantPath: "semantic/insights/eigenform.cog.md", wantFrag: "Seed",
 		},
 		{
-			raw:    "cog://conf/kernel.yaml",
+			raw:    "cog:conf/kernel.yaml",
 			wantNS: "conf", wantPath: "kernel.yaml",
 		},
 		{
-			raw:    "cog://crystal",
+			raw:    "cog:crystal",
 			wantNS: "crystal",
 		},
 		{
-			raw:       "cog://signals/inference?above=0.3",
+			raw:       "cog:signals/inference?above=0.3",
 			wantNS:    "signals",
 			wantPath:  "inference",
 			wantQuery: map[string]string{"above": "0.3"},
 		},
 		{
-			raw:       "cog://context?budget=50000&model=sonnet",
+			raw:       "cog:context?budget=50000&model=sonnet",
 			wantNS:    "context",
 			wantQuery: map[string]string{"budget": "50000", "model": "sonnet"},
 		},
 		{
-			raw:      "cog://thread/current#last-10",
+			raw:      "cog:thread/current#last-10",
 			wantNS:   "thread",
 			wantPath: "current",
 			wantFrag: "last-10",
+		},
+		// Authority form (legacy — must still be accepted)
+		{
+			raw:    "cog://mem/semantic/insights/eigenform",
+			wantNS: "mem", wantPath: "semantic/insights/eigenform",
+		},
+		{
+			raw:    "cog://crystal",
+			wantNS: "crystal",
 		},
 	}
 
@@ -128,22 +138,29 @@ func TestParseMissingNamespace(t *testing.T) {
 
 func TestStringRoundTrip(t *testing.T) {
 	t.Parallel()
-	cases := []string{
-		"cog://mem/semantic/insights/eigenform",
-		"cog://crystal",
-		"cog://thread/current#last-10",
-		"cog://conf/kernel.yaml",
+	// String() always emits the canonical bare form regardless of input form.
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"cog:mem/semantic/insights/eigenform", "cog:mem/semantic/insights/eigenform"},
+		{"cog://mem/semantic/insights/eigenform", "cog:mem/semantic/insights/eigenform"},
+		{"cog:crystal", "cog:crystal"},
+		{"cog://crystal", "cog:crystal"},
+		{"cog:thread/current#last-10", "cog:thread/current#last-10"},
+		{"cog://thread/current#last-10", "cog:thread/current#last-10"},
+		{"cog:conf/kernel.yaml", "cog:conf/kernel.yaml"},
 	}
-	for _, raw := range cases {
-		t.Run(raw, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
 			t.Parallel()
-			u, err := Parse(raw)
+			u, err := Parse(tc.input)
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
 			got := u.String()
-			if got != raw {
-				t.Errorf("String() = %q; want %q", got, raw)
+			if got != tc.want {
+				t.Errorf("String() = %q; want %q", got, tc.want)
 			}
 		})
 	}
@@ -151,12 +168,12 @@ func TestStringRoundTrip(t *testing.T) {
 
 func TestStringWithQuery(t *testing.T) {
 	t.Parallel()
-	u, err := Parse("cog://signals/inference?above=0.3")
+	u, err := Parse("cog:signals/inference?above=0.3")
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
 	s := u.String()
-	if !strings.HasPrefix(s, "cog://signals/inference?") {
+	if !strings.HasPrefix(s, "cog:signals/inference?") {
 		t.Errorf("unexpected String() = %q", s)
 	}
 	if !strings.Contains(s, "above=0.3") {
@@ -168,7 +185,7 @@ func TestStringWithQuery(t *testing.T) {
 
 func TestGetQueryInt(t *testing.T) {
 	t.Parallel()
-	u, _ := Parse("cog://context?budget=50000")
+	u, _ := Parse("cog:context?budget=50000")
 	if got := u.GetQueryInt("budget", 0); got != 50000 {
 		t.Errorf("GetQueryInt = %d; want 50000", got)
 	}
@@ -179,7 +196,7 @@ func TestGetQueryInt(t *testing.T) {
 
 func TestGetQueryFloat(t *testing.T) {
 	t.Parallel()
-	u, _ := Parse("cog://signals/inference?above=0.3")
+	u, _ := Parse("cog:signals/inference?above=0.3")
 	if got := u.GetQueryFloat("above", 0); got != 0.3 {
 		t.Errorf("GetQueryFloat = %f; want 0.3", got)
 	}
@@ -187,7 +204,7 @@ func TestGetQueryFloat(t *testing.T) {
 
 func TestGetQueryBool(t *testing.T) {
 	t.Parallel()
-	u, _ := Parse("cog://context?verbose=true")
+	u, _ := Parse("cog:context?verbose=true")
 	if !u.GetQueryBool("verbose") {
 		t.Error("GetQueryBool(verbose) = false; want true")
 	}
@@ -198,7 +215,7 @@ func TestGetQueryBool(t *testing.T) {
 
 func TestWithQuery(t *testing.T) {
 	t.Parallel()
-	u, _ := Parse("cog://context?budget=50000")
+	u, _ := Parse("cog:context?budget=50000")
 	u2 := u.WithQuery("model", "sonnet")
 	// Original unchanged.
 	if u.GetQuery("model") != "" {
@@ -271,5 +288,96 @@ func TestIsCogURI(t *testing.T) {
 	}
 	if IsCogURI("") {
 		t.Error("expected false for empty string")
+	}
+}
+
+// ── ADR-067 compliance ─────────────────────────────────────────────────────────
+
+// TestParseDigestFailClosed verifies that a URI carrying ?digest=sha256:...
+// is rejected by Parse per ADR-067 §170 (fail-closed integrity contract).
+func TestParseDigestFailClosed(t *testing.T) {
+	t.Parallel()
+	digests := []string{
+		"cog:mem/semantic/foo.cog.md?digest=sha256:abc123",
+		"cog://mem/semantic/foo.cog.md?digest=sha256:abc123",
+		"cog:conf/kernel.yaml?digest=sha256:deadbeef",
+		// digest alongside other params
+		"cog:mem/foo.cog.md?ref=main&digest=sha256:111",
+	}
+	for _, raw := range digests {
+		raw := raw
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+			_, err := Parse(raw)
+			if err == nil {
+				t.Fatalf("Parse(%q): expected error (digest fail-closed), got nil", raw)
+			}
+			if !errors.Is(err, ErrInvalidURI) {
+				t.Errorf("Parse(%q): got %v; want errors.Is ErrInvalidURI (digest fail-closed)", raw, err)
+			}
+		})
+	}
+}
+
+// TestParseNonDigestQueryAllowed verifies non-digest query params do not trigger
+// the digest fail-closed check.
+func TestParseNonDigestQueryAllowed(t *testing.T) {
+	t.Parallel()
+	_, err := Parse("cog:mem/semantic/foo.cog.md?ref=main")
+	if err != nil {
+		t.Errorf("non-digest query: unexpected error %v", err)
+	}
+}
+
+// TestParseBothFormsRoundTrip verifies that both URI forms parse successfully
+// and that String() always emits the canonical bare form, so a second Parse
+// of the emitted form reproduces an identical URI.
+func TestParseBothFormsRoundTrip(t *testing.T) {
+	t.Parallel()
+	pairs := []struct {
+		bare      string
+		authority string
+	}{
+		{"cog:mem/semantic/insights/eigenform.cog.md", "cog://mem/semantic/insights/eigenform.cog.md"},
+		{"cog:conf/kernel.yaml", "cog://conf/kernel.yaml"},
+		{"cog:crystal", "cog://crystal"},
+		{"cog:thread/current#last-10", "cog://thread/current#last-10"},
+	}
+	for _, p := range pairs {
+		p := p
+		t.Run(p.bare, func(t *testing.T) {
+			t.Parallel()
+
+			uBare, err := Parse(p.bare)
+			if err != nil {
+				t.Fatalf("Parse(bare %q): %v", p.bare, err)
+			}
+			uAuth, err := Parse(p.authority)
+			if err != nil {
+				t.Fatalf("Parse(authority %q): %v", p.authority, err)
+			}
+
+			// Both must emit the same canonical string.
+			if uBare.String() != uAuth.String() {
+				t.Errorf("bare.String()=%q != auth.String()=%q", uBare.String(), uAuth.String())
+			}
+
+			// Round-trip: re-parse the emitted string → must succeed and reproduce.
+			reparse, err := Parse(uBare.String())
+			if err != nil {
+				t.Fatalf("Parse(round-trip %q): %v", uBare.String(), err)
+			}
+			if reparse.String() != uBare.String() {
+				t.Errorf("round-trip mismatch: %q → %q", uBare.String(), reparse.String())
+			}
+
+			// Namespace and Path must be identical for both forms.
+			if uBare.Namespace != uAuth.Namespace {
+				t.Errorf("Namespace: bare=%q auth=%q", uBare.Namespace, uAuth.Namespace)
+			}
+			if uBare.Path != uAuth.Path {
+				t.Errorf("Path: bare=%q auth=%q", uBare.Path, uAuth.Path)
+			}
+		})
 	}
 }

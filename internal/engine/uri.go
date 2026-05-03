@@ -1,28 +1,42 @@
-// uri.go — cog:// URI projection system for CogOS v3
+// uri.go — cog: URI projection system for CogOS v3
 //
-// A cog:// URI has the form:
+// A cog: URI has the form (ADR-067):
 //
-//	cog://type/path[#fragment]
+//	cog:projection/path[?query][#fragment]      (local — no authority)
+//	cog://workspace/projection/path[?query][#fragment]  (cross-workspace authority form)
 //
-// "type" selects a Projection that maps to a filesystem location under the
-// workspace root.  "path" is the resource name within that projection.
-// "fragment" (optional, after '#') identifies a section within the file.
+// Both forms are accepted.  The bare form (no //) is canonical for local
+// references; the authority form is used for cross-workspace refs.
 //
 // Examples:
 //
-//	cog://mem/semantic/insights/eigenform.cog.md        → .cog/mem/semantic/insights/eigenform.cog.md
-//	cog://mem/semantic/insights/eigenform.cog.md#Seed   → same path, anchor "Seed"
-//	cog://conf/kernel.yaml                              → .cog/config/kernel.yaml
-//	cog://crystal                                       → .cog/ledger/crystal.json
+//	cog:mem/semantic/insights/eigenform.cog.md        → .cog/mem/semantic/insights/eigenform.cog.md
+//	cog:mem/semantic/insights/eigenform.cog.md#Seed   → same path, anchor "Seed"
+//	cog:conf/kernel.yaml                              → .cog/config/kernel.yaml
+//	cog:crystal                                       → .cog/ledger/crystal.json
+//	cog://workspace/mem/semantic/x                    → cross-workspace (ErrUnknownAuthority unless #167 merges)
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 )
+
+// ErrUnknownAuthority is returned when a cog://workspace/... URI references a
+// workspace name that is not registered in the local URIRegistry.  The URI
+// registry implementation lives in #167; until that lands the error is always
+// returned for any cross-workspace authority form.
+var ErrUnknownAuthority = errors.New("unknown workspace authority")
+
+// ErrDigestNotVerified is returned when a URI carries a ?digest=sha256:...
+// query parameter but the resolver does not implement digest verification.
+// Per ADR-067 the resolver MUST fail-closed rather than silently ignoring the
+// integrity constraint.
+var ErrDigestNotVerified = errors.New("digest verification not implemented: fail-closed per ADR-067")
 
 // ── Projection ───────────────────────────────────────────────────────────────
 
@@ -118,33 +132,33 @@ type URIResolution struct {
 	Fragment string
 }
 
-// cogURIPattern matches cog:// URI references embedded in document content.
-// It captures the scheme, type, optional path, and optional #fragment.
+// cogURIPattern matches cog: URI references embedded in document content.
+// Accepts both the bare form (cog:projection/path) and the authority form
+// (cog://projection/path) per ADR-067.
 var cogURIPattern = regexp.MustCompile(
-	`cog://` + // scheme
+	`cog:(?://)?` + // scheme — cog:// or cog:
 		`\w+` + // type (required)
-		`(?:/[\w./_-]*)?` + // /path (optional; allows dots, slashes, underscores, hyphens)
-		`(?:#[\w-]*)? `, // #fragment (optional)
+		`(?:/[\w./_-]*)?` + // /path (optional)
+		`(?:#[\w-]*)?`, // #fragment (optional)
 )
 
-// init replaces the trailing space in the pattern (used to anchor the
-// character class close) with a version that stops at natural boundaries.
-func init() {
-	cogURIPattern = regexp.MustCompile(
-		`cog://\w+(?:/[\w./_-]*)?(?:#[\w-]*)?`,
-	)
-}
-
-// ResolveURI resolves a cog:// URI to an absolute filesystem path.
+// ResolveURI resolves a cog: URI to an absolute filesystem path.
+// Both the bare form (cog:projection/path) and the authority form
+// (cog://projection/path) are accepted per ADR-067.
 // The #fragment part (section anchor) is separated and returned in
 // URIResolution.Fragment without modifying the path resolution.
 func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
-	if !strings.HasPrefix(uri, "cog://") {
-		return nil, fmt.Errorf("not a cog:// URI: %q", uri)
+	if !strings.HasPrefix(uri, "cog:") {
+		return nil, fmt.Errorf("not a cog: URI: %q", uri)
 	}
 
-	// Strip scheme.
-	rest := strings.TrimPrefix(uri, "cog://")
+	// Strip scheme — normalise both cog://... and cog:... to a bare path.
+	var rest string
+	if strings.HasPrefix(uri, "cog://") {
+		rest = strings.TrimPrefix(uri, "cog://")
+	} else {
+		rest = strings.TrimPrefix(uri, "cog:")
+	}
 
 	// Split off fragment.
 	fragment := ""
@@ -153,12 +167,40 @@ func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
 		rest = rest[:idx]
 	}
 
-	// Split type from path (path may be empty for singletons like cog://crystal).
+	// Split off query string and check for digest fail-closed (ADR-067 §170).
+	// A ?digest=sha256:... param signals an integrity constraint.  The local
+	// projection resolver does not verify content hashes, so it MUST error rather
+	// than silently ignoring the param.
+	if idx := strings.IndexByte(rest, '?'); idx >= 0 {
+		query := rest[idx+1:]
+		rest = rest[:idx]
+		for _, param := range strings.Split(query, "&") {
+			if strings.HasPrefix(param, "digest=") {
+				return nil, fmt.Errorf("%w: %q", ErrDigestNotVerified, uri)
+			}
+		}
+		// Other query params (e.g. ?ref=, ?format=) are silently ignored at the
+		// filesystem level; higher-level handlers may interpret them.
+	}
+
+	// For the authority form (cog://...) the first component might be a workspace
+	// name (cross-workspace reference) or a projection name.  Discriminate by
+	// checking projections first.  If the first component is not a known projection,
+	// and the original URI used the authority form, it is a cross-workspace ref —
+	// return ErrUnknownAuthority so callers can handle it without treating it as a
+	// parse error.
+	isAuthorityForm := strings.HasPrefix(uri, "cog://")
+
+	// Split type from path (path may be empty for singletons like cog:crystal).
 	uriType, uriPath, _ := strings.Cut(rest, "/")
 
 	proj, ok := projections[uriType]
 	if !ok {
-		return nil, fmt.Errorf("unknown cog:// type %q in URI %q", uriType, uri)
+		if isAuthorityForm {
+			// Not a known projection in the authority slot — cross-workspace ref.
+			return nil, fmt.Errorf("%w: workspace %q in URI %q", ErrUnknownAuthority, uriType, uri)
+		}
+		return nil, fmt.Errorf("unknown cog: projection %q in URI %q", uriType, uri)
 	}
 
 	path, err := resolveProjection(workspaceRoot, proj, uriPath)
@@ -211,11 +253,12 @@ func resolveProjection(workspaceRoot string, proj *Projection, uriPath string) (
 
 // ── Reverse mapping (path → URI) ─────────────────────────────────────────────
 
-// uriMapping maps a workspace-relative filesystem path prefix to a cog:// URI prefix.
+// uriMapping maps a workspace-relative filesystem path prefix to a cog: URI prefix.
 type uriMapping struct {
 	// pathPrefix is workspace-relative (e.g. ".cog/mem/").
 	pathPrefix string
-	// uriPrefix is the cog:// prefix including trailing slash (e.g. "cog://mem/").
+	// uriPrefix is the canonical cog: prefix including trailing slash (e.g. "cog:mem/").
+	// Uses the bare form (no //) per ADR-067 — projections are local references.
 	uriPrefix string
 	// stripExts lists file extensions to remove from the name component.
 	// Applied in order; first match wins.
@@ -225,22 +268,22 @@ type uriMapping struct {
 // uriMappings ordered longest-prefix-first so specific paths take precedence
 // over generic catch-alls (e.g. ".cog/bin/agents/" before ".cog/").
 var uriMappings = []uriMapping{
-	{".cog/bin/agents/", "cog://agents/", []string{".md"}},
-	{".cog/handoffs/", "cog://handoffs/", []string{".md"}},
-	{".cog/ontology/", "cog://ontology/", []string{".cog.md", ".md"}},
-	{".cog/config/", "cog://conf/", nil},
-	{".cog/hooks/", "cog://hooks/", nil},
-	{".cog/specs/", "cog://specs/", []string{".cog.md", ".md"}},
-	{".cog/roles/", "cog://roles/", []string{".md"}},
-	{".cog/status/", "cog://status/", []string{".json"}},
-	{".cog/ledger/", "cog://ledger/", nil},
-	{".cog/work/", "cog://work/", nil},
-	{".cog/docs/", "cog://docs/", nil},
-	{".cog/adr/", "cog://adr/", []string{".md"}},
-	{".cog/mem/", "cog://mem/", nil}, // keep full extension for mem
-	{".cog/", "cog://kernel/", nil},
-	{".claude/skills/", "cog://skills/", nil},
-	{".claude/agents/", "cog://agents/", nil},
+	{".cog/bin/agents/", "cog:agents/", []string{".md"}},
+	{".cog/handoffs/", "cog:handoffs/", []string{".md"}},
+	{".cog/ontology/", "cog:ontology/", []string{".cog.md", ".md"}},
+	{".cog/config/", "cog:conf/", nil},
+	{".cog/hooks/", "cog:hooks/", nil},
+	{".cog/specs/", "cog:specs/", []string{".cog.md", ".md"}},
+	{".cog/roles/", "cog:roles/", []string{".md"}},
+	{".cog/status/", "cog:status/", []string{".json"}},
+	{".cog/ledger/", "cog:ledger/", nil},
+	{".cog/work/", "cog:work/", nil},
+	{".cog/docs/", "cog:docs/", nil},
+	{".cog/adr/", "cog:adr/", []string{".md"}},
+	{".cog/mem/", "cog:mem/", nil}, // keep full extension for mem
+	{".cog/", "cog:kernel/", nil},
+	{".claude/skills/", "cog:skills/", nil},
+	{".claude/agents/", "cog:agents/", nil},
 }
 
 // PathToURI converts an absolute (or workspace-relative) filesystem path to a

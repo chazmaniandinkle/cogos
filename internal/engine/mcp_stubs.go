@@ -142,7 +142,8 @@ func buildFTSQuery(raw string) string {
 	return strings.Join(parts, " OR ")
 }
 
-// pathToMemURI converts an absolute filesystem path to a cog://mem/ URI.
+// pathToMemURI converts an absolute filesystem path to a cog: URI.
+// Projection references use the bare form (no //) per ADR-067.
 // Non-memory paths are returned as cog://workspace/ URIs.
 func pathToMemURI(workspaceRoot, path string) string {
 	rel, err := filepath.Rel(workspaceRoot, path)
@@ -150,9 +151,9 @@ func pathToMemURI(workspaceRoot, path string) string {
 		return "cog://workspace/" + filepath.Base(path)
 	}
 	prefixes := [][2]string{
-		{".cog/mem/", "cog://mem/"},
-		{".cog/docs/", "cog://docs/"},
-		{".cog/adr/", "cog://adr/"},
+		{".cog/mem/", "cog:mem/"},
+		{".cog/docs/", "cog:docs/"},
+		{".cog/adr/", "cog:adr/"},
 	}
 	for _, p := range prefixes {
 		if strings.HasPrefix(rel, p[0]) {

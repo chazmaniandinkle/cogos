@@ -514,7 +514,7 @@ func (d *URLDecomposer) downloadArxivPDF(ctx context.Context, result *IngestResu
 		return
 	}
 
-	ref := fmt.Sprintf("cog://mem/semantic/inbox/papers/%s.pdf", paperID)
+	ref := fmt.Sprintf("cog:mem/semantic/inbox/papers/%s.pdf", paperID)
 	hash, err := bs.Store(data, "application/pdf", ref)
 	if err != nil {
 		slog.Error("arxiv: blob store failed", "paper_id", paperID, "error", err)

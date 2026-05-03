@@ -640,8 +640,8 @@ func BuildCogdocIndex(cogRoot string) (*CogdocIndex, error) {
 	return idx, err
 }
 
-// cogURIPattern matches cog:// URIs in content
-var cogURIPattern = regexp.MustCompile(`cog://[a-zA-Z0-9/_-]+`)
+// cogURIPattern matches cog: URIs in content (both bare and authority forms per ADR-067)
+var cogURIPattern = regexp.MustCompile(`cog:(?://)?[a-zA-Z0-9/_-]+`)
 
 // extractInlineRefs finds cog:// URIs in markdown content (navigational refs)
 func extractInlineRefs(content string) []string {
@@ -1127,14 +1127,38 @@ func resolveGlob(pattern string) (string, error) {
 	return matches[0], nil
 }
 
-// resolveURI converts cog://type/path to filesystem path
+// resolveURI converts a cog: URI to a filesystem path.
+// Accepts both cog:projection/path (bare, ADR-067 canonical) and
+// cog://projection/path (legacy authority form) for backward compatibility.
 func resolveURI(uri string) (string, error) {
-	// Parse cog://type/path
-	if !strings.HasPrefix(uri, "cog://") {
-		return "", fmt.Errorf("invalid URI scheme (expected cog://)")
+	if !strings.HasPrefix(uri, "cog:") {
+		return "", fmt.Errorf("invalid URI scheme (expected cog:)")
 	}
 
-	path := uri[6:] // Remove cog://
+	// Normalise both forms to a bare path string.
+	var path string
+	if strings.HasPrefix(uri, "cog://") {
+		path = uri[6:] // Remove cog://
+	} else {
+		path = uri[4:] // Remove cog:
+	}
+
+	// Strip query string (fail-closed on ?digest=).
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		query := path[idx+1:]
+		path = path[:idx]
+		for _, param := range strings.Split(query, "&") {
+			if strings.HasPrefix(param, "digest=") {
+				return "", fmt.Errorf("digest verification not implemented: fail-closed per ADR-067: %q", uri)
+			}
+		}
+	}
+
+	// Strip fragment.
+	if idx := strings.IndexByte(path, '#'); idx >= 0 {
+		path = path[:idx]
+	}
+
 	parts := strings.SplitN(path, "/", 2)
 	if len(parts) == 0 {
 		return "", fmt.Errorf("invalid URI format")
@@ -1983,9 +2007,9 @@ func validateCogdocFull(path string) *CogdocValidation {
 		} else {
 			result.StructuralRefs = refs
 			for _, ref := range refs {
-				if !strings.HasPrefix(ref.URI, "cog://") {
+				if !strings.HasPrefix(ref.URI, "cog:") {
 					result.Valid = false
-					result.Errors = append(result.Errors, fmt.Sprintf("invalid ref URI '%s' (must start with cog://)", ref.URI))
+					result.Errors = append(result.Errors, fmt.Sprintf("invalid ref URI '%s' (must start with cog:)", ref.URI))
 				} else if ref.Rel != "" && !isValidRelationFromOntology(ref.Rel) {
 					result.Valid = false
 					result.Errors = append(result.Errors, fmt.Sprintf("invalid ref relation '%s'", ref.Rel))
@@ -2078,9 +2102,9 @@ func validateCogdoc(path string) error {
 		}
 
 		for _, ref := range refs {
-			// Validate URI format
-			if !strings.HasPrefix(ref.URI, "cog://") {
-				return fmt.Errorf("invalid ref URI '%s' (must start with cog://)", ref.URI)
+			// Validate URI format — accept both cog:projection/path and cog://projection/path
+			if !strings.HasPrefix(ref.URI, "cog:") {
+				return fmt.Errorf("invalid ref URI '%s' (must start with cog:)", ref.URI)
 			}
 
 			// Validate relationship type - uses ontology if cached
