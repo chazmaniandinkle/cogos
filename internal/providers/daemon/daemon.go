@@ -39,6 +39,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/cogos-dev/cogos/internal/providers/pin"
 	"github.com/cogos-dev/cogos/pkg/reconcile"
@@ -72,14 +73,23 @@ func SetWorkspaceRoot(root string) {
 }
 
 // pinProvider is the daemon-side wrapper around the fully-extracted pin provider.
-// It delegates Health() directly to pin.New(), wiring the workspace root at
-// probe time via resolveRoot(). The non-health methods are provided by
-// the embedded stubMethods (daemon only needs Health() for the proprioception block).
+// It delegates Health() to pin.New() after running the full Reconcile cycle
+// (LoadConfig → FetchLive → ComputePlan) so that pinStates is populated before
+// Health() is called. Without the full cycle, pinStates is always empty and
+// Health() always reports green ("no pins declared") even when pin files
+// declare drift.
+//
+// The Reconcile call is time-bounded to 10 s to avoid blocking the proprioception
+// tick. staleAfter controls how long a prior cycle result is reused to avoid
+// hammering the filesystem on every foveated-context refresh.
 type pinProvider struct {
 	stubMethods
-	mu   sync.Mutex
-	impl *pin.Provider
+	mu        sync.Mutex
+	impl      *pin.Provider
+	lastProbe time.Time
 }
+
+const pinProbeStaleAfter = 30 * time.Second
 
 func (p *pinProvider) Type() string { return "pin" }
 
@@ -93,18 +103,26 @@ func (p *pinProvider) Health() reconcile.ResourceStatus {
 		p.impl = pin.New(nil)
 	}
 	impl := p.impl
+	// Reuse the last Reconcile result if it is still fresh.
+	stale := time.Since(p.lastProbe) >= pinProbeStaleAfter
 	p.mu.Unlock()
 
-	// Wire the workspace root into the pin provider so its Health() can
-	// inspect .cog/pins/. LoadConfig is idempotent; call it cheaply here so
-	// the provider's internal root field is always current.
-	if _, err := impl.LoadConfig(root); err != nil {
-		return reconcile.ResourceStatus{
-			Sync:      reconcile.SyncStatusUnknown,
-			Health:    reconcile.HealthDegraded,
-			Operation: reconcile.OperationIdle,
-			Message:   fmt.Sprintf("pin LoadConfig: %v", err),
+	if stale {
+		// Run the full reconcile cycle so pinStates reflects live drift.
+		// A 10 s context prevents blocking the proprioception tick indefinitely.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := impl.Reconcile(ctx, root); err != nil {
+			return reconcile.ResourceStatus{
+				Sync:      reconcile.SyncStatusUnknown,
+				Health:    reconcile.HealthDegraded,
+				Operation: reconcile.OperationIdle,
+				Message:   fmt.Sprintf("pin reconcile: %v", err),
+			}
 		}
+		p.mu.Lock()
+		p.lastProbe = time.Now()
+		p.mu.Unlock()
 	}
 	return impl.Health()
 }
