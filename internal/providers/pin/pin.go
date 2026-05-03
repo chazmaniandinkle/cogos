@@ -227,7 +227,10 @@ type localGitHeadResolver struct {
 }
 
 func (r *localGitHeadResolver) ResolveHead(ctx context.Context, target, workspaceRoot string) (string, string, error) {
-	targetPath := r.locateTarget(ctx, target, workspaceRoot)
+	targetPath, locErr := r.locateTarget(ctx, target, workspaceRoot)
+	if locErr != nil {
+		return "", "", fmt.Errorf("pin: locating target %q: %w", target, locErr)
+	}
 	if targetPath == "" {
 		return "", "", fmt.Errorf("%w: %q", ErrWorkspaceNotFound, target)
 	}
@@ -250,20 +253,28 @@ func (r *localGitHeadResolver) ResolveHead(ctx context.Context, target, workspac
 //     success or on any error that is NOT ErrWorkspaceNotFound.
 //  2. Sibling-directory scan — local fallback for workspaces not yet in the
 //     registry (e.g. during bootstrapping or federation setup).
-func (r *localGitHeadResolver) locateTarget(ctx context.Context, target, workspaceRoot string) string {
+//
+// Returns ("", nil) when the workspace is simply not found anywhere.
+// Returns ("", err) when the locator signals a hard registry failure.
+func (r *localGitHeadResolver) locateTarget(ctx context.Context, target, workspaceRoot string) (string, error) {
 	// Step 1: consult WorkspaceLocator when available.
 	if r.locator != nil {
 		path, err := r.locator.LocateWorkspace(ctx, target)
 		if err == nil && path != "" {
-			return path
+			return path, nil
 		}
-		// ErrWorkspaceNotFound → fall through to local scan.
-		// Any other error (I/O, registry unavailable) → also fall through so
-		// a transient registry failure doesn't break local-only workflows.
+		if err != nil && !errors.Is(err, ErrWorkspaceNotFound) {
+			// Non-not-found error (I/O failure, parse error, registry
+			// unavailable): propagate immediately so the registry failure
+			// is visible to the caller rather than silently masked by a
+			// stale sibling-directory scan.
+			return "", err
+		}
+		// ErrWorkspaceNotFound → fall through to local sibling-directory scan.
 	}
 
 	if workspaceRoot == "" {
-		return ""
+		return "", nil
 	}
 
 	// Normalise target: convert "/" to OS separator.
@@ -279,21 +290,21 @@ func (r *localGitHeadResolver) locateTarget(ctx context.Context, target, workspa
 		// single-component target (e.g., "cogos") — look as a sibling dir.
 		candidate := filepath.Join(parent, parts[0])
 		if isGitRepo(candidate) {
-			return candidate
+			return candidate, nil
 		}
 	case 2:
 		// two-component target (e.g., "cogos-dev/cogos") — look one level up.
 		candidate := filepath.Join(grandParent, parts[0], parts[1])
 		if isGitRepo(candidate) {
-			return candidate
+			return candidate, nil
 		}
 		// Also try: sibling with last-segment name.
 		candidateFlat := filepath.Join(parent, parts[1])
 		if isGitRepo(candidateFlat) {
-			return candidateFlat
+			return candidateFlat, nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // isGitRepo returns true when path is a directory containing a .git entry.

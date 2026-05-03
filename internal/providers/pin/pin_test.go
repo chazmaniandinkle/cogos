@@ -870,6 +870,124 @@ sync: read-only
 	}
 }
 
+// ─── Locator error-propagation tests (PR #180 fixup) ─────────────────────────
+
+// errLocator is a stub WorkspaceLocator that always returns a hard error that
+// is NOT ErrWorkspaceNotFound (simulates I/O failure / corrupt registry file).
+type errLocator struct {
+	err error
+}
+
+func (l *errLocator) LocateWorkspace(_ context.Context, _ string) (string, error) {
+	return "", l.err
+}
+
+// TestLocatorNonNotFoundError_Propagated is the regression test for the
+// silent-swallow bug found by Codex review of PR #180.
+//
+// Before the fix, any error from WorkspaceLocator.LocateWorkspace (other than
+// ErrWorkspaceNotFound) was silently swallowed and the sibling-directory
+// fallback always ran. The comment at locateTarget:247-250 said non-not-found
+// errors should return immediately — but the code didn't match.
+//
+// After the fix, a hard registry error (e.g. I/O failure) propagates out of
+// FetchLive so the caller knows the registry is broken, not just empty.
+func TestLocatorNonNotFoundError_Propagated(t *testing.T) {
+	t.Parallel()
+	source := setupWorkspace(t)
+	const target = "cogos-dev/cogos"
+
+	writePinYAML(t, source, "cogos-dev_cogos", `
+target: cogos-dev/cogos
+pin:
+  ref: abc1234567890abcdef1234567890abcdef123456
+sync: read-only
+`)
+
+	registryErr := errors.New("simulated registry I/O failure")
+	p := pin.New(nil)
+	p.SetWorkspaceLocator(&errLocator{err: registryErr})
+
+	cfgAny, err := p.LoadConfig(source)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	liveAny, fetchErr := p.FetchLive(context.Background(), cfgAny)
+	if fetchErr != nil {
+		t.Fatalf("FetchLive unexpected top-level error: %v", fetchErr)
+	}
+
+	// ComputePlan stores lr.Error.Error() in the plan action details["error"].
+	// This is the observable surface for what error message was captured.
+	plan, planErr := p.ComputePlan(cfgAny, liveAny, nil)
+	if planErr != nil {
+		t.Fatalf("ComputePlan unexpected error: %v", planErr)
+	}
+
+	// After the fix: the registry error propagates through locateTarget →
+	// ResolveHead (wrapped as "pin: locating target …: simulated registry I/O
+	// failure") → LiveRef.Error → plan action details["error"].
+	// The original registryErr.Error() string must appear in the action details.
+	//
+	// Without the fix: locateTarget silently falls through to sibling scan,
+	// which also fails but produces a generic ErrWorkspaceNotFound message —
+	// "pin: workspace not found …" — that does NOT contain the original registry
+	// error text. The test would fail on pre-fix code because the error string
+	// "simulated registry I/O failure" is absent from the action details.
+	if len(plan.Actions) == 0 {
+		t.Fatal("ComputePlan returned no actions; expected at least one for the unreachable target")
+	}
+	actionErr, _ := plan.Actions[0].Details["error"].(string)
+	if !strings.Contains(actionErr, registryErr.Error()) {
+		t.Errorf("plan action error %q does not contain registry error %q; "+
+			"registry I/O error was silently swallowed and replaced by fallback error",
+			actionErr, registryErr.Error())
+	}
+}
+
+// TestLocatorErrWorkspaceNotFound_FallsBack verifies the complementary case:
+// ErrWorkspaceNotFound from the locator still falls through to the sibling scan
+// (not treated as a hard failure). This ensures the fallback logic is intact.
+func TestLocatorErrWorkspaceNotFound_FallsBack(t *testing.T) {
+	t.Parallel()
+	source := setupWorkspace(t)
+	const target = "some-workspace"
+
+	writePinYAML(t, source, "some_workspace", `
+target: some-workspace
+pin:
+  ref: abc1234567890abcdef1234567890abcdef123456
+sync: read-only
+`)
+
+	// Locator returns ErrWorkspaceNotFound — should fall through, not hard-fail.
+	notFoundLocator := &stubLocator{paths: map[string]string{}} // empty → not found
+	p := pin.New(nil)
+	p.SetWorkspaceLocator(notFoundLocator)
+
+	cfgAny, err := p.LoadConfig(source)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	// FetchLive should not propagate an error from ErrWorkspaceNotFound alone;
+	// the sibling scan fires (and finds nothing), then localGitHeadResolver
+	// wraps the absence as ErrWorkspaceNotFound in the LiveRef.
+	_, err = p.FetchLive(context.Background(), cfgAny)
+	if err != nil {
+		// Acceptable — may wrap ErrWorkspaceNotFound from git resolution.
+		// What is NOT acceptable is a hard error.
+		if !errors.Is(err, pin.ErrWorkspaceNotFound) && !strings.Contains(err.Error(), "not found") {
+			t.Errorf("FetchLive returned unexpected error (want workspace-not-found, got): %v", err)
+		}
+	}
+	// Locator must have been consulted.
+	if len(notFoundLocator.calls) == 0 {
+		t.Error("locator was not consulted at all")
+	}
+}
+
 // TestErrWorkspaceNotFound_SentinelExported verifies the exported sentinel error
 // is the right type for errors.Is checks in callers.
 func TestErrWorkspaceNotFound_SentinelExported(t *testing.T) {
