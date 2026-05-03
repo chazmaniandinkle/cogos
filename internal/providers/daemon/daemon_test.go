@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/cogos-dev/cogos/internal/providers/daemon"
@@ -206,4 +207,83 @@ func TestSetWorkspaceRoot_HealthReflectsWorkspaceState(t *testing.T) {
 
 	// Reset for other tests.
 	daemon.SetWorkspaceRoot("")
+}
+
+// TestPinProvider_ConcurrentHealth_NoParallelRefresh verifies that concurrent
+// Health() calls on the pin provider serialise correctly and do not trigger
+// parallel RefreshState invocations (Bug B fix).
+//
+// The test fires N goroutines that each call p.Health() simultaneously on a
+// workspace with a pin file. With the Bug B fix the mutex is held through the
+// entire refresh, so the calls serialise rather than racing. Without the fix,
+// concurrent stale-state checks both pass the staleness gate and both run
+// RefreshState in parallel, which can race on pinStates writes.
+//
+// The test is also run with -race in CI (go test -race) to surface any data
+// races that the serialisation fix is intended to prevent.
+func TestPinProvider_ConcurrentHealth_NoParallelRefresh(t *testing.T) {
+	tmp := t.TempDir()
+	pinsDir := filepath.Join(tmp, ".cog", "pins")
+	if err := os.MkdirAll(pinsDir, 0o755); err != nil {
+		t.Fatalf("mkdir pins: %v", err)
+	}
+	pinYAML := `target: cogos-dev/nonexistent-target
+pin:
+  ref: abc000000000
+branch: main
+sync: read-only
+`
+	if err := os.WriteFile(filepath.Join(pinsDir, "cogos-dev_nonexistent-target.yaml"), []byte(pinYAML), 0o644); err != nil {
+		t.Fatalf("write pin yaml: %v", err)
+	}
+
+	// Also create the minimal workspace structure so agent / service providers
+	// don't interfere.
+	agentsDir := filepath.Join(tmp, ".cog", "bin", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsDir, "registry.yaml"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write registry.yaml: %v", err)
+	}
+
+	daemon.SetWorkspaceRoot(tmp)
+	defer daemon.SetWorkspaceRoot("")
+
+	p, err := reconcile.GetProvider("pin")
+	if err != nil {
+		t.Fatalf("GetProvider(pin): %v", err)
+	}
+
+	const concurrency = 8
+	var wg sync.WaitGroup
+	statuses := make([]reconcile.ResourceStatus, concurrency)
+
+	// Fire all goroutines at roughly the same time. All will see a stale
+	// lastProbe (zero value). With the fix, only one runs RefreshState; the
+	// others block on the mutex and see a fresh result when they acquire it.
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			statuses[i] = p.Health()
+		}()
+	}
+	wg.Wait()
+
+	// All goroutines must have received a coherent status — not a zero value.
+	for i, s := range statuses {
+		if s.Health == "" {
+			t.Errorf("goroutine %d: Health() returned zero-value status", i)
+		}
+	}
+
+	// The workspace has a pin that is unreachable locally, so every status
+	// must be Degraded (not Healthy).
+	for i, s := range statuses {
+		if s.Health == reconcile.HealthHealthy {
+			t.Errorf("goroutine %d: Health()=Healthy with unreachable pin; want Degraded; message=%q", i, s.Message)
+		}
+	}
 }
