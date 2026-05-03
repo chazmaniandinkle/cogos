@@ -1,5 +1,3 @@
-//go:build coguri
-
 package engine
 
 import (

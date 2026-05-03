@@ -1,10 +1,8 @@
-//go:build coguri
-
 // uri_registry_integration_test.go — end-to-end tests for the alias subsystem
 // exercised through the full ResolveURI → URIRegistry chain.
 //
-// Build with -tags coguri.  These tests validate the complete alias→canonical
-// resolution pipeline and serve as the integration test suite for #167.
+// These tests validate the complete alias→canonical resolution pipeline and
+// serve as the integration test suite for #167.
 package engine
 
 import (

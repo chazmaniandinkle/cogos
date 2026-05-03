@@ -1,10 +1,4 @@
-//go:build coguri
-
 // uri_registry.go — live URIRegistry implementation.
-//
-// Build with -tags coguri to activate this file.  Without that tag,
-// uri_v2_stub.go takes over and URIRegistry is nil, so the MCP server
-// falls back to the legacy local-only resolver.
 //
 // Resolution chain for cog://authority/path:
 //  1. Parse the URI; extract the authority component.
@@ -36,9 +30,6 @@ import (
 )
 
 // ── uriContent and resolver interface ────────────────────────────────────────
-//
-// These types ALSO exist in uri_v2_stub.go (which compiles when !coguri).
-// With the coguri tag, only this file compiles; the stub is excluded.
 
 // uriContent is the resolved content descriptor returned by URIRegistry.Resolve.
 type uriContent struct {
@@ -50,9 +41,8 @@ type uriResolver interface {
 	Resolve(ctx context.Context, uri string) (*uriContent, error)
 }
 
-// URIRegistry is the live resolver, non-nil when built with -tags coguri.
-// The MCP server checks `if URIRegistry != nil` before calling; when nil
-// (stub file), it falls back to the legacy local resolver.
+// URIRegistry is the live resolver.  ResolveURI falls through to it when the
+// URI's authority component is not a known projection namespace.
 var URIRegistry uriResolver
 
 // ── init ──────────────────────────────────────────────────────────────────────
