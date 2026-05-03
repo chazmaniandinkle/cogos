@@ -66,8 +66,8 @@ type MemorySearchResult struct {
 	SourceType      string
 }
 
-// MemoryPathToURI converts an absolute memory file path to a cog://mem/ URI.
-// Example: /Users/foo/cog-workspace/.cog/mem/semantic/insights/topic.cog.md → cog://mem/semantic/insights/topic
+// MemoryPathToURI converts an absolute memory file path to a cog:mem/ URI.
+// Example: /Users/foo/cog-workspace/.cog/mem/semantic/insights/topic.cog.md → cog:mem/semantic/insights/topic
 func MemoryPathToURI(cogRoot, absPath string) string {
 	memDir := filepath.Join(cogRoot, ".cog", "mem") + "/"
 	if !strings.HasPrefix(absPath, memDir) {
@@ -77,16 +77,21 @@ func MemoryPathToURI(cogRoot, absPath string) string {
 	// Strip file extensions for clean URIs
 	relPath = strings.TrimSuffix(relPath, ".cog.md")
 	relPath = strings.TrimSuffix(relPath, ".md")
-	return "cog://mem/" + relPath
+	return "cog:mem/" + relPath
 }
 
-// URIToMemoryPath converts a cog://mem/ URI back to an absolute file path.
+// URIToMemoryPath converts a cog:mem/ or cog://mem/ URI back to an absolute file path.
 // Tries .cog.md first, then .md, then bare path.
 func URIToMemoryPath(cogRoot, uri string) (string, error) {
-	if !strings.HasPrefix(uri, "cog://mem/") {
+	var relPath string
+	switch {
+	case strings.HasPrefix(uri, "cog:mem/"):
+		relPath = strings.TrimPrefix(uri, "cog:mem/")
+	case strings.HasPrefix(uri, "cog://mem/"):
+		relPath = strings.TrimPrefix(uri, "cog://mem/")
+	default:
 		return "", fmt.Errorf("not a memory URI: %s", uri)
 	}
-	relPath := strings.TrimPrefix(uri, "cog://mem/")
 	memDir := filepath.Join(cogRoot, ".cog", "mem")
 
 	// Try .cog.md first (canonical), then .md, then bare
@@ -116,41 +121,44 @@ type uriMapping struct {
 }
 
 // uriMappings is ordered by specificity — longest prefix first wins.
+// All projection emitters use the bare cog: form (no //) per ADR-067.
+// NOTE: .cog/config/ is the canonical configuration directory (not .cog/conf/,
+// which does not exist). The conf/config mismatch was a bug — fixed here.
 var uriMappings = []uriMapping{
 	// Memory (most specific .cog/ subtree first)
-	{pathPrefix: ".cog/mem/", uriPrefix: "cog://mem/", stripExt: true},
+	{pathPrefix: ".cog/mem/", uriPrefix: "cog:mem/", stripExt: true},
 	// ADRs
-	{pathPrefix: ".cog/adr/", uriPrefix: "cog://adr/", stripExt: true},
+	{pathPrefix: ".cog/adr/", uriPrefix: "cog:adr/", stripExt: true},
 	// Hooks
-	{pathPrefix: ".cog/hooks/", uriPrefix: "cog://hooks/", stripExt: true},
+	{pathPrefix: ".cog/hooks/", uriPrefix: "cog:hooks/", stripExt: true},
 	// Agents (under .cog/bin/agents/)
-	{pathPrefix: ".cog/bin/agents/", uriPrefix: "cog://agents/", stripExt: true},
+	{pathPrefix: ".cog/bin/agents/", uriPrefix: "cog:agents/", stripExt: true},
 	// Skills (under .cog/bin/skills/)
-	{pathPrefix: ".cog/bin/skills/", uriPrefix: "cog://skills/", stripExt: true},
-	// Roles
-	{pathPrefix: ".cog/conf/roles/", uriPrefix: "cog://roles/", stripExt: true},
+	{pathPrefix: ".cog/bin/skills/", uriPrefix: "cog:skills/", stripExt: true},
+	// Roles (under .cog/roles/ — engine canonical path)
+	{pathPrefix: ".cog/roles/", uriPrefix: "cog:roles/", stripExt: true},
 	// Ontology
-	{pathPrefix: ".cog/ontology/", uriPrefix: "cog://kernel/ontology/", stripExt: true},
+	{pathPrefix: ".cog/ontology/", uriPrefix: "cog:ontology/", stripExt: true},
 	// Specs
-	{pathPrefix: ".cog/conf/spec/", uriPrefix: "cog://spec/", stripExt: true},
+	{pathPrefix: ".cog/specs/", uriPrefix: "cog:specs/", stripExt: true},
 	// Milestones
-	{pathPrefix: ".cog/milestones/", uriPrefix: "cog://kernel/milestones/", stripExt: true},
-	// Configuration (generic .cog/conf/ catch-all after specific subtrees)
-	{pathPrefix: ".cog/conf/", uriPrefix: "cog://kernel/conf/", stripExt: true},
+	{pathPrefix: ".cog/milestones/", uriPrefix: "cog:kernel/milestones/", stripExt: true},
+	// Configuration — canonical path is .cog/config/ (not .cog/conf/)
+	{pathPrefix: ".cog/config/", uriPrefix: "cog:conf/", stripExt: true},
 	// Coordination
-	{pathPrefix: ".cog/claims/", uriPrefix: "cog://kernel/coordination/claims/", stripExt: false},
-	{pathPrefix: ".cog/handoffs/", uriPrefix: "cog://kernel/coordination/handoffs/", stripExt: false},
-	{pathPrefix: ".cog/broadcasts/", uriPrefix: "cog://kernel/coordination/broadcasts/", stripExt: false},
+	{pathPrefix: ".cog/claims/", uriPrefix: "cog:kernel/coordination/claims/", stripExt: false},
+	{pathPrefix: ".cog/handoffs/", uriPrefix: "cog:handoffs/", stripExt: false},
+	{pathPrefix: ".cog/broadcasts/", uriPrefix: "cog:kernel/coordination/broadcasts/", stripExt: false},
 	// Ledger
-	{pathPrefix: ".cog/ledger/", uriPrefix: "cog://ledger/", stripExt: false},
+	{pathPrefix: ".cog/ledger/", uriPrefix: "cog:ledger/", stripExt: false},
 	// Runtime (PID files, sockets)
-	{pathPrefix: ".cog/run/", uriPrefix: "cog://kernel/run/", stripExt: false},
+	{pathPrefix: ".cog/run/", uriPrefix: "cog:kernel/run/", stripExt: false},
 	// Logs
-	{pathPrefix: ".cog/logs/", uriPrefix: "cog://kernel/logs/", stripExt: false},
+	{pathPrefix: ".cog/logs/", uriPrefix: "cog:kernel/logs/", stripExt: false},
 	// Status
-	{pathPrefix: ".cog/.state/", uriPrefix: "cog://status/", stripExt: false},
+	{pathPrefix: ".cog/.state/", uriPrefix: "cog:status/", stripExt: false},
 	// Components (apps/)
-	{pathPrefix: "apps/", uriPrefix: "cog://kernel/components/apps/", stripExt: false},
+	{pathPrefix: "apps/", uriPrefix: "cog:kernel/components/apps/", stripExt: false},
 }
 
 // PathToURI converts any workspace path to the appropriate cog:// URI.
@@ -183,16 +191,24 @@ func PathToURI(cogRoot, path string) string {
 	return relPath
 }
 
-// URIToPath converts a cog:// URI back to an absolute filesystem path.
+// URIToPath converts a cog: URI back to an absolute filesystem path.
+// Accepts both cog:projection/path (bare) and cog://projection/path (legacy).
 // Probes for .cog.md, .md, .yaml, and bare path in that order.
 func URIToPath(cogRoot, uri string) (string, error) {
-	if !strings.HasPrefix(uri, "cog://") {
+	if !strings.HasPrefix(uri, "cog:") {
 		return "", fmt.Errorf("not a cog URI: %s", uri)
 	}
 
+	// Normalise cog://projection/... to cog:projection/... for prefix matching
+	// against uriMappings which now use the bare cog: form.
+	normalised := uri
+	if strings.HasPrefix(uri, "cog://") {
+		normalised = "cog:" + uri[6:]
+	}
+
 	for _, m := range uriMappings {
-		if strings.HasPrefix(uri, m.uriPrefix) {
-			suffix := strings.TrimPrefix(uri, m.uriPrefix)
+		if strings.HasPrefix(normalised, m.uriPrefix) {
+			suffix := strings.TrimPrefix(normalised, m.uriPrefix)
 			baseDir := filepath.Join(cogRoot, m.pathPrefix)
 
 			if m.stripExt {
@@ -825,9 +841,14 @@ func MemoryList(cogRoot string, sector string, subdir string) ([]MemorySearchRes
 // This prevents double-nesting (e.g., .cog/mem/.cog/mem/...) which occurs when
 // a .cog/mem/ prefixed path is blindly joined with the memory directory.
 func resolveMemoryPath(memoryDir, path string) string {
-	// cog://mem/ URI — resolve to filesystem path with extension probing
-	if strings.HasPrefix(path, "cog://mem/") {
-		relPath := strings.TrimPrefix(path, "cog://mem/")
+	// cog:mem/ URI (bare or legacy cog://mem/) — resolve to filesystem path
+	if strings.HasPrefix(path, "cog:mem/") || strings.HasPrefix(path, "cog://mem/") {
+		var relPath string
+		if strings.HasPrefix(path, "cog://mem/") {
+			relPath = strings.TrimPrefix(path, "cog://mem/")
+		} else {
+			relPath = strings.TrimPrefix(path, "cog:mem/")
+		}
 		// Try .cog.md first (canonical), then .md, then bare
 		candidates := []string{
 			filepath.Join(memoryDir, relPath+".cog.md"),
