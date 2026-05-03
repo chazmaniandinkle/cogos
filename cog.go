@@ -5766,6 +5766,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			code = 1
 		}
+	case "pin":
+		if err := cmdPin(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			code = 1
+		}
 	case "version", "-v", "--version":
 		code = cmdVersion()
 	case "info":
