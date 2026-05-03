@@ -55,6 +55,16 @@ func Parse(rawURI string) (*URI, error) {
 		return nil, &Error{Op: "Parse", URI: rawURI, Err: fmt.Errorf("%w: must start with %s", ErrInvalidURI, Scheme)}
 	}
 
+	// RFC 3986 §3: query precedes fragment.  Reject URIs where '#' appears before
+	// '?' — without this check url.Parse would fold the query into the fragment
+	// field and the digest fail-closed check below would never fire, silently
+	// bypassing the integrity constraint (ADR-067 §170).
+	if qIdx := strings.IndexByte(rawURI, '?'); qIdx >= 0 {
+		if hIdx := strings.IndexByte(rawURI, '#'); hIdx >= 0 && hIdx < qIdx {
+			return nil, &Error{Op: "Parse", URI: rawURI, Err: fmt.Errorf("%w: fragment before query (RFC 3986 violation)", ErrInvalidURI)}
+		}
+	}
+
 	// Fail-closed on digest integrity constraint (ADR-067 §170).
 	if idx := strings.IndexByte(rawURI, '?'); idx >= 0 {
 		query := rawURI[idx+1:]

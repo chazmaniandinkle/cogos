@@ -114,6 +114,17 @@ func (r *uriRegistryImpl) Resolve(ctx context.Context, rawURI string) (*uriConte
 	// cog://authority/path form — parse authority and path.
 	rest := strings.TrimPrefix(rawURI, "cog://")
 
+	// RFC 3986 §3: query precedes fragment.  Reject URIs where '#' appears
+	// before '?' — the previous stripping order (fragment first, then query)
+	// meant that cog://ws/mem/x#frag?digest=... would have "#frag?digest=..."
+	// stripped as the fragment, leaving no '?' in rest and thus digestHex
+	// would never be set, silently bypassing digest verification (ADR-067 §170).
+	if qIdx := strings.IndexByte(rest, '?'); qIdx >= 0 {
+		if hIdx := strings.IndexByte(rest, '#'); hIdx >= 0 && hIdx < qIdx {
+			return nil, fmt.Errorf("uri_registry: malformed URI (fragment before query): %q", rawURI)
+		}
+	}
+
 	// RFC 3986 §3: URI = scheme ":" hier-part ["?" query] ["#" fragment]
 	// Fragment always trails query; strip #fragment FIRST so the query value
 	// never accidentally includes the fragment text (e.g. ?digest=hex#frag

@@ -291,3 +291,37 @@ func TestResolveURI_DigestWithFragment_WellFormed(t *testing.T) {
 		t.Errorf("ResolveURI(%q): got %v; want errors.Is ErrDigestNotVerified", uri, err)
 	}
 }
+
+// ── 6. Fragment preserved on well-formed ?query#fragment URI (PR #176 regression) ─
+
+// TestResolveURI_FragmentPreservedWithQuery verifies that a well-formed URI
+// carrying both a non-digest query param and a fragment in RFC 3986 order
+// (?query#fragment) correctly preserves the fragment in the returned
+// URIResolution.
+//
+// PR #176 introduced a regression: rest was truncated at '?' before the
+// fragment-extraction pass, so the fragment was silently dropped.
+// Concretely: cog:adr/074?ref=main#section-2 would return Fragment="" instead
+// of Fragment="section-2".
+func TestResolveURI_FragmentPreservedWithQuery(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+
+	// adr uses glob pattern — create the file so ResolveURI can find it.
+	if err := os.MkdirAll(filepath.Join(root, ".cog", "adr"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	adrFile := filepath.Join(root, ".cog", "adr", "074-some-decision.md")
+	if err := os.WriteFile(adrFile, []byte("# ADR-074\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	uri := "cog:adr/074?ref=main#section-2"
+	res, err := ResolveURI(root, uri)
+	if err != nil {
+		t.Fatalf("ResolveURI(%q): unexpected error %v", uri, err)
+	}
+	if res.Fragment != "section-2" {
+		t.Errorf("Fragment = %q; want %q (fragment was dropped — PR #176 regression)", res.Fragment, "section-2")
+	}
+}
