@@ -1,9 +1,9 @@
-// daemon_test.go — verifies that importing this package registers all 9
+// daemon_test.go — verifies that importing this package registers all 10
 // expected Reconcilable providers with pkg/reconcile.
 //
 // This is the canonical test for verification gate 3: "after the
 // engine.Main-equivalent boot path runs, reconcile.ListProviders() returns
-// the 9 expected names."
+// the 10 expected names."
 //
 // We don't start a server or invoke engine.Main() — we only confirm that
 // the package's init() side-effect wired the providers. This is sufficient
@@ -20,7 +20,7 @@ import (
 	"github.com/cogos-dev/cogos/internal/providers/daemon"
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 
-	// Blank import fires daemon.init(), registering all 9 providers; the named
+	// Blank import fires daemon.init(), registering all 10 providers; the named
 	// import above is for the new SetWorkspaceRoot regression test.
 	_ "github.com/cogos-dev/cogos/internal/providers/daemon"
 )
@@ -34,10 +34,11 @@ var expectedProviders = []string{
 	"openclaw-agents",
 	"openclaw-cron",
 	"openclaw-gateway",
+	"pin",
 	"service",
 }
 
-func TestDaemonInit_RegistersAll9Providers(t *testing.T) {
+func TestDaemonInit_RegistersAll10Providers(t *testing.T) {
 	got := reconcile.ListProviders()
 	sort.Strings(got)
 
