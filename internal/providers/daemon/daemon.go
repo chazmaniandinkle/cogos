@@ -72,6 +72,23 @@ func SetWorkspaceRoot(root string) {
 	workspaceRoot = root
 }
 
+// globalPinProvider is the singleton pinProvider registered in init().
+// Exposed so providers_wire.go can inject the workspace locator after the
+// engine's URIRegistry is initialised.
+var globalPinProvider = &pinProvider{stubMethods: stubMethods{name: "pin"}}
+
+// SetPinWorkspaceLocator wires a WorkspaceLocator into the pin provider so that
+// FetchLive can consult the global workspace registry. Called from
+// providers_wire.go after engine.URIRegistry is available.
+func SetPinWorkspaceLocator(loc pin.WorkspaceLocator) {
+	globalPinProvider.mu.Lock()
+	defer globalPinProvider.mu.Unlock()
+	if globalPinProvider.impl == nil {
+		globalPinProvider.impl = pin.New(nil)
+	}
+	globalPinProvider.impl.SetWorkspaceLocator(loc)
+}
+
 // pinProvider is the daemon-side wrapper around the fully-extracted pin provider.
 // It delegates Health() to pin.New() after running the read-only refresh cycle
 // (LoadConfig → FetchLive → ComputePlan, no ApplyPlan) so that pinStates is
@@ -144,7 +161,7 @@ func init() {
 	reconcile.RegisterProvider("openclaw-agents", &openclawAgentsProvider{})
 	reconcile.RegisterProvider("openclaw-cron", &openclawCronProvider{})
 	reconcile.RegisterProvider("openclaw-gateway", &openclawGatewayProvider{})
-	reconcile.RegisterProvider("pin", &pinProvider{stubMethods: stubMethods{name: "pin"}})
+	reconcile.RegisterProvider("pin", globalPinProvider)
 	reconcile.RegisterProvider("service", &serviceProvider{})
 }
 

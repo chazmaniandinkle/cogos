@@ -22,11 +22,23 @@
 package main
 
 import (
+	"context"
+
 	"github.com/cogos-dev/cogos/internal/engine"
 	"github.com/cogos-dev/cogos/internal/eval"
 	"github.com/cogos-dev/cogos/internal/providers/component"
 	"github.com/cogos-dev/cogos/internal/providers/daemon"
 )
+
+// uriRegistryLocatorAdapter adapts engine.ResolveWorkspacePath to satisfy the
+// pin.WorkspaceLocator interface. This avoids exporting the engine's unexported
+// uriResolver type while still allowing the pin provider to consult the global
+// workspace registry for target path resolution.
+type uriRegistryLocatorAdapter struct{}
+
+func (a *uriRegistryLocatorAdapter) LocateWorkspace(ctx context.Context, name string) (string, error) {
+	return engine.ResolveWorkspacePath(ctx, name)
+}
 
 // daemonEvalProvider is the daemon-side EvalProvider instance passed to the
 // eval MCP tools. The daemon does not run plan/apply; it only exposes the
@@ -52,6 +64,11 @@ func init() {
 	engine.SetProvidersWorkspace = func(workspaceRoot string) {
 		daemon.SetWorkspaceRoot(workspaceRoot)
 		component.SetWorkspaceRoot(workspaceRoot)
+		// Wire URIRegistry into the pin provider's WorkspaceLocator so FetchLive
+		// can consult the global workspace registry for target path resolution
+		// (two-step chain: registry → sibling-dir fallback). Safe to call every
+		// time SetProvidersWorkspace fires — SetPinWorkspaceLocator is idempotent.
+		daemon.SetPinWorkspaceLocator(&uriRegistryLocatorAdapter{})
 		// Prime the daemon EvalProvider root so its MCP tools can resolve
 		// the workspace-relative state files (eval-dispatch-triggers.json,
 		// eval-baselines.json). LoadConfig is idempotent — safe to call here.

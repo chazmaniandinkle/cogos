@@ -15,10 +15,10 @@
 //   - Health      — green/yellow/red aggregate across all pins
 //   - Reconcile   — full cycle (LoadConfig → FetchLive → ComputePlan → ApplyPlan)
 //
-// URIRegistry dependency: FetchLive resolves target workspace names via
-// URIRegistry (issue #167, not yet merged). Until #167 lands, FetchLive
-// stubs remote resolution and falls back to local git checkout inspection.
-// A clear TODO marks the integration point.
+// URIRegistry dependency: FetchLive resolves target workspace names via a
+// WorkspaceLocator (backed by engine.URIRegistry, wired at startup). When no
+// locator is injected the provider falls back to local git checkout inspection.
+// The locator is injected via Provider.SetWorkspaceLocator after construction.
 package pin
 
 import (
@@ -33,10 +33,27 @@ import (
 	"sync"
 	"time"
 
+	"errors"
+
 	"gopkg.in/yaml.v3"
 
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 )
+
+// ─── WorkspaceLocator ────────────────────────────────────────────────────────
+
+// WorkspaceLocator resolves a workspace name (e.g. "cogos-dev/cogos") to its
+// absolute filesystem root path. In production it is backed by engine.URIRegistry
+// via an adapter wired at daemon startup. Tests inject a stub.
+type WorkspaceLocator interface {
+	// LocateWorkspace returns the filesystem root for the named workspace.
+	// Returns ErrWorkspaceNotFound when the workspace is not registered.
+	LocateWorkspace(ctx context.Context, name string) (path string, err error)
+}
+
+// ErrWorkspaceNotFound is returned by WorkspaceLocator when the target workspace
+// is not registered in the global workspace registry.
+var ErrWorkspaceNotFound = errors.New("pin: workspace not found in registry")
 
 // ─── Schema types ────────────────────────────────────────────────────────────
 
@@ -123,6 +140,9 @@ type pinLive struct {
 //
 // Construct via New; inject a GitHeadResolver for FetchLive. Tests supply
 // a stubResolver; production defaults to localGitHeadResolver.
+// Optionally inject a WorkspaceLocator via SetWorkspaceLocator after
+// construction so FetchLive can consult the global workspace registry before
+// falling back to local directory scanning.
 //
 // Thread safety: mu protects all mutable fields. LoadConfig, FetchLive, and
 // the Health probe are the only callers that mutate state; they are sequenced
@@ -132,6 +152,7 @@ type Provider struct {
 	mu sync.Mutex
 
 	resolver GitHeadResolver
+	locator  WorkspaceLocator // optional; nil = skip registry lookup
 
 	// State updated through the lifecycle and surfaced by Health().
 	root      string
@@ -163,6 +184,20 @@ func New(resolver GitHeadResolver) *Provider {
 	}
 }
 
+// SetWorkspaceLocator injects a WorkspaceLocator so FetchLive can consult the
+// global workspace registry before falling back to local directory scanning.
+// Call this at daemon startup after the registry is initialised. Safe to call
+// multiple times; the last value wins. Thread-safe.
+func (p *Provider) SetWorkspaceLocator(loc WorkspaceLocator) {
+	p.mu.Lock()
+	p.locator = loc
+	// Propagate to the underlying localGitHeadResolver if that is what we hold.
+	if lgr, ok := p.resolver.(*localGitHeadResolver); ok {
+		lgr.locator = loc
+	}
+	p.mu.Unlock()
+}
+
 // Type returns the provider identifier. Used by the reconcile registry and
 // the "cog reconcile" dispatch.
 func (p *Provider) Type() string { return "pin" }
@@ -183,19 +218,18 @@ type GitHeadResolver interface {
 }
 
 // localGitHeadResolver is the production GitHeadResolver.
-// It resolves target workspace paths by scanning sibling directories relative
-// to the source workspace and running `git rev-parse HEAD`.
-//
-// TODO(#167): wire URIRegistry here once PR #167 merges.
-// The lookup chain should be:
-//   1. URIRegistry.Resolve("cog://workspace/<target>") → path
-//   2. Fallback: sibling-directory scan (current behaviour)
-type localGitHeadResolver struct{}
+// It resolves target workspace paths using a two-step chain:
+//  1. WorkspaceLocator (backed by URIRegistry) — canonical registry lookup.
+//  2. Sibling-directory scan — local fallback when no locator is wired or the
+//     registry does not know the workspace yet.
+type localGitHeadResolver struct {
+	locator WorkspaceLocator // injected via Provider.SetWorkspaceLocator
+}
 
 func (r *localGitHeadResolver) ResolveHead(ctx context.Context, target, workspaceRoot string) (string, string, error) {
-	targetPath := r.locateTarget(target, workspaceRoot)
+	targetPath := r.locateTarget(ctx, target, workspaceRoot)
 	if targetPath == "" {
-		return "", "", fmt.Errorf("pin: target workspace %q not found locally (TODO: consult URIRegistry after #167)", target)
+		return "", "", fmt.Errorf("%w: %q", ErrWorkspaceNotFound, target)
 	}
 
 	// git rev-parse HEAD in the target directory.
@@ -208,11 +242,26 @@ func (r *localGitHeadResolver) ResolveHead(ctx context.Context, target, workspac
 	return ref, "", nil // digest computation deferred to v1
 }
 
-// locateTarget attempts to find a local checkout of the target workspace.
-// Strategy: look for a directory whose last path component or last-two components
-// matches the target name (e.g., "cogos-dev/cogos" → sibling "cogos-dev/cogos"
-// or "cogos").
-func (r *localGitHeadResolver) locateTarget(target, workspaceRoot string) string {
+// locateTarget finds the filesystem root for the target workspace.
+//
+// Lookup chain:
+//  1. WorkspaceLocator.LocateWorkspace — consults the global workspace registry
+//     (URIRegistry backed by ~/.cog/node/global.yaml). Returns immediately on
+//     success or on any error that is NOT ErrWorkspaceNotFound.
+//  2. Sibling-directory scan — local fallback for workspaces not yet in the
+//     registry (e.g. during bootstrapping or federation setup).
+func (r *localGitHeadResolver) locateTarget(ctx context.Context, target, workspaceRoot string) string {
+	// Step 1: consult WorkspaceLocator when available.
+	if r.locator != nil {
+		path, err := r.locator.LocateWorkspace(ctx, target)
+		if err == nil && path != "" {
+			return path
+		}
+		// ErrWorkspaceNotFound → fall through to local scan.
+		// Any other error (I/O, registry unavailable) → also fall through so
+		// a transient registry failure doesn't break local-only workflows.
+	}
+
 	if workspaceRoot == "" {
 		return ""
 	}
