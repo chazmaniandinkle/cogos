@@ -14,7 +14,7 @@ import (
 	"github.com/cogos-dev/cogos/sdk/types"
 )
 
-// inferenceProjector handles cog://inference namespace.
+// inferenceProjector handles cog:inference namespace.
 // Provides the SDK interface to the Claude CLI inference engine.
 type inferenceProjector struct {
 	BaseProjector
@@ -31,9 +31,9 @@ func (p *inferenceProjector) CanMutate() bool {
 //
 // URIs:
 //
-//	cog://inference           -> Engine status
-//	cog://inference/status    -> Detailed status
-//	cog://inference/config    -> Current configuration
+//	cog:inference           -> Engine status
+//	cog:inference/status    -> Detailed status
+//	cog:inference/config    -> Current configuration
 func (p *inferenceProjector) Resolve(ctx context.Context, uri *ParsedURI) (*Resource, error) {
 	switch uri.Path {
 	case "", "status":
@@ -83,7 +83,7 @@ func (p *inferenceProjector) resolveConfig(uri *ParsedURI) (*Resource, error) {
 //	}
 //	data, _ := json.Marshal(req)
 //	mutation := sdk.NewSetMutation(data)
-//	kernel.Mutate("cog://inference", mutation)
+//	kernel.Mutate("cog:inference", mutation)
 func (p *inferenceProjector) Mutate(ctx context.Context, uri *ParsedURI, m *Mutation) error {
 	if m.Op != MutationSet {
 		return NewURIError("Mutate", uri.Raw, fmt.Errorf("only 'set' operation supported for inference"))

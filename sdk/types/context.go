@@ -38,7 +38,7 @@ type ContextTierName string
 
 const (
 	// TierIdentity is the stable identity tier (~1/3 of budget).
-	// Contains: cog://identity, agent cards, roles
+	// Contains: cog:identity, agent cards, roles
 	TierIdentity ContextTierName = "identity"
 
 	// TierTemporal is the session-aware tier.
@@ -204,20 +204,20 @@ func (cs *ContextState) BuildMetrics() *ContextMetrics {
 // ContextURISource maps tier names to their default URI sources.
 var ContextURISource = map[ContextTierName][]string{
 	TierIdentity: {
-		"cog://identity",
-		"cog://roles",
-		"cog://agents",
+		"cog:identity",
+		"cog:roles",
+		"cog:agents",
 	},
 	TierTemporal: {
-		"cog://handoffs",
-		"cog://ledger",
+		"cog:handoffs",
+		"cog:ledger",
 	},
 	TierPresent: {
-		"cog://thread/current",
-		"cog://signals",
+		"cog:thread/current",
+		"cog:signals",
 	},
 	TierFeedback: {
-		"cog://coherence",
-		"cog://mem/episodic/decisions",
+		"cog:coherence",
+		"cog:mem/episodic/decisions",
 	},
 }

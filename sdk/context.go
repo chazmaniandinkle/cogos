@@ -10,7 +10,7 @@ import (
 	"github.com/cogos-dev/cogos/sdk/types"
 )
 
-// contextProjector handles cog://context namespace.
+// contextProjector handles cog:context namespace.
 // Projects the 4-tier context pipeline for inference.
 type contextProjector struct {
 	BaseProjector
@@ -28,10 +28,10 @@ type contextProjector struct {
 //
 // Example URIs:
 //
-//	cog://context                     -> Full 4-tier context
-//	cog://context?budget=30000        -> With custom budget
-//	cog://context?tier=identity       -> Identity tier only
-//	cog://context?include=cog://adr/021,cog://adr/033
+//	cog:context                     -> Full 4-tier context
+//	cog:context?budget=30000        -> With custom budget
+//	cog:context?tier=identity       -> Identity tier only
+//	cog:context?include=cog:adr/021,cog:adr/033
 func (p *contextProjector) Resolve(ctx context.Context, uri *ParsedURI) (*Resource, error) {
 	// Parse configuration from query params
 	config := types.DefaultContextConfig()
@@ -101,7 +101,7 @@ func (p *contextProjector) assembleContext(ctx context.Context, config *types.Co
 	}
 
 	// Get coherence score
-	coherenceRes, err := p.kernel.ResolveContext(ctx, "cog://coherence")
+	coherenceRes, err := p.kernel.ResolveContext(ctx, "cog:coherence")
 	if err == nil {
 		var coherence map[string]any
 		if err := coherenceRes.JSON(&coherence); err == nil {
@@ -298,7 +298,7 @@ func (b *ContextBuilder) WithSession(sessionID string) *ContextBuilder {
 func (b *ContextBuilder) Build(ctx context.Context) (*types.ContextState, error) {
 	// Build query string
 	var parts []string
-	parts = append(parts, "cog://context")
+	parts = append(parts, "cog:context")
 
 	var queryParts []string
 	if b.config.Budget != 50000 {
@@ -314,7 +314,7 @@ func (b *ContextBuilder) Build(ctx context.Context) (*types.ContextState, error)
 		queryParts = append(queryParts, "exclude="+strings.Join(b.exclude, ","))
 	}
 
-	uri := "cog://context"
+	uri := "cog:context"
 	if len(queryParts) > 0 {
 		uri += "?" + strings.Join(queryParts, "&")
 	}

@@ -223,8 +223,8 @@ func TestContextURISource(t *testing.T) {
 
 	// Check identity tier includes identity URI
 	identityURIs := types.ContextURISource[types.TierIdentity]
-	if !slices.Contains(identityURIs, "cog://identity") {
-		t.Error("Identity tier should include cog://identity")
+	if !slices.Contains(identityURIs, "cog:identity") {
+		t.Error("Identity tier should include cog:identity")
 	}
 }
 

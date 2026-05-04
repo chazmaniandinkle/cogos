@@ -9,14 +9,14 @@ import (
 	"github.com/cogos-dev/cogos/sdk/types"
 )
 
-// InferenceClient provides ergonomic access to cog://inference
+// InferenceClient provides ergonomic access to cog:inference
 //
 // This client wraps the inference projector, which invokes the Claude CLI
 // for LLM completions. It supports:
 //   - Single prompts with Complete()
 //   - Streaming responses with Stream()
 //   - Chat-style multi-turn with Chat()
-//   - Context injection from cog:// URIs
+//   - Context injection from cog: URIs
 //
 // All methods are goroutine-safe.
 type InferenceClient struct {
@@ -67,7 +67,7 @@ func (c *InferenceClient) WithTemperature(t float64) *InferenceClient {
 //
 // Example:
 //
-//	client := c.Inference.WithContext("cog://mem/semantic/insights/eigenform", "cog://identity")
+//	client := c.Inference.WithContext("cog:mem/semantic/insights/eigenform", "cog:identity")
 //	resp, err := client.Complete("Summarize the eigenform concept.")
 func (c *InferenceClient) WithContext(uris ...string) *InferenceClient {
 	clone := *c
@@ -94,7 +94,7 @@ func (c *InferenceClient) CompleteContext(ctx context.Context, prompt string) (*
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	uri := "cog://inference"
+	uri := "cog:inference"
 	mutation := sdk.NewSetMutation(content)
 
 	if err := c.kernel.MutateContext(ctx, uri, mutation); err != nil {
@@ -149,7 +149,7 @@ func (c *InferenceClient) StreamContext(ctx context.Context, prompt string) (<-c
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	uri := "cog://inference?stream=true"
+	uri := "cog:inference?stream=true"
 	mutation := sdk.NewSetMutation(content)
 
 	if err := c.kernel.MutateContext(ctx, uri, mutation); err != nil {
@@ -245,7 +245,7 @@ func (c *InferenceClient) Status() (*types.InferenceStatus, error) {
 
 // StatusContext is like Status but accepts a context.
 func (c *InferenceClient) StatusContext(ctx context.Context) (*types.InferenceStatus, error) {
-	resource, err := c.kernel.ResolveContext(ctx, "cog://inference?status=true")
+	resource, err := c.kernel.ResolveContext(ctx, "cog:inference?status=true")
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +310,7 @@ func (c *InferenceClient) Ask(prompt string) (string, error) {
 //
 // Example:
 //
-//	answer, err := c.Inference.AskWithContext("Summarize this.", "cog://mem/semantic/insights/eigenform")
+//	answer, err := c.Inference.AskWithContext("Summarize this.", "cog:mem/semantic/insights/eigenform")
 func (c *InferenceClient) AskWithContext(prompt string, uris ...string) (string, error) {
 	return c.WithContext(uris...).Ask(prompt)
 }

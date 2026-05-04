@@ -10,7 +10,7 @@ import (
 	"github.com/cogos-dev/cogos/sdk/types"
 )
 
-// ThreadClient provides ergonomic access to cog://thread/*
+// ThreadClient provides ergonomic access to cog:thread/*
 //
 // Threads are conversation histories that persist across sessions.
 // They contain messages with roles (user, assistant, system, tool).
@@ -37,7 +37,7 @@ func (c *ThreadClient) Get(id string) (*types.Thread, error) {
 
 // GetContext is like Get but accepts a context.
 func (c *ThreadClient) GetContext(ctx context.Context, id string) (*types.Thread, error) {
-	uri := fmt.Sprintf("cog://thread/%s", id)
+	uri := fmt.Sprintf("cog:thread/%s", id)
 	resource, err := c.kernel.ResolveContext(ctx, uri)
 	if err != nil {
 		return nil, err
@@ -62,7 +62,7 @@ func (c *ThreadClient) Current() (*types.Thread, error) {
 
 // CurrentContext is like Current but accepts a context.
 func (c *ThreadClient) CurrentContext(ctx context.Context) (*types.Thread, error) {
-	resource, err := c.kernel.ResolveContext(ctx, "cog://thread/current")
+	resource, err := c.kernel.ResolveContext(ctx, "cog:thread/current")
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +89,7 @@ func (c *ThreadClient) List() ([]*types.Thread, error) {
 
 // ListContext is like List but accepts a context.
 func (c *ThreadClient) ListContext(ctx context.Context) ([]*types.Thread, error) {
-	resource, err := c.kernel.ResolveContext(ctx, "cog://thread")
+	resource, err := c.kernel.ResolveContext(ctx, "cog:thread")
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +142,7 @@ func (c *ThreadClient) CreateContext(ctx context.Context, title string) (*types.
 		return nil, fmt.Errorf("marshal thread: %w", err)
 	}
 
-	uri := fmt.Sprintf("cog://thread/%s", id)
+	uri := fmt.Sprintf("cog:thread/%s", id)
 	mutation := sdk.NewSetMutation(content)
 	if err := c.kernel.MutateContext(ctx, uri, mutation); err != nil {
 		return nil, err
@@ -178,7 +178,7 @@ func (c *ThreadClient) ArchiveContext(ctx context.Context, id string) error {
 		return fmt.Errorf("marshal thread: %w", err)
 	}
 
-	uri := fmt.Sprintf("cog://thread/%s", id)
+	uri := fmt.Sprintf("cog:thread/%s", id)
 	mutation := sdk.NewSetMutation(content)
 	return c.kernel.MutateContext(ctx, uri, mutation)
 }
@@ -194,7 +194,7 @@ func (c *ThreadClient) Delete(id string) error {
 
 // DeleteContext is like Delete but accepts a context.
 func (c *ThreadClient) DeleteContext(ctx context.Context, id string) error {
-	uri := fmt.Sprintf("cog://thread/%s", id)
+	uri := fmt.Sprintf("cog:thread/%s", id)
 	mutation := sdk.NewDeleteMutation()
 	return c.kernel.MutateContext(ctx, uri, mutation)
 }
@@ -221,7 +221,7 @@ func (c *ThreadClient) AppendContext(ctx context.Context, threadID string, msg t
 		return fmt.Errorf("marshal message: %w", err)
 	}
 
-	uri := fmt.Sprintf("cog://thread/%s", threadID)
+	uri := fmt.Sprintf("cog:thread/%s", threadID)
 	mutation := sdk.NewAppendMutation(content)
 	return c.kernel.MutateContext(ctx, uri, mutation)
 }
@@ -264,7 +264,7 @@ func (c *ThreadClient) LastN(threadID string, n int) ([]*types.Message, error) {
 
 // LastNContext is like LastN but accepts a context.
 func (c *ThreadClient) LastNContext(ctx context.Context, threadID string, n int) ([]*types.Message, error) {
-	uri := fmt.Sprintf("cog://thread/%s#last-%d", threadID, n)
+	uri := fmt.Sprintf("cog:thread/%s#last-%d", threadID, n)
 	resource, err := c.kernel.ResolveContext(ctx, uri)
 	if err != nil {
 		return nil, err
@@ -342,7 +342,7 @@ func (c *ThreadClient) SetTitleContext(ctx context.Context, threadID, title stri
 		return fmt.Errorf("marshal thread: %w", err)
 	}
 
-	uri := fmt.Sprintf("cog://thread/%s", threadID)
+	uri := fmt.Sprintf("cog:thread/%s", threadID)
 	mutation := sdk.NewSetMutation(content)
 	return c.kernel.MutateContext(ctx, uri, mutation)
 }

@@ -14,7 +14,7 @@ import (
 // OpenAIHandler provides an OpenAI-compatible /v1/chat/completions endpoint.
 //
 // This allows tools that speak OpenAI API to use the CogOS inference system.
-// The handler translates between OpenAI format and cog://inference.
+// The handler translates between OpenAI format and cog:inference.
 type OpenAIHandler struct {
 	kernel *sdk.Kernel
 }

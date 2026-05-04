@@ -234,7 +234,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check coherence
-	coherence, err := s.kernel.Resolve("cog://coherence")
+	coherence, err := s.kernel.Resolve("cog:coherence")
 	if err == nil {
 		var state map[string]any
 		if err := coherence.JSON(&state); err == nil {
@@ -370,7 +370,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get coherence state via SDK
-	coherence, err := s.kernel.Resolve("cog://coherence")
+	coherence, err := s.kernel.Resolve("cog:coherence")
 	if err == nil {
 		var cohState map[string]any
 		if err := coherence.JSON(&cohState); err == nil {
@@ -396,7 +396,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get signals via SDK
-	signals, err := s.kernel.Resolve("cog://signals")
+	signals, err := s.kernel.Resolve("cog:signals")
 	if err == nil {
 		var sigField map[string]any
 		if err := signals.JSON(&sigField); err == nil {
@@ -450,7 +450,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get session ID via SDK
-	identity, err := s.kernel.Resolve("cog://identity")
+	identity, err := s.kernel.Resolve("cog:identity")
 	if err == nil {
 		var idData map[string]any
 		if err := identity.JSON(&idData); err == nil {
@@ -480,7 +480,7 @@ func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get signals via SDK
-	signals, err := s.kernel.Resolve("cog://signals")
+	signals, err := s.kernel.Resolve("cog:signals")
 	if err != nil {
 		// Return empty signals rather than error
 		writeJSON(w, http.StatusOK, result)
