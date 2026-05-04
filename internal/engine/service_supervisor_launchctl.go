@@ -12,8 +12,8 @@
 //     load plist then kickstart.
 //   - Stop:    SIGTERM with 5s timeout, then SIGKILL. Returns immediately with
 //     Stopping=true; caller polls Status.
-//   - Restart: serialised per-service. Second concurrent call waits for first,
-//     then returns the same resulting status.
+//   - Restart: serialised per-service via mutex. Second concurrent call blocks
+//     until the first finishes, then runs its own stop+start (idempotent).
 //   - Enable:  launchctl load -w <plist>. Idempotent.
 //   - Disable: launchctl unload -w <plist>. Idempotent (unload of missing job
 //     is harmless — launchctl exits 0).
@@ -47,19 +47,17 @@ import (
 // It shells out to launchctl(1) and parses its output to derive live state.
 //
 // The controller holds a per-service mutex map so that concurrent Restart
-// calls for the same service serialise (second waits for first, both return
-// the same resulting status as per the spec).
+// calls for the same service serialise: the second caller blocks until the
+// first finishes, then executes its own stop+start (which is idempotent).
 type LaunchctlController struct {
 	mu    sync.Mutex
 	locks map[string]*serviceRestartLock
 }
 
 // serviceRestartLock serialises concurrent Restart calls for a single service.
+// Plain mutex: each caller runs the full stop+start sequence under the lock.
 type serviceRestartLock struct {
-	mu      sync.Mutex
-	inFlight bool
-	result  *ServiceStatus
-	err     error
+	mu sync.Mutex
 }
 
 // NewLaunchctlController returns a LaunchctlController ready for use.
@@ -173,29 +171,15 @@ func (c *LaunchctlController) Stop(ctx context.Context, name string, def Service
 }
 
 // Restart stops and then starts the service. Concurrent calls for the same
-// service serialise: the second caller waits for the first and returns the
-// same resulting status.
+// service serialise via a per-service mutex: the second caller blocks until
+// the first completes, then runs its own stop+start. Because stop+start is
+// idempotent, redundant work is safe. Each caller receives the result of its
+// own restart attempt.
 func (c *LaunchctlController) Restart(ctx context.Context, name string, def ServiceDef) (*ServiceStatus, error) {
 	lock := c.restartLockFor(name)
 
 	lock.mu.Lock()
 	defer lock.mu.Unlock()
-
-	if lock.inFlight {
-		// Another goroutine is already restarting — wait until it finishes
-		// (lock is held), then return its result. Because we hold the same
-		// Mutex here after the first goroutine releases it, we simply execute
-		// the restart again; the underlying idempotency of stop+start is safe.
-		// In practice goroutines block on lock.mu.Lock() above, so by the
-		// time we get here the previous result is available.
-		if lock.result != nil || lock.err != nil {
-			return lock.result, lock.err
-		}
-	}
-
-	lock.inFlight = true
-	lock.result = nil
-	lock.err = nil
 
 	_, _ = c.Stop(ctx, name, def)
 	// Brief wait to allow launchd to process the stop before starting.
@@ -203,16 +187,11 @@ func (c *LaunchctlController) Restart(ctx context.Context, name string, def Serv
 	// live state before kickstarting.
 	select {
 	case <-ctx.Done():
-		lock.inFlight = false
 		return nil, ctx.Err()
 	case <-time.After(500 * time.Millisecond):
 	}
 
-	st, err := c.Start(ctx, name, def)
-	lock.result = st
-	lock.err = err
-	lock.inFlight = false
-	return st, err
+	return c.Start(ctx, name, def)
 }
 
 // Enable loads the plist with -w (write boot preference) so the service
