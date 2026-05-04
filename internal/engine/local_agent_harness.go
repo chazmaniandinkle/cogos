@@ -279,6 +279,15 @@ func (c *LocalHarnessController) autonomicTick(ctx context.Context) {
 	// 2. Emit snapshot to bus regardless of health state.
 	emitHealthSnapshot(ctx, c.busSessions, snap)
 
+	// 2a. Run deterministic self-heal for any degraded provider that supports
+	// the full plan/apply Reconcilable contract (e.g. MLXSupervisedProvider).
+	// This runs BEFORE the escalation predicate so that transient crashes are
+	// repaired autonomically without waking the LLM. If self-heal succeeds,
+	// the next snapshot will be green and no escalation fires.
+	if !snap.AllGreen() {
+		healDegradedProviders(ctx)
+	}
+
 	// 3. Consume the triggerPending flag atomically.
 	c.triggerPendingMu.Lock()
 	triggerPending := c.triggerPending

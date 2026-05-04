@@ -718,6 +718,210 @@ func TestAutonomicTick_DedupeReleasesOnReturnToGreen(t *testing.T) {
 	})
 }
 
+// --- healDegradedProviders unit tests ----------------------------------------
+
+// selfHealableProvider is a Reconcilable stub that records whether
+// FetchLive, ComputePlan, and ApplyPlan were called. Its Health() returns the
+// injected status. Used to verify that healDegradedProviders calls the full
+// plan/apply cycle for unhealthy providers.
+type selfHealableProvider struct {
+	name           string
+	status         reconcile.ResourceStatus
+	fetchLiveCalls int
+	computePlanCalls int
+	applyPlanCalls int
+	// planHasChanges controls whether ComputePlan returns a non-empty plan.
+	planHasChanges bool
+}
+
+func (s *selfHealableProvider) Type() string { return s.name }
+
+func (s *selfHealableProvider) LoadConfig(string) (any, error) { return nil, nil }
+
+func (s *selfHealableProvider) FetchLive(context.Context, any) (any, error) {
+	s.fetchLiveCalls++
+	return struct{}{}, nil
+}
+
+func (s *selfHealableProvider) ComputePlan(_ any, _ any, _ *reconcile.State) (*reconcile.Plan, error) {
+	s.computePlanCalls++
+	plan := &reconcile.Plan{ResourceType: s.name}
+	if s.planHasChanges {
+		plan.Actions = []reconcile.Action{{
+			Action:       reconcile.ActionUpdate,
+			ResourceType: s.name,
+			Name:         s.name + "/heal",
+		}}
+		plan.Summary.Updates = 1
+	}
+	return plan, nil
+}
+
+func (s *selfHealableProvider) ApplyPlan(_ context.Context, _ *reconcile.Plan) ([]reconcile.Result, error) {
+	s.applyPlanCalls++
+	return []reconcile.Result{{
+		Phase:  "apply",
+		Action: string(reconcile.ActionUpdate),
+		Name:   s.name + "/heal",
+		Status: reconcile.ApplySucceeded,
+	}}, nil
+}
+
+func (s *selfHealableProvider) BuildState(_ any, _ any, _ *reconcile.State) (*reconcile.State, error) {
+	return nil, nil
+}
+
+func (s *selfHealableProvider) Health() reconcile.ResourceStatus { return s.status }
+
+// withSelfHealableProviders registers selfHealableProvider instances in the
+// global reconcile registry for the duration of fn(). Uses healthRegistryMu
+// (same lock as withProviders) to avoid concurrent mutation.
+func withSelfHealableProviders(t *testing.T, providers []*selfHealableProvider, fn func()) {
+	t.Helper()
+	healthRegistryMu.Lock()
+	defer healthRegistryMu.Unlock()
+
+	reconcile.ResetProviders()
+	defer reconcile.ResetProviders()
+
+	for _, p := range providers {
+		reconcile.RegisterProvider(p.name, p)
+	}
+	fn()
+}
+
+// TestHealDegradedProviders_CallsReconcileOnUnhealthy verifies that
+// healDegradedProviders calls FetchLive→ComputePlan→ApplyPlan for providers
+// whose Health() is Degraded. This is the regression test for issue #150:
+// the autonomic ticker must self-heal mlx-supervised providers on crash.
+func TestHealDegradedProviders_CallsReconcileOnUnhealthy(t *testing.T) {
+	degraded := &selfHealableProvider{
+		name: "mlx-supervised/test",
+		status: reconcile.ResourceStatus{
+			Sync:    reconcile.SyncStatusOutOfSync,
+			Health:  reconcile.HealthDegraded,
+			Message: "process not running",
+		},
+		planHasChanges: true,
+	}
+
+	withSelfHealableProviders(t, []*selfHealableProvider{degraded}, func() {
+		ctx := context.Background()
+		healDegradedProviders(ctx)
+
+		if degraded.fetchLiveCalls != 1 {
+			t.Errorf("FetchLive calls: got %d; want 1", degraded.fetchLiveCalls)
+		}
+		if degraded.computePlanCalls != 1 {
+			t.Errorf("ComputePlan calls: got %d; want 1", degraded.computePlanCalls)
+		}
+		if degraded.applyPlanCalls != 1 {
+			t.Errorf("ApplyPlan calls: got %d; want 1", degraded.applyPlanCalls)
+		}
+	})
+}
+
+// TestHealDegradedProviders_SkipsHealthyProviders verifies that
+// healDegradedProviders does NOT call plan/apply for providers that are Healthy
+// and Synced. Self-heal must be a no-op on the happy path.
+func TestHealDegradedProviders_SkipsHealthyProviders(t *testing.T) {
+	healthy := &selfHealableProvider{
+		name:   "mlx-supervised/healthy",
+		status: greenStatus(),
+	}
+
+	withSelfHealableProviders(t, []*selfHealableProvider{healthy}, func() {
+		ctx := context.Background()
+		healDegradedProviders(ctx)
+
+		if healthy.fetchLiveCalls != 0 {
+			t.Errorf("FetchLive should not be called for healthy provider: got %d calls", healthy.fetchLiveCalls)
+		}
+		if healthy.computePlanCalls != 0 {
+			t.Errorf("ComputePlan should not be called for healthy provider: got %d calls", healthy.computePlanCalls)
+		}
+		if healthy.applyPlanCalls != 0 {
+			t.Errorf("ApplyPlan should not be called for healthy provider: got %d calls", healthy.applyPlanCalls)
+		}
+	})
+}
+
+// TestHealDegradedProviders_SkipsWhenNoPlanChanges verifies that when
+// ComputePlan produces an empty plan (no drift), ApplyPlan is NOT called.
+// Self-heal must not make spurious applies.
+func TestHealDegradedProviders_SkipsWhenNoPlanChanges(t *testing.T) {
+	degraded := &selfHealableProvider{
+		name: "mlx-supervised/nochanges",
+		status: reconcile.ResourceStatus{
+			Sync:   reconcile.SyncStatusOutOfSync,
+			Health: reconcile.HealthDegraded,
+		},
+		planHasChanges: false, // ComputePlan will return an empty plan.
+	}
+
+	withSelfHealableProviders(t, []*selfHealableProvider{degraded}, func() {
+		ctx := context.Background()
+		healDegradedProviders(ctx)
+
+		if degraded.fetchLiveCalls != 1 {
+			t.Errorf("FetchLive calls: got %d; want 1", degraded.fetchLiveCalls)
+		}
+		if degraded.computePlanCalls != 1 {
+			t.Errorf("ComputePlan calls: got %d; want 1", degraded.computePlanCalls)
+		}
+		if degraded.applyPlanCalls != 0 {
+			t.Errorf("ApplyPlan should not be called when plan is empty: got %d calls", degraded.applyPlanCalls)
+		}
+	})
+}
+
+// TestAutonomicTick_HealsDegradedBeforeSnapshot verifies the end-to-end path:
+// when autonomicTick fires with a degraded provider registered, it calls
+// healDegradedProviders. We confirm FetchLive was called (proof the heal loop
+// ran). This test does not use a live LLM — the snapshot degradation is enough
+// to assert the deterministic path.
+func TestAutonomicTick_HealsDegradedBeforeSnapshot(t *testing.T) {
+	degraded := &selfHealableProvider{
+		name: "mlx-supervised/tick-heal",
+		status: reconcile.ResourceStatus{
+			Sync:    reconcile.SyncStatusOutOfSync,
+			Health:  reconcile.HealthDegraded,
+			Message: "process crashed",
+		},
+		planHasChanges: true,
+	}
+
+	withSelfHealableProviders(t, []*selfHealableProvider{degraded}, func() {
+		root := makeWorkspace(t)
+		cfg := makeConfig(t, root)
+		cfg.LocalModel = "gemma4:e4b"
+		proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+		srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+
+		ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+		if err != nil {
+			t.Fatalf("NewLocalHarnessController: %v", err)
+		}
+		// Suppress LLM escalation by setting a recent lastLLMCycle with a long
+		// idle window. This isolates the deterministic heal path.
+		ctrl.mu.Lock()
+		ctrl.lastLLMCycle = time.Now().UTC()
+		ctrl.mu.Unlock()
+		ctrl.autonomicCfg = AutonomicConfig{IdleRecheckIn: 24 * time.Hour}
+
+		// Run one tick. The degraded provider is not-green, so healDegradedProviders
+		// must run and call FetchLive → ComputePlan → ApplyPlan.
+		ctrl.autonomicTick(context.Background())
+
+		if degraded.fetchLiveCalls == 0 {
+			t.Error("autonomicTick: FetchLive not called — self-heal loop did not run")
+		}
+		if degraded.applyPlanCalls == 0 {
+			t.Error("autonomicTick: ApplyPlan not called — self-heal did not apply corrective action")
+		}
+	})
+}
+
 // --- snapshotToPayload unit test -------------------------------------------
 
 func TestSnapshotToPayload_Roundtrip(t *testing.T) {
