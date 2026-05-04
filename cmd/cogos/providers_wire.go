@@ -19,16 +19,119 @@
 // (cog_run_experiment, cog_list_experiments, cog_get_experiment_status,
 // cog_pin_baseline) onto the kernel's MCP server so they are accessible
 // from both the cog CLI binary and the daemon.
+//
+// workspace.LoadConfig and workspace.GitRoot are wired here so that
+// internal/workspace.ResolveWorkspace() can resolve the active workspace
+// from ~/.cog/node/global.yaml and from the enclosing git repository, in
+// addition to the COG_ROOT environment variable. Without this wiring the
+// daemon binary skips tiers 2-4 of the resolution algorithm silently.
+// Previously this wiring lived only in cog.go:init() (the CLI binary).
 package main
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"github.com/cogos-dev/cogos/internal/engine"
 	"github.com/cogos-dev/cogos/internal/eval"
 	"github.com/cogos-dev/cogos/internal/providers/component"
 	"github.com/cogos-dev/cogos/internal/providers/daemon"
+	"github.com/cogos-dev/cogos/internal/workspace"
+	"gopkg.in/yaml.v3"
 )
+
+// daemonGlobalConfig is the minimal shape of ~/.cog/node/global.yaml that
+// workspace resolution requires. Only the two fields used by
+// workspace.ConfigProvider are declared; other keys round-trip cleanly via
+// yaml.v3's default behaviour.
+//
+// ADR-085 rule 7: duplicate small helpers rather than exporting them from
+// the root CLI package.
+type daemonGlobalConfig struct {
+	CurrentWorkspace string                           `yaml:"current-workspace,omitempty"`
+	Workspaces       map[string]*daemonWorkspaceEntry `yaml:"workspaces,omitempty"`
+}
+
+type daemonWorkspaceEntry struct {
+	Path string `yaml:"path"`
+}
+
+func (c *daemonGlobalConfig) CurrentWorkspaceValue() string { return c.CurrentWorkspace }
+func (c *daemonGlobalConfig) WorkspacePath(name string) (string, bool) {
+	e, ok := c.Workspaces[name]
+	if !ok || e == nil {
+		return "", false
+	}
+	return e.Path, ok
+}
+
+// daemonConfigProvider wraps *daemonGlobalConfig to implement workspace.ConfigProvider.
+type daemonConfigProvider struct{ cfg *daemonGlobalConfig }
+
+func (p daemonConfigProvider) CurrentWorkspace() string { return p.cfg.CurrentWorkspace }
+func (p daemonConfigProvider) WorkspacePath(name string) (string, bool) {
+	return p.cfg.WorkspacePath(name)
+}
+
+// loadDaemonGlobalConfig reads ~/.cog/node/global.yaml, falling back to
+// ~/.cog/config (the legacy path used before issue #161). Returns an empty
+// config on ENOENT so the daemon starts even on a fresh node.
+//
+// Local duplicate of cog.go's loadGlobalConfig / globalConfigPath per
+// ADR-085 rule 7.
+func loadDaemonGlobalConfig() (workspace.ConfigProvider, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return daemonConfigProvider{cfg: &daemonGlobalConfig{
+			Workspaces: make(map[string]*daemonWorkspaceEntry),
+		}}, nil
+	}
+	newPath := filepath.Join(home, ".cog", "node", "global.yaml")
+	oldPath := filepath.Join(home, ".cog", "config")
+
+	path := newPath
+	if _, statErr := os.Stat(newPath); os.IsNotExist(statErr) {
+		if _, statErr2 := os.Stat(oldPath); statErr2 == nil {
+			path = oldPath
+		}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return daemonConfigProvider{cfg: &daemonGlobalConfig{
+				Workspaces: make(map[string]*daemonWorkspaceEntry),
+			}}, nil
+		}
+		return nil, fmt.Errorf("daemon: read global config: %w", err)
+	}
+
+	var cfg daemonGlobalConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("daemon: parse global config: %w", err)
+	}
+	if cfg.Workspaces == nil {
+		cfg.Workspaces = make(map[string]*daemonWorkspaceEntry)
+	}
+	return daemonConfigProvider{cfg: &cfg}, nil
+}
+
+// daemonGitRoot returns the top-level git repository containing the process
+// working directory. Local duplicate of cog.go's gitRoot per ADR-085 rule 7.
+func daemonGitRoot() (string, error) {
+	var out bytes.Buffer
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("not a git repository")
+	}
+	return strings.TrimSpace(out.String()), nil
+}
 
 // uriRegistryLocatorAdapter adapts engine.ResolveWorkspacePath to satisfy the
 // pin.WorkspaceLocator interface. This avoids exporting the engine's unexported
@@ -47,6 +150,18 @@ func (a *uriRegistryLocatorAdapter) LocateWorkspace(ctx context.Context, name st
 var daemonEvalProvider = eval.New(nil, nil)
 
 func init() {
+	// Wire workspace.LoadConfig and workspace.GitRoot so that
+	// internal/workspace.ResolveWorkspace() can resolve workspaces via the
+	// global registry (~/.cog/node/global.yaml) and via git root detection,
+	// in addition to the COG_ROOT env var that always works unconditionally.
+	//
+	// These DI seams were previously only wired in cog.go:init() (the CLI
+	// binary). Moving them here closes the gap for the daemon binary.
+	workspace.LoadConfig = func() (workspace.ConfigProvider, error) {
+		return loadDaemonGlobalConfig()
+	}
+	workspace.GitRoot = daemonGitRoot
+
 	// The named import of internal/providers/daemon above already triggered
 	// daemon.init() (and component.init() via daemon's blank import), which
 	// called reconcile.RegisterProvider for all 9 providers. engine.RegisterProviders
