@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cogos-dev/cogos/pkg/reconcile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -542,6 +543,12 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 		if err != nil {
 			return nil, fmt.Errorf("mlx-supervised %q: %w", name, err)
 		}
+		// Register in the global reconcile registry so the autonomic ticker can
+		// run the full plan/apply self-heal cycle. UpsertProvider is used instead
+		// of RegisterProvider to allow safe re-registration (e.g. on config reload
+		// or in tests that call BuildRouter multiple times).
+		reconcile.UpsertProvider(mlxSupervisedType+"/"+name, p)
+		slog.Info("router: registered mlx-supervised provider in reconcile registry", "name", name)
 		return p, nil
 	default:
 		return nil, fmt.Errorf("unknown provider type %q", t)

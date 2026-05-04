@@ -247,6 +247,88 @@ func snapshotFingerprint(snap KernelHealthSnapshot) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// --- Self-healing reconcile loop ---------------------------------------------
+
+// healDegradedProviders iterates all registered Reconcilables and, for any
+// whose Health() is not Healthy, runs the full plan/apply cycle:
+//
+//  1. FetchLive — probe actual state.
+//  2. ComputePlan — diff declared vs live.
+//  3. ApplyPlan — execute any corrective actions (e.g. start a crashed process).
+//
+// This is the deterministic self-healing path. It runs on every tick before the
+// LLM escalation predicate so that transient crashes (mlx_lm.server exited) are
+// corrected autonomically without waking the LLM. Errors are logged but never
+// propagate — a failed apply leaves Health() degraded, which will trigger the
+// LLM escalation predicate on the same tick if needed.
+func healDegradedProviders(ctx context.Context) {
+	names := reconcile.ListProviders()
+	for _, name := range names {
+		p, err := reconcile.GetProvider(name)
+		if err != nil {
+			continue
+		}
+		h := p.Health()
+		// Only attempt self-heal when the provider is non-healthy (Degraded,
+		// Missing, OutOfSync). Suspended and Progressing providers are either
+		// intentionally paused or already converging — skip them.
+		needsHeal := h.Health == reconcile.HealthDegraded ||
+			h.Health == reconcile.HealthMissing ||
+			h.Sync == reconcile.SyncStatusOutOfSync
+
+		if !needsHeal {
+			continue
+		}
+
+		slog.Info("autonomic: self-heal: starting reconcile cycle",
+			"provider", name,
+			"health", string(h.Health),
+			"sync", string(h.Sync),
+		)
+
+		// Load config (no-op for most providers that parse config at construction).
+		cfg, err := p.LoadConfig("")
+		if err != nil {
+			slog.Warn("autonomic: self-heal: LoadConfig failed", "provider", name, "err", err)
+			continue
+		}
+
+		// Fetch live state.
+		live, err := p.FetchLive(ctx, cfg)
+		if err != nil {
+			slog.Warn("autonomic: self-heal: FetchLive failed", "provider", name, "err", err)
+			continue
+		}
+
+		// Compute plan.
+		plan, err := p.ComputePlan(cfg, live, nil)
+		if err != nil {
+			slog.Warn("autonomic: self-heal: ComputePlan failed", "provider", name, "err", err)
+			continue
+		}
+		if plan == nil || !plan.Summary.HasChanges() {
+			slog.Debug("autonomic: self-heal: no changes needed", "provider", name)
+			continue
+		}
+
+		// Apply plan.
+		results, err := p.ApplyPlan(ctx, plan)
+		if err != nil {
+			slog.Warn("autonomic: self-heal: ApplyPlan failed",
+				"provider", name,
+				"err", err,
+				"results", len(results),
+			)
+			continue
+		}
+		slog.Info("autonomic: self-heal: apply complete",
+			"provider", name,
+			"actions", len(plan.Actions),
+			"results", len(results),
+		)
+	}
+}
+
 // snapshotToPayload serialises KernelHealthSnapshot into the map[string]any
 // shape expected by BusSessionManager.AppendEvent.
 func snapshotToPayload(snap KernelHealthSnapshot) (map[string]any, error) {

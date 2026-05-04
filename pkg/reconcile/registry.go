@@ -62,6 +62,16 @@ func HasProvider(name string) bool {
 	return ok
 }
 
+// UpsertProvider adds or replaces a reconciliation provider in the global
+// registry. Unlike RegisterProvider, this does not panic on duplicate names —
+// the new provider replaces the existing one. Used by BuildRouter to register
+// MLXSupervisedProvider instances without conflicting with daemon-side stubs.
+func UpsertProvider(name string, provider Reconcilable) {
+	providersMu.Lock()
+	defer providersMu.Unlock()
+	providers[name] = provider
+}
+
 // ResetProviders clears the registry (for testing only).
 func ResetProviders() {
 	providersMu.Lock()
