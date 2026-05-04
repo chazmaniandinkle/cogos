@@ -11,6 +11,8 @@
 // observer-only mode for all services.
 package engine
 
+import "os"
+
 // LaunchctlController is a no-op alias for ObserverSupervisor on non-darwin
 // platforms. It compiles cleanly but returns ErrNotControllable for all
 // mutations.
@@ -21,7 +23,10 @@ func NewLaunchctlController() *LaunchctlController {
 	return &ObserverSupervisor{}
 }
 
-// homeDir is a stub on non-darwin platforms — not called in practice.
+// homeDir returns the current user's home directory on non-darwin platforms.
+// MLXSupervisedProvider uses this to build the plist path; on Linux/other
+// platforms the plist path is meaningless (launchd is macOS-only) but the
+// provider must still construct cleanly so tests and cross-platform builds work.
 func homeDir() (string, error) {
-	return "", ErrNotControllable
+	return os.UserHomeDir()
 }
