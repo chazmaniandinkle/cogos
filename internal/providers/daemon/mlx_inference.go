@@ -30,6 +30,8 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/cogos-dev/cogos/pkg/reconcile"
 )
 
@@ -107,17 +109,8 @@ type mlxEntry struct {
 
 // loadMLXEntries reads providers(.local).yaml and returns all entries with
 // type == "mlx-supervised". Errors are silently ignored (missing file = empty).
+// providers.local.yaml is processed second so its entries overlay the base file.
 func loadMLXEntries(root string) []mlxEntry {
-	type providerCfg struct {
-		Type     string                 `json:"type"`
-		Endpoint string                 `json:"endpoint"`
-		Model    string                 `json:"model"`
-		Options  map[string]interface{} `json:"options"`
-	}
-	type providersCfg struct {
-		Providers map[string]providerCfg `json:"providers"`
-	}
-
 	var result []mlxEntry
 
 	for _, filename := range []string{"providers.yaml", "providers.local.yaml"} {
@@ -126,12 +119,6 @@ func loadMLXEntries(root string) []mlxEntry {
 		if err != nil {
 			continue
 		}
-		// Use JSON-compatible YAML decode: pkg/reconcile has no yaml dep, so
-		// we do a two-step: marshal to JSON intermediary via a map decode then
-		// re-encode. For this minimal parse, direct JSON parsing of the YAML
-		// works because mlx-supervised configs use only string/int/bool fields.
-		// We rely on the same approach used by the daemon's other providers
-		// (simple os.ReadFile + string checks). For robustness we parse manually.
 		entries := parseMLXEntriesFromYAML(data, filename)
 		// Overlay: if same name already present, replace (local wins).
 		existing := make(map[string]int)
@@ -146,102 +133,63 @@ func loadMLXEntries(root string) []mlxEntry {
 				existing[e.name] = len(result) - 1
 			}
 		}
-		_ = data
 	}
 	return result
 }
 
-// parseMLXEntriesFromYAML is a minimal parser that extracts mlx-supervised
-// provider entries from a providers YAML file without a yaml library dependency.
-// It reads line by line, detecting top-level provider keys and their type fields.
+// providerFileCfg is the top-level shape of providers(.local).yaml, used only
+// for the daemon-side mlx-supervised parse. Fields beyond what we need are
+// ignored via yaml:",inline" / unknown-key tolerance in yaml.v3.
+type providerFileCfg struct {
+	Providers map[string]providerEntryCfg `yaml:"providers"`
+}
+
+// providerEntryCfg captures the fields relevant to mlx-supervised health probes.
+// Unknown fields (e.g. options, context_window) are silently ignored.
+type providerEntryCfg struct {
+	Type         string `yaml:"type"`
+	Endpoint     string `yaml:"endpoint"`
+	Model        string `yaml:"model"`
+	LaunchdLabel string `yaml:"launchd_label"`
+}
+
+// parseMLXEntriesFromYAML decodes a providers YAML file with gopkg.in/yaml.v3
+// and returns the subset of entries whose type is "mlx-supervised".
 //
-// This is intentionally simple: it handles the canonical format that
-// providers.local.yaml uses. Exotic YAML constructs (anchors, multi-line
-// strings) are not supported here; they fall through gracefully.
-func parseMLXEntriesFromYAML(data []byte, filename string) []mlxEntry {
+// This replaces the previous hand-rolled line-by-line state machine. yaml.v3
+// correctly handles anchors/aliases, flow-style mappings, multi-line strings,
+// and tab/space variants that the bespoke parser silently dropped.
+//
+// Behavior preservation notes vs. the prior implementation:
+//   - All valid-input behavior is identical: same entries extracted, same
+//     default launchd_label derivation ("com.cogos.mlx-<name>").
+//   - The bespoke parser silently produced empty results for malformed YAML
+//     (anchors, flow-style, multi-line strings). yaml.v3 returns a decode
+//     error instead; we treat that as "no entries" (same observable outcome
+//     for callers) but the error surface is now explicit in the log-path if
+//     we later add logging.
+func parseMLXEntriesFromYAML(data []byte, _ string) []mlxEntry {
+	var cfg providerFileCfg
+	if err := yaml.Unmarshal(data, &cfg); err != nil || cfg.Providers == nil {
+		return nil
+	}
+
 	var entries []mlxEntry
-	lines := strings.Split(string(data), "\n")
-
-	// State machine: track current top-level section and current provider block.
-	inProviders := false
-	var currentName string
-	var currentType, currentEndpoint, currentModel, currentLabel string
-
-	flush := func() {
-		if currentName != "" && currentType == mlxSupervisedTypeKey {
-			label := currentLabel
-			if label == "" {
-				label = "com.cogos.mlx-" + currentName
-			}
-			entries = append(entries, mlxEntry{
-				name:         currentName,
-				endpoint:     currentEndpoint,
-				model:        currentModel,
-				launchdLabel: label,
-			})
+	for name, p := range cfg.Providers {
+		if p.Type != mlxSupervisedTypeKey {
+			continue
 		}
-		currentName = ""
-		currentType = ""
-		currentEndpoint = ""
-		currentModel = ""
-		currentLabel = ""
+		label := p.LaunchdLabel
+		if label == "" {
+			label = "com.cogos.mlx-" + name
+		}
+		entries = append(entries, mlxEntry{
+			name:         name,
+			endpoint:     p.Endpoint,
+			model:        p.Model,
+			launchdLabel: label,
+		})
 	}
-
-	for _, rawLine := range lines {
-		// Detect top-level section headers.
-		if rawLine == "providers:" {
-			flush()
-			inProviders = true
-			continue
-		}
-		if len(rawLine) > 0 && rawLine[0] != ' ' && rawLine[0] != '\t' && strings.HasSuffix(strings.TrimSpace(rawLine), ":") {
-			// A non-indented key — new top-level section.
-			if rawLine != "providers:" {
-				flush()
-				inProviders = false
-			}
-			continue
-		}
-		if !inProviders {
-			continue
-		}
-
-		trimmed := strings.TrimSpace(rawLine)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-
-		// Detect two-space-indented provider name (e.g. "  mlx-gemma-supervised:").
-		if len(rawLine) >= 2 && rawLine[0] == ' ' && rawLine[1] == ' ' && rawLine[2] != ' ' {
-			// This is a provider-level key.
-			flush()
-			if strings.HasSuffix(trimmed, ":") {
-				currentName = strings.TrimSuffix(trimmed, ":")
-			}
-			continue
-		}
-
-		// Four-space (or more) indented fields within a provider block.
-		if currentName != "" && len(rawLine) >= 4 && rawLine[0] == ' ' && rawLine[1] == ' ' && rawLine[2] == ' ' {
-			kv := strings.SplitN(trimmed, ":", 2)
-			if len(kv) != 2 {
-				continue
-			}
-			k := strings.TrimSpace(kv[0])
-			v := strings.TrimSpace(kv[1])
-			switch k {
-			case "type":
-				currentType = v
-			case "endpoint":
-				currentEndpoint = v
-			case "model":
-				currentModel = v
-			case "launchd_label":
-				currentLabel = v
-			}
-		}
-	}
-	flush()
 	return entries
 }
 
