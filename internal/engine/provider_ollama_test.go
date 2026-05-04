@@ -884,6 +884,7 @@ func TestBuildOllamaRequestSuppressesToolsWhenNone(t *testing.T) {
 
 	// tool_choice == "none" → tools field must be absent from the wire body.
 	t.Run("none suppresses tools", func(t *testing.T) {
+		t.Parallel()
 		req := &CompletionRequest{Messages: msgs, Tools: tools, ToolChoice: "none"}
 		r := buildOllamaRequest("m", req, false, 0)
 		if len(r.Tools) != 0 {
@@ -906,6 +907,7 @@ func TestBuildOllamaRequestSuppressesToolsWhenNone(t *testing.T) {
 	for _, tc := range []string{"auto", "required", "search"} {
 		tc := tc
 		t.Run("includes tools for "+tc, func(t *testing.T) {
+			t.Parallel()
 			req := &CompletionRequest{Messages: msgs, Tools: tools, ToolChoice: tc}
 			r := buildOllamaRequest("m", req, false, 0)
 			if len(r.Tools) != 1 {
@@ -916,6 +918,7 @@ func TestBuildOllamaRequestSuppressesToolsWhenNone(t *testing.T) {
 
 	// No tools in the request → tools field absent regardless of tool_choice.
 	t.Run("no tools always omits tools field", func(t *testing.T) {
+		t.Parallel()
 		req := &CompletionRequest{Messages: msgs, ToolChoice: "auto"}
 		r := buildOllamaRequest("m", req, false, 0)
 		if len(r.Tools) != 0 {
