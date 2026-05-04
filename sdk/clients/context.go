@@ -124,9 +124,9 @@ func (c *ContextClient) BuildContext(ctx context.Context, opts ...ContextOption)
 		params.Add("exclude", pattern)
 	}
 
-	uri := "cog://context"
+	uri := "cog:context"
 	if len(params) > 0 {
-		uri = fmt.Sprintf("cog://context?%s", params.Encode())
+		uri = fmt.Sprintf("cog:context?%s", params.Encode())
 	}
 
 	resource, err := c.kernel.ResolveContext(ctx, uri)
@@ -208,7 +208,7 @@ func (c *ContextClient) FeedbackContext(ctx context.Context) (*types.ContextTier
 
 // getTier fetches a specific tier from the context projector.
 func (c *ContextClient) getTier(ctx context.Context, tier types.ContextTierName) (*types.ContextTier, error) {
-	uri := fmt.Sprintf("cog://context?tier=%s", tier)
+	uri := fmt.Sprintf("cog:context?tier=%s", tier)
 	resource, err := c.kernel.ResolveContext(ctx, uri)
 	if err != nil {
 		return nil, err

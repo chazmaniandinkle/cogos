@@ -35,7 +35,7 @@ var ValidRefRelations = map[string]bool{
 
 // IndexedCogdoc represents a cogdoc with full metadata for indexing.
 type IndexedCogdoc struct {
-	URI        string            `json:"uri"`         // cog://mem/episodic/decisions/foo
+	URI        string            `json:"uri"`         // cog:mem/episodic/decisions/foo
 	Path       string            `json:"path"`        // .cog/mem/episodic/decisions/foo.cog.md
 	Type       types.CogdocType  `json:"type"`        // decision, session, guide, etc.
 	ID         string            `json:"id"`          // kebab-case identifier
@@ -174,14 +174,14 @@ func parseCogdocForIndex(path, cogRoot string) (*IndexedCogdoc, error) {
 	}
 
 	// Convert path to URI
-	// .cog/mem/episodic/decisions/foo.cog.md -> cog://mem/episodic/decisions/foo
+	// .cog/mem/episodic/decisions/foo.cog.md -> cog:mem/episodic/decisions/foo
 	relPath, err := filepath.Rel(cogRoot, path)
 	if err != nil {
 		return nil, err
 	}
 	// Remove .cog.md extension
 	relPath = strings.TrimSuffix(relPath, ".cog.md")
-	uri := "cog://" + relPath
+	uri := "cog:" + relPath
 
 	// Parse refs
 	refs := parseRefs(doc.Refs)

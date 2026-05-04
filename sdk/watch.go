@@ -92,9 +92,9 @@ func (w *Watcher) Close() error {
 // WatchURI subscribes to changes on a URI pattern.
 //
 // Supports wildcards in the path:
-//   - cog://mem/semantic/* watches all files in semantic/
-//   - cog://mem/semantic/** watches all files recursively
-//   - cog://signals/* watches all signal namespaces
+//   - cog:mem/semantic/* watches all files in semantic/
+//   - cog:mem/semantic/** watches all files recursively
+//   - cog:signals/* watches all signal namespaces
 //
 // The returned Watcher's Events channel will emit WatchEvents
 // when resources matching the pattern change.
@@ -103,7 +103,7 @@ func (w *Watcher) Close() error {
 //
 // Example:
 //
-//	watcher, err := kernel.WatchURI(ctx, "cog://mem/semantic/*")
+//	watcher, err := kernel.WatchURI(ctx, "cog:mem/semantic/*")
 //	if err != nil {
 //	    return err
 //	}
@@ -358,12 +358,12 @@ func parseWatchPattern(pattern string) (*watchPattern, error) {
 	if len(parts) > 1 {
 		path := parts[1]
 		if path == "**" {
-			// cog://namespace/** - recursive wildcard at root
+			// cog:namespace/** - recursive wildcard at root
 			wp.path = ""
 			wp.wildcard = true
 			wp.recursive = true
 		} else if path == "*" {
-			// cog://namespace/* - wildcard at root
+			// cog:namespace/* - wildcard at root
 			wp.path = ""
 			wp.wildcard = true
 			wp.recursive = false

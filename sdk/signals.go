@@ -43,7 +43,7 @@ func (ps *persistedSignal) toTypesSignal(location string) *types.Signal {
 	}
 }
 
-// signalProjector handles cog://signals/* namespace.
+// signalProjector handles cog:signals/* namespace.
 // Provides stigmergic coordination through signal field access.
 type signalProjector struct {
 	BaseProjector
@@ -58,10 +58,10 @@ func (p *signalProjector) CanMutate() bool {
 // Resolve reads signals from the signal field.
 //
 // URI patterns:
-//   - cog://signals - List all signals
-//   - cog://signals/inference - Signals at 'inference' location
-//   - cog://signals/inference?above=0.3 - Only signals with relevance > 0.3
-//   - cog://signals?location=inference - Same as above
+//   - cog:signals - List all signals
+//   - cog:signals/inference - Signals at 'inference' location
+//   - cog:signals/inference?above=0.3 - Only signals with relevance > 0.3
+//   - cog:signals?location=inference - Same as above
 func (p *signalProjector) Resolve(ctx context.Context, uri *ParsedURI) (*Resource, error) {
 	state, err := p.loadSignalField()
 	if err != nil {
@@ -135,7 +135,7 @@ func (p *signalProjector) Resolve(ctx context.Context, uri *ParsedURI) (*Resourc
 //	}
 func (p *signalProjector) Mutate(ctx context.Context, uri *ParsedURI, m *Mutation) error {
 	if uri.Path == "" {
-		return NewURIError("Mutate", uri.Raw, fmt.Errorf("signal location required (e.g., cog://signals/inference)"))
+		return NewURIError("Mutate", uri.Raw, fmt.Errorf("signal location required (e.g., cog:signals/inference)"))
 	}
 
 	location := uri.Path

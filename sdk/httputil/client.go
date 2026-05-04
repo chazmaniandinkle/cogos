@@ -24,7 +24,7 @@ import (
 // Example:
 //
 //	client := httputil.NewClient("http://localhost:8080")
-//	resource, err := client.Resolve(ctx, "cog://mem/semantic/insights")
+//	resource, err := client.Resolve(ctx, "cog:mem/semantic/insights")
 type Client struct {
 	baseURL    string
 	httpClient *http.Client

@@ -6,18 +6,18 @@ import (
 	"strings"
 )
 
-// ParsedURI represents a parsed cog:// URI with its components.
+// ParsedURI represents a parsed cog: URI with its components.
 //
-// URI format: cog://namespace/path[?query][#fragment]
+// URI format: cog:namespace/path[?query][#fragment]
 //
 // Examples:
 //
-//	cog://mem/semantic/insights/eigenform
-//	cog://signals/inference?above=0.3
-//	cog://context?budget=50000&model=sonnet
-//	cog://thread/current#last-10
-//	cog://coherence
-//	cog://src
+//	cog:mem/semantic/insights/eigenform
+//	cog:signals/inference?above=0.3
+//	cog:context?budget=50000&model=sonnet
+//	cog:thread/current#last-10
+//	cog:coherence
+//	cog:src
 type ParsedURI struct {
 	// Namespace is the first path component (memory, signals, context, etc.)
 	Namespace string

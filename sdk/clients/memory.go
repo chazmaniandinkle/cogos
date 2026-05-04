@@ -11,7 +11,7 @@ import (
 	"github.com/cogos-dev/cogos/sdk/types"
 )
 
-// MemoryClient provides ergonomic access to cog://mem/*
+// MemoryClient provides ergonomic access to cog:mem/*
 //
 // The Memory namespace contains the Holographic Memory Domain (HMD):
 //   - semantic/ - Knowledge, architecture, insights
@@ -89,7 +89,7 @@ func (c *MemoryClient) Get(path string) (*sdk.Resource, error) {
 
 // GetContext is like Get but accepts a context.
 func (c *MemoryClient) GetContext(ctx context.Context, path string) (*sdk.Resource, error) {
-	uri := fmt.Sprintf("cog://mem/%s", strings.TrimPrefix(path, "/"))
+	uri := fmt.Sprintf("cog:mem/%s", strings.TrimPrefix(path, "/"))
 	return c.kernel.ResolveContext(ctx, uri)
 }
 
@@ -131,7 +131,7 @@ func (c *MemoryClient) List(sector string) ([]*sdk.Resource, error) {
 
 // ListContext is like List but accepts a context.
 func (c *MemoryClient) ListContext(ctx context.Context, sector string) ([]*sdk.Resource, error) {
-	uri := fmt.Sprintf("cog://mem/%s", sector)
+	uri := fmt.Sprintf("cog:mem/%s", sector)
 	resource, err := c.kernel.ResolveContext(ctx, uri)
 	if err != nil {
 		return nil, err
@@ -186,7 +186,7 @@ func (c *MemoryClient) SearchContext(ctx context.Context, query string, opts ...
 		}
 	}
 
-	uri := fmt.Sprintf("cog://memory?%s", params.Encode())
+	uri := fmt.Sprintf("cog:mem?%s", params.Encode())
 	resource, err := c.kernel.ResolveContext(ctx, uri)
 	if err != nil {
 		return nil, err
@@ -215,7 +215,7 @@ func (c *MemoryClient) Write(path string, content []byte) error {
 
 // WriteContext is like Write but accepts a context.
 func (c *MemoryClient) WriteContext(ctx context.Context, path string, content []byte) error {
-	uri := fmt.Sprintf("cog://mem/%s", strings.TrimPrefix(path, "/"))
+	uri := fmt.Sprintf("cog:mem/%s", strings.TrimPrefix(path, "/"))
 	mutation := sdk.NewSetMutation(content)
 	return c.kernel.MutateContext(ctx, uri, mutation)
 }
@@ -260,7 +260,7 @@ func (c *MemoryClient) Delete(path string) error {
 
 // DeleteContext is like Delete but accepts a context.
 func (c *MemoryClient) DeleteContext(ctx context.Context, path string) error {
-	uri := fmt.Sprintf("cog://mem/%s", strings.TrimPrefix(path, "/"))
+	uri := fmt.Sprintf("cog:mem/%s", strings.TrimPrefix(path, "/"))
 	mutation := sdk.NewDeleteMutation()
 	return c.kernel.MutateContext(ctx, uri, mutation)
 }
@@ -346,8 +346,10 @@ func (c *MemoryClient) resourceToCogdoc(r *sdk.Resource, doc *types.Cogdoc) erro
 	doc.Content = string(r.Content)
 	doc.Hash = r.Hash
 
-	// Extract path from URI
-	if strings.HasPrefix(r.URI, "cog://mem/") {
+	// Extract path from URI (accept both bare and legacy authority form)
+	if strings.HasPrefix(r.URI, "cog:mem/") {
+		doc.Path = strings.TrimPrefix(r.URI, "cog:mem/")
+	} else if strings.HasPrefix(r.URI, "cog://mem/") {
 		doc.Path = strings.TrimPrefix(r.URI, "cog://mem/")
 	}
 

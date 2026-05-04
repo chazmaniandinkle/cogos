@@ -269,7 +269,7 @@ func TestNewEvent(t *testing.T) {
 func TestEventWithData(t *testing.T) {
 	event := types.NewEvent(types.EventTypeMessage, "session").
 		WithSource("cog-chat").
-		WithURI("cog://thread/current").
+		WithURI("cog:thread/current").
 		WithData(types.MessageEventData{
 			Role:    "user",
 			Content: "Hello",
@@ -279,8 +279,8 @@ func TestEventWithData(t *testing.T) {
 	if event.Source != "cog-chat" {
 		t.Errorf("Source = %q, want 'cog-chat'", event.Source)
 	}
-	if event.URI != "cog://thread/current" {
-		t.Errorf("URI = %q, want 'cog://thread/current'", event.URI)
+	if event.URI != "cog:thread/current" {
+		t.Errorf("URI = %q, want 'cog:thread/current'", event.URI)
 	}
 
 	var data types.MessageEventData

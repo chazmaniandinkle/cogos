@@ -15,7 +15,7 @@ import (
 	"github.com/cogos-dev/cogos/sdk/types"
 )
 
-// threadProjector handles cog://thread/* namespace.
+// threadProjector handles cog:thread/* namespace.
 // Provides conversation thread storage and retrieval.
 type threadProjector struct {
 	BaseProjector
@@ -30,11 +30,11 @@ func (p *threadProjector) CanMutate() bool {
 // Resolve reads threads from storage.
 //
 // URI patterns:
-//   - cog://thread - List all threads
-//   - cog://thread/current - Get the current active thread
-//   - cog://thread/{id} - Get a specific thread by ID
-//   - cog://thread/{id}?last=10 - Get last 10 messages only
-//   - cog://thread/{id}?summarize=true - Get thread summary only
+//   - cog:thread - List all threads
+//   - cog:thread/current - Get the current active thread
+//   - cog:thread/{id} - Get a specific thread by ID
+//   - cog:thread/{id}?last=10 - Get last 10 messages only
+//   - cog:thread/{id}?summarize=true - Get thread summary only
 func (p *threadProjector) Resolve(ctx context.Context, uri *ParsedURI) (*Resource, error) {
 	if uri.Path == "" {
 		return p.listThreads(uri)
@@ -50,7 +50,7 @@ func (p *threadProjector) Resolve(ctx context.Context, uri *ParsedURI) (*Resourc
 		}
 		if activeID == "" {
 			return nil, NotFoundError("Resolve", uri.Raw).
-				WithRecover("No active thread. Create one with cog://thread mutation.")
+				WithRecover("No active thread. Create one with cog:thread mutation.")
 		}
 		threadID = activeID
 	}
@@ -288,7 +288,7 @@ func (p *threadProjector) archiveThread(uri *ParsedURI) error {
 	patchURI := &ParsedURI{
 		Namespace: uri.Namespace,
 		Path:      threadID,
-		Raw:       "cog://thread/" + threadID,
+		Raw:       "cog:thread/" + threadID,
 	}
 	return p.patchThread(patchURI, patchContent)
 }

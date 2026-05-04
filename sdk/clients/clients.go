@@ -31,22 +31,22 @@ import (
 // Thread-safety: All clients are goroutine-safe because the underlying
 // kernel is goroutine-safe.
 type Clients struct {
-	// Memory provides ergonomic access to cog://mem/*
+	// Memory provides ergonomic access to cog:mem/*
 	Memory *MemoryClient
 
-	// Signal provides ergonomic access to cog://signals/*
+	// Signal provides ergonomic access to cog:signals/*
 	Signal *SignalClient
 
-	// Thread provides ergonomic access to cog://thread/*
+	// Thread provides ergonomic access to cog:thread/*
 	Thread *ThreadClient
 
-	// Inference provides ergonomic access to cog://inference
+	// Inference provides ergonomic access to cog:inference
 	Inference *InferenceClient
 
 	// Context provides context building for inference
 	Context *ContextClient
 
-	// Event provides event emission to cog://events
+	// Event provides event emission to cog:events
 	Event *EventClient
 
 	// kernel is the underlying kernel (kept for direct access if needed)

@@ -459,19 +459,20 @@ func parseCogdoc(data []byte, path string) (*Cogdoc, error) {
 }
 
 // Fix 1: Implement URI Resolution
-// resolveURIToID attempts to resolve a cog:// URI to a document ID.
+// resolveURIToID attempts to resolve a cog: URI to a document ID.
+// Accepts both bare (cog:X/Y) and legacy authority form (cog://X/Y).
 //
 // Supported URI patterns:
-//   - cog://mem/semantic/path/to/doc → .cog/mem/semantic/path/to/doc.cog.md
-//   - cog://adr/004 → .cog/adr/004-*.cog.md (glob pattern)
-//   - cog://kernel/path → .cog/kernel/path.cog.md
-//   - cog://type/identifier → ID lookup
+//   - cog:mem/semantic/path/to/doc → .cog/mem/semantic/path/to/doc.cog.md
+//   - cog:adr/004 → .cog/adr/004-*.cog.md (glob pattern)
+//   - cog:kernel/path → .cog/kernel/path.cog.md
+//   - cog:type/identifier → ID lookup
 func resolveURIToID(tx *sql.Tx, uri string) sql.NullString {
 	if !strings.HasPrefix(uri, "cog://") {
 		return sql.NullString{Valid: false}
 	}
 
-	// PREREQ-2: normalize cog://memory/ → cog://mem/ (D-14 canonical prefix)
+	// PREREQ-2: normalize legacy cog://memory/ → cog://mem/ (D-14 canonical prefix)
 	uri = strings.Replace(uri, "cog://memory/", "cog://mem/", 1)
 
 	// Strip cog:// prefix
@@ -490,13 +491,13 @@ func resolveURIToID(tx *sql.Tx, uri string) sql.NullString {
 
 	switch uriType {
 	case "mem":
-		// cog://mem/semantic/insights/foo
+		// cog:mem/semantic/insights/foo
 		// → .cog/mem/semantic/insights/foo.cog.md
 		return resolveByPath(tx, filepath.Join(".cog", path)+".cog.md")
 
 	case "adr":
-		// cog://adr/004 → .cog/adr/004-*.cog.md (glob pattern)
-		// cog://adr/004-cogdoc-format → .cog/adr/004-cogdoc-format.cog.md (exact)
+		// cog:adr/004 → .cog/adr/004-*.cog.md (glob pattern)
+		// cog:adr/004-cogdoc-format → .cog/adr/004-cogdoc-format.cog.md (exact)
 		if len(parts) < 2 {
 			return sql.NullString{Valid: false}
 		}
@@ -509,11 +510,11 @@ func resolveURIToID(tx *sql.Tx, uri string) sql.NullString {
 		return resolveByPattern(tx, ".cog/adr", adrID+"-*")
 
 	case "kernel":
-		// cog://kernel/path
+		// cog:kernel/path
 		return resolveByPath(tx, filepath.Join(".cog", path)+".cog.md")
 
 	case "term":
-		// cog://term/thermal-time-world → .cog/ontology/vocabulary.cog.md (all terms in one file)
+		// cog:term/thermal-time-world → .cog/ontology/vocabulary.cog.md (all terms in one file)
 		// For now, try to resolve by ID (term name)
 		if len(parts) < 2 {
 			return sql.NullString{Valid: false}
@@ -522,13 +523,13 @@ func resolveURIToID(tx *sql.Tx, uri string) sql.NullString {
 		return resolveByID(tx, termName)
 
 	case "work":
-		// cog://work/councils/xyz/synthesis → .cog/work/councils/xyz/synthesis.cog.md
+		// cog:work/councils/xyz/synthesis → .cog/work/councils/xyz/synthesis.cog.md
 		return resolveByPath(tx, filepath.Join(".cog", path)+".cog.md")
 
 	case "rfc":
-		// PREREQ-2: cog://rfc/NNN → .cog/conf/spec/rfc/RFC-NNN-*.cog.md (glob pattern)
-		// cog://rfc/030 → .cog/conf/spec/rfc/RFC-030-*.cog.md
-		// cog://rfc/30 → .cog/conf/spec/rfc/RFC-030-*.cog.md (zero-padded)
+		// PREREQ-2: cog:rfc/NNN → .cog/conf/spec/rfc/RFC-NNN-*.cog.md (glob pattern)
+		// cog:rfc/030 → .cog/conf/spec/rfc/RFC-030-*.cog.md
+		// cog:rfc/30 → .cog/conf/spec/rfc/RFC-030-*.cog.md (zero-padded)
 		if len(parts) < 2 {
 			return sql.NullString{Valid: false}
 		}
@@ -544,7 +545,7 @@ func resolveURIToID(tx *sql.Tx, uri string) sql.NullString {
 		return resolveByPattern(tx, ".cog/conf/spec/rfc", rfcPrefix+"-*")
 
 	case "conf":
-		// cog://conf/spec/foo → .cog/conf/spec/foo.cog.md
+		// cog:conf/spec/foo → .cog/conf/spec/foo.cog.md
 		return resolveByPath(tx, filepath.Join(".cog", path)+".cog.md")
 
 	default:

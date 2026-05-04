@@ -113,16 +113,16 @@ func (k *Kernel) NextEventSeq() int64 {
 // Examples:
 //
 //	// Read a single cogdoc
-//	resource, err := kernel.Resolve("cog://mem/semantic/insights/eigenform")
+//	resource, err := kernel.Resolve("cog:mem/semantic/insights/eigenform")
 //
 //	// Search memory with query
-//	resource, err := kernel.Resolve("cog://mem/semantic?q=topic&limit=10")
+//	resource, err := kernel.Resolve("cog:mem/semantic?q=topic&limit=10")
 //
 //	// Get active signals
-//	resource, err := kernel.Resolve("cog://signals/inference?above=0.3")
+//	resource, err := kernel.Resolve("cog:signals/inference?above=0.3")
 //
 //	// Get coherence state
-//	resource, err := kernel.Resolve("cog://coherence")
+//	resource, err := kernel.Resolve("cog:coherence")
 func (k *Kernel) Resolve(uri string) (*Resource, error) {
 	return k.ResolveContext(context.Background(), uri)
 }
@@ -156,7 +156,7 @@ func (k *Kernel) ResolveContext(ctx context.Context, uri string) (*Resource, err
 // Example:
 //
 //	var coherence types.CoherenceState
-//	err := kernel.Project("cog://coherence", &coherence)
+//	err := kernel.Project("cog:coherence", &coherence)
 func (k *Kernel) Project(uri string, into any) error {
 	return k.ProjectContext(context.Background(), uri, into)
 }
@@ -190,7 +190,7 @@ func (k *Kernel) ProjectContext(ctx context.Context, uri string, into any) error
 // Example:
 //
 //	mutation := sdk.NewSetMutation([]byte("# New Content\n..."))
-//	err := kernel.Mutate("cog://mem/semantic/insights/new-insight", mutation)
+//	err := kernel.Mutate("cog:mem/semantic/insights/new-insight", mutation)
 func (k *Kernel) Mutate(uri string, mutation *Mutation) error {
 	return k.MutateContext(context.Background(), uri, mutation)
 }

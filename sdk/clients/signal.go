@@ -10,7 +10,7 @@ import (
 	"github.com/cogos-dev/cogos/sdk/types"
 )
 
-// SignalClient provides ergonomic access to cog://signals/*
+// SignalClient provides ergonomic access to cog:signals/*
 //
 // Signals are the stigmergic coordination mechanism - ephemeral markers
 // that decay over time and indicate workspace activity.
@@ -57,7 +57,7 @@ func (c *SignalClient) Field() (*SignalField, error) {
 
 // FieldContext is like Field but accepts a context.
 func (c *SignalClient) FieldContext(ctx context.Context) (*SignalField, error) {
-	resource, err := c.kernel.ResolveContext(ctx, "cog://signals")
+	resource, err := c.kernel.ResolveContext(ctx, "cog:signals")
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +98,7 @@ func (c *SignalClient) Get(location string) ([]*types.Signal, error) {
 
 // GetContext is like Get but accepts a context.
 func (c *SignalClient) GetContext(ctx context.Context, location string) ([]*types.Signal, error) {
-	uri := fmt.Sprintf("cog://signals/%s", location)
+	uri := fmt.Sprintf("cog:signals/%s", location)
 	resource, err := c.kernel.ResolveContext(ctx, uri)
 	if err != nil {
 		return nil, err
@@ -125,7 +125,7 @@ func (c *SignalClient) Above(threshold float64) ([]*types.Signal, error) {
 
 // AboveContext is like Above but accepts a context.
 func (c *SignalClient) AboveContext(ctx context.Context, threshold float64) ([]*types.Signal, error) {
-	uri := fmt.Sprintf("cog://signals?above=%f", threshold)
+	uri := fmt.Sprintf("cog:signals?above=%f", threshold)
 	resource, err := c.kernel.ResolveContext(ctx, uri)
 	if err != nil {
 		return nil, err
@@ -200,7 +200,7 @@ func (c *SignalClient) DepositContext(ctx context.Context, signal types.Signal) 
 		return fmt.Errorf("marshal signal: %w", err)
 	}
 
-	uri := fmt.Sprintf("cog://signals/%s", signal.Location)
+	uri := fmt.Sprintf("cog:signals/%s", signal.Location)
 	mutation := sdk.NewSetMutation(content)
 	return c.kernel.MutateContext(ctx, uri, mutation)
 }
@@ -244,7 +244,7 @@ func (c *SignalClient) RemoveContext(ctx context.Context, location, signalType s
 		}
 	}
 
-	uri := fmt.Sprintf("cog://signals/%s", location)
+	uri := fmt.Sprintf("cog:signals/%s", location)
 	mutation := sdk.NewDeleteMutation()
 	mutation.Content = content
 	return c.kernel.MutateContext(ctx, uri, mutation)

@@ -12,31 +12,31 @@
 //	defer kernel.Close()
 //
 //	// Resolve a URI
-//	resource, _ := kernel.Resolve("cog://mem/semantic/insights")
+//	resource, _ := kernel.Resolve("cog:mem/semantic/insights")
 //
 //	// Project into typed struct
 //	var coherence types.CoherenceState
-//	kernel.Project("cog://coherence", &coherence)
+//	kernel.Project("cog:coherence", &coherence)
 //
 // # URI Scheme
 //
-// All workspace access is through cog:// URIs:
+// All workspace access is through cog: URIs:
 //
-//	cog://mem/*         - Cogdocs (knowledge, sessions, etc.)
-//	cog://signals/*     - Signal field (stigmergic coordination)
-//	cog://context       - Four-tier context for inference
-//	cog://thread/*      - Conversation threads
-//	cog://coherence     - Workspace coherence state
-//	cog://identity      - Workspace identity
-//	cog://src           - SRC constants (immutable)
-//	cog://adr/*         - Architecture Decision Records
-//	cog://ledger/*      - Event ledger
+//	cog:mem/*         - Cogdocs (knowledge, sessions, etc.)
+//	cog:signals/*     - Signal field (stigmergic coordination)
+//	cog:context       - Four-tier context for inference
+//	cog:thread/*      - Conversation threads
+//	cog:coherence     - Workspace coherence state
+//	cog:identity      - Workspace identity
+//	cog:src           - SRC constants (immutable)
+//	cog:adr/*         - Architecture Decision Records
+//	cog:ledger/*      - Event ledger
 //
 // Query parameters act as projections (filters, shapes):
 //
-//	cog://mem/semantic?q=topic&limit=10
-//	cog://signals/inference?above=0.3
-//	cog://context?budget=50000
+//	cog:mem/semantic?q=topic&limit=10
+//	cog:signals/inference?above=0.3
+//	cog:context?budget=50000
 //
 // # SRC Constants
 //
@@ -199,7 +199,7 @@ func registerBuiltinProjectors(k *Kernel) {
 
 // --- Phase 1 Projector Implementations ---
 
-// srcProjector handles cog://src
+// srcProjector handles cog:src
 type srcProjector struct {
 	BaseProjector
 }
@@ -209,7 +209,7 @@ func (p *srcProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource, er
 	return NewJSONResource(uri.Raw, src)
 }
 
-// identityProjector handles cog://identity
+// identityProjector handles cog:identity
 type identityProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -227,7 +227,7 @@ func (p *identityProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resourc
 	return resource, nil
 }
 
-// coherenceProjector handles cog://coherence
+// coherenceProjector handles cog:coherence
 type coherenceProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -250,7 +250,7 @@ func (p *coherenceProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resour
 	return NewJSONResource(uri.Raw, state)
 }
 
-// memoryProjector handles cog://mem/*
+// memoryProjector handles cog:mem/*
 type memoryProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -310,7 +310,7 @@ func (p *memoryProjector) listSectors(uri *ParsedURI) (*Resource, error) {
 	for _, sector := range sectors {
 		sectorPath := filepath.Join(p.kernel.MemoryDir(), sector)
 		if info, err := os.Stat(sectorPath); err == nil && info.IsDir() {
-			child := NewResource("cog://mem/"+sector, nil)
+			child := NewResource("cog:mem/"+sector, nil)
 			child.SetMetadata("sector", sector)
 			children = append(children, child)
 		}
@@ -361,7 +361,7 @@ func (p *memoryProjector) listDirectory(uri *ParsedURI, dirPath string) (*Resour
 // Cogdocs are validated before writing if the path ends in .cog.md.
 func (p *memoryProjector) Mutate(ctx context.Context, uri *ParsedURI, m *Mutation) error {
 	if uri.Path == "" {
-		return NewURIError("Mutate", uri.Raw, fmt.Errorf("memory path required (e.g., cog://mem/semantic/insights/new-insight)"))
+		return NewURIError("Mutate", uri.Raw, fmt.Errorf("memory path required (e.g., cog:mem/semantic/insights/new-insight)"))
 	}
 
 	switch m.Op {
@@ -479,7 +479,7 @@ func writeAtomicFile(path string, data []byte, perm os.FileMode) error {
 
 // --- Extended Projector Implementations (ported from kernel) ---
 
-// adrProjector handles cog://adr/*
+// adrProjector handles cog:adr/*
 type adrProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -532,7 +532,7 @@ func (p *adrProjector) listADRs(uri *ParsedURI, adrDir string) (*Resource, error
 			continue
 		}
 		name := entry.Name()
-		childURI := "cog://adr/" + name[:len(name)-3] // Remove .md
+		childURI := "cog:adr/" + name[:len(name)-3] // Remove .md
 		child := NewResource(childURI, nil)
 		child.SetMetadata("name", name)
 		children = append(children, child)
@@ -543,7 +543,7 @@ func (p *adrProjector) listADRs(uri *ParsedURI, adrDir string) (*Resource, error
 	return resource, nil
 }
 
-// specProjector handles cog://spec/* and cog://specs/*
+// specProjector handles cog:spec/* and cog:specs/*
 type specProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -594,7 +594,7 @@ func (p *specProjector) listDirectory(uri *ParsedURI, dirPath string) (*Resource
 	return resource, nil
 }
 
-// statusProjector handles cog://status/*
+// statusProjector handles cog:status/*
 type statusProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -644,7 +644,7 @@ func (p *statusProjector) listDirectory(uri *ParsedURI, dirPath string) (*Resour
 	return resource, nil
 }
 
-// canonicalProjector handles cog://canonical
+// canonicalProjector handles cog:canonical
 type canonicalProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -671,7 +671,7 @@ func (p *canonicalProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resour
 	return NewJSONResource(uri.Raw, state)
 }
 
-// handoffProjector handles cog://handoff/* and cog://handoffs/*
+// handoffProjector handles cog:handoff/* and cog:handoffs/*
 type handoffProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -735,7 +735,7 @@ func (p *handoffProjector) listDirectory(uri *ParsedURI, dirPath string) (*Resou
 	return resource, nil
 }
 
-// crystalProjector handles cog://crystal/*
+// crystalProjector handles cog:crystal/*
 type crystalProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -760,7 +760,7 @@ func (p *crystalProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource
 	return resource, nil
 }
 
-// ledgerProjector handles cog://ledger/*
+// ledgerProjector handles cog:ledger/*
 type ledgerProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -829,7 +829,7 @@ func (p *ledgerProjector) listDirectory(uri *ParsedURI, dirPath string) (*Resour
 // Operations:
 //   - Append: Append an event to the session's event log
 //
-// The URI path should be the session ID: cog://ledger/{session-id}
+// The URI path should be the session ID: cog:ledger/{session-id}
 //
 // For Append, content should be an Event:
 //
@@ -838,7 +838,7 @@ func (p *ledgerProjector) listDirectory(uri *ParsedURI, dirPath string) (*Resour
 // The event will be assigned a sequence number and timestamp automatically.
 func (p *ledgerProjector) Mutate(ctx context.Context, uri *ParsedURI, m *Mutation) error {
 	if uri.Path == "" {
-		return NewURIError("Mutate", uri.Raw, fmt.Errorf("session ID required (e.g., cog://ledger/{session-id})"))
+		return NewURIError("Mutate", uri.Raw, fmt.Errorf("session ID required (e.g., cog:ledger/{session-id})"))
 	}
 
 	// Extract session ID from path (e.g., "abc123" or "abc123/events.jsonl")
@@ -883,7 +883,7 @@ func (p *ledgerProjector) appendEvent(sessionID string, content []byte) error {
 	return fs.AppendLine(eventsPath, line)
 }
 
-// roleProjector handles cog://role/* and cog://roles/*
+// roleProjector handles cog:role/* and cog:roles/*
 type roleProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -942,7 +942,7 @@ func (p *roleProjector) listDirectory(uri *ParsedURI, dirPath string) (*Resource
 	return resource, nil
 }
 
-// skillProjector handles cog://skill/* and cog://skills/*
+// skillProjector handles cog:skill/* and cog:skills/*
 type skillProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -1001,7 +1001,7 @@ func (p *skillProjector) listDirectory(uri *ParsedURI, dirPath string) (*Resourc
 	return resource, nil
 }
 
-// agentProjector handles cog://agent/* and cog://agents/*
+// agentProjector handles cog:agent/* and cog:agents/*
 type agentProjector struct {
 	BaseProjector
 	kernel *Kernel
@@ -1060,7 +1060,7 @@ func (p *agentProjector) listDirectory(uri *ParsedURI, dirPath string) (*Resourc
 	return resource, nil
 }
 
-// kernelProjector handles cog://kernel/*
+// kernelProjector handles cog:kernel/*
 type kernelProjector struct {
 	BaseProjector
 	kernel *Kernel

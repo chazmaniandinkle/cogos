@@ -111,7 +111,7 @@ func TestInferenceClientBuilder(t *testing.T) {
 	}
 
 	// Test WithContext
-	withCtx := base.WithContext("cog://memory", "cog://identity")
+	withCtx := base.WithContext("cog:mem", "cog:identity")
 	if len(withCtx.contextURIs) != 2 {
 		t.Errorf("WithContext: expected 2 URIs, got %d", len(withCtx.contextURIs))
 	}
@@ -129,7 +129,7 @@ func TestInferenceRequestBuilding(t *testing.T) {
 		model:       "opus",
 		maxTokens:   4096,
 		temperature: 0.7,
-		contextURIs: []string{"cog://memory"},
+		contextURIs: []string{"cog:mem"},
 	}
 
 	req := client.buildRequest("Hello world")
@@ -146,8 +146,8 @@ func TestInferenceRequestBuilding(t *testing.T) {
 	if req.Temperature != 0.7 {
 		t.Errorf("Temperature: expected 0.7, got %f", req.Temperature)
 	}
-	if len(req.Context) != 1 || req.Context[0] != "cog://memory" {
-		t.Errorf("Context: expected [cog://memory], got %v", req.Context)
+	if len(req.Context) != 1 || req.Context[0] != "cog:mem" {
+		t.Errorf("Context: expected [cog:mem], got %v", req.Context)
 	}
 }
 
