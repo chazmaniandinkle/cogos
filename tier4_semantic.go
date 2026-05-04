@@ -17,32 +17,43 @@ import (
 	"github.com/cogos-dev/cogos/sdk/constellation"
 )
 
-// embedClientSingleton holds the shared embed client (nil if embedding disabled).
-var (
-	embedClientSingleton *constellation.EmbedClient
-	embedClientOnce      sync.Once
-)
+// embedClientCache holds per-workspace embed clients.
+// A nil value stored for a key means embedding is disabled for that workspace.
+var embedClientCache sync.Map // map[string]*constellation.EmbedClient
 
-// getEmbedClient returns the shared embed client, creating it on first call.
-// Returns nil if embedding is not enabled in config.
+// getEmbedClient returns the embed client for workspaceRoot, creating it on first access.
+// Returns nil if embedding is not enabled in the workspace's taa.yaml config.
+// Each workspace root gets its own client so callers with different configs do not
+// cross-contaminate (fixes the sync.Once first-caller-wins bug, issue #134).
 func getEmbedClient(workspaceRoot string) *constellation.EmbedClient {
-	embedClientOnce.Do(func() {
-		cfg := LoadTAAConfig(workspaceRoot)
-		if !cfg.Embedding.Enabled {
-			return
+	if v, ok := embedClientCache.Load(workspaceRoot); ok {
+		if v == nil {
+			return nil
 		}
+		return v.(*constellation.EmbedClient)
+	}
 
-		embedClientSingleton = constellation.NewEmbedClient(constellation.EmbedConfig{
-			Enabled:        cfg.Embedding.Enabled,
-			ServerSocket:   cfg.Embedding.ServerSocket,
-			ServerHTTP:     cfg.Embedding.ServerHTTP,
-			DimsFull:       cfg.Embedding.DimsFull,
-			DimsCompressed: cfg.Embedding.DimsCompressed,
-			TimeoutMs:      cfg.Embedding.TimeoutMs,
-		})
+	cfg := LoadTAAConfig(workspaceRoot)
+	if !cfg.Embedding.Enabled {
+		// Store nil sentinel to avoid re-reading config on every call.
+		embedClientCache.Store(workspaceRoot, (*constellation.EmbedClient)(nil))
+		return nil
+	}
+
+	client := constellation.NewEmbedClient(constellation.EmbedConfig{
+		Enabled:        cfg.Embedding.Enabled,
+		ServerSocket:   cfg.Embedding.ServerSocket,
+		ServerHTTP:     cfg.Embedding.ServerHTTP,
+		DimsFull:       cfg.Embedding.DimsFull,
+		DimsCompressed: cfg.Embedding.DimsCompressed,
+		TimeoutMs:      cfg.Embedding.TimeoutMs,
 	})
-
-	return embedClientSingleton
+	// LoadOrStore: if another goroutine raced us, discard our duplicate.
+	actual, loaded := embedClientCache.LoadOrStore(workspaceRoot, client)
+	if loaded {
+		return actual.(*constellation.EmbedClient)
+	}
+	return client
 }
 
 // QueryConstellation queries the constellation graph for relevant knowledge.
@@ -61,7 +72,7 @@ func QueryConstellation(workspaceRoot, anchor, goal string, budget int) (string,
 		fmt.Fprintf(os.Stderr, "[TAA] Tier 4: querying with anchor=%q goal=%q budget=%d\n", anchor, goal, budget)
 	}
 
-	c, err := getConstellation()
+	c, err := getConstellationForWorkspace(workspaceRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[TAA] Tier 4: constellation not available: %v\n", err)
 		return "", nil
@@ -259,7 +270,7 @@ func QueryConstellationWithIris(workspaceRoot, anchor, goal string, budget int, 
 			anchor, goal, budget, irisPressure*100)
 	}
 
-	c, err := getConstellation()
+	c, err := getConstellationForWorkspace(workspaceRoot)
 	if err != nil || c == nil {
 		return "", nil
 	}
