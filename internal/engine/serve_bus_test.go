@@ -937,6 +937,39 @@ func TestBusStreamSincePastTip(t *testing.T) {
 	}
 }
 
+// TestBusStreamSinceEmptyBus is a regression test for issue #136: an empty bus
+// with ?since=1 (or any positive value) must return 416 Range Not Satisfiable,
+// not silently fall through to a 200 SSE stream. The empty bus has tip=0, so
+// any since>0 is out of range per RFC 7233.
+func TestBusStreamSinceEmptyBus(t *testing.T) {
+	t.Parallel()
+	handler, _, _ := newEventsTestServer(t)
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	const busID = "since-empty-bus"
+	openResp, _ := http.Post(srv.URL+"/v1/bus/open", "application/json",
+		strings.NewReader(`{"bus_id":"`+busID+`"}`))
+	openResp.Body.Close()
+
+	// Bus has no events (tip=0). since=1 must return 416.
+	resp, err := http.Get(srv.URL + "/v1/bus/" + busID + "/stream?since=1")
+	if err != nil {
+		t.Fatalf("GET stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Errorf("status = %d, want 416 (empty bus + since=1 must not fall through to 200)", resp.StatusCode)
+	}
+
+	var body map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if _, ok := body["error"]; !ok {
+		t.Errorf("response missing 'error' field: %+v", body)
+	}
+}
+
 // TestBusStreamSinceMutualExclusion verifies that passing both ?since=N and
 // ?no_replay=1 returns 400 Bad Request.
 func TestBusStreamSinceMutualExclusion(t *testing.T) {
