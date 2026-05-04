@@ -70,16 +70,35 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// filteredEnviron returns a copy of os.Environ() with the CLAUDECODE variable
-// removed. Claude Code sets CLAUDECODE in its process environment; if a child
-// `claude` CLI inherits it, the CLI refuses to start ("cannot be launched inside
-// another Claude Code session"). Filtering it out allows CogOS to spawn Claude
-// CLI from within a Claude Code session (e.g. during development/testing).
+// harnessIngressVars are environment variable prefixes that, if inherited by a
+// spawned subprocess, can redirect the child's model client back through the
+// CogOS kernel (routing loop). These mirror the ingressVars list in
+// internal/engine/provider_env.go; keep both lists in sync.
+var harnessIngressVars = []string{
+	"ANTHROPIC_BASE_URL",
+	"ANTHROPIC_AUTH_TOKEN",
+	"OPENAI_BASE_URL",
+	"OPENAI_API_BASE",
+	"OPENAI_COMPAT_BASE_URL",
+}
+
+// filteredEnviron returns a copy of os.Environ() with variables that would
+// cause routing loops stripped out:
+//   - CLAUDECODE: Claude Code sets this in its process env; a child `claude`
+//     CLI that inherits it refuses to start ("cannot be launched inside another
+//     Claude Code session").
+//   - The five ingress/proxy routing vars (ANTHROPIC_BASE_URL, etc.): these
+//     can redirect a kernel-spawned provider subprocess back through the kernel,
+//     producing recursive inference loops (same bug fixed in internal/engine/
+//     via PR #130 / issue #59).
 func filteredEnviron() []string {
 	env := os.Environ()
 	out := make([]string, 0, len(env)+1)
 	for _, e := range env {
 		if strings.HasPrefix(e, "CLAUDECODE=") {
+			continue
+		}
+		if isHarnessIngressVar(e) {
 			continue
 		}
 		out = append(out, e)
@@ -88,6 +107,17 @@ func filteredEnviron() []string {
 	// so they can skip context injection (the kernel handles it natively).
 	out = append(out, "COGOS_HARNESS=1")
 	return out
+}
+
+// isHarnessIngressVar reports whether the KEY=VALUE string kv corresponds to
+// one of the known ingress routing variables.
+func isHarnessIngressVar(kv string) bool {
+	for _, key := range harnessIngressVars {
+		if strings.HasPrefix(kv, key+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 // Harness is the inference execution engine. Create one with [New] and call
