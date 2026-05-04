@@ -116,88 +116,167 @@ func TestResolveURI_NonDigestQueryAllowed(t *testing.T) {
 
 // ── 3. Round-trip equivalence ─────────────────────────────────────────────────
 
+// roundTripMapping describes one entry in uriMappings that supports a clean
+// PathToURI → ResolveURI round-trip.  Only "direct"-pattern projections
+// round-trip cleanly: "directory" projections append a trailing separator on
+// resolve (so the round-trip path differs from the input), "glob" projections
+// require matching files on disk and are tested separately, and "singleton"
+// projections have no path component.
+//
+// The table is derived from uriMappings (which drives PathToURI) cross-checked
+// against projections (which drives ResolveURI).  Each entry carries a
+// representative relative path under the mapping's filesystem prefix and the
+// canonical URI that PathToURI must emit for it.
+//
+// Maintenance: when a new namespace is added to pkg/uri.Namespaces *and* has a
+// "direct"-pattern projection in internal/engine/uri.go, add a row here.  The
+// namespace_sync_test.go drift guard (issue #178) will catch Namespaces-only
+// additions; this table catches projection-only additions (PathToURI mismatch).
+var roundTripMappings = []struct {
+	// name is the subtest label — conventionally the namespace key.
+	name string
+	// relPath is workspace-relative (no leading slash).  It is joined with
+	// root inside the test.
+	relPath string
+	// wantURI is the exact cog: URI that PathToURI must emit for relPath.
+	wantURI string
+}{
+	// ── Memory corpus ──────────────────────────────────────────────────────────
+	{
+		name:    "mem",
+		relPath: ".cog/mem/semantic/insights/foo.cog.md",
+		wantURI: "cog:mem/semantic/insights/foo.cog.md",
+	},
+	// ── Config ─────────────────────────────────────────────────────────────────
+	// PathToURI emits the canonical "conf" alias; ResolveURI accepts it.
+	{
+		name:    "conf",
+		relPath: ".cog/config/kernel.yaml",
+		wantURI: "cog:conf/kernel.yaml",
+	},
+	// ── Ontology ───────────────────────────────────────────────────────────────
+	// uriMappings strips .cog.md; the "direct" projection in ResolveURI re-adds
+	// it, so the original path is recovered exactly.
+	{
+		name:    "ontology",
+		relPath: ".cog/ontology/crystal.cog.md",
+		wantURI: "cog:ontology/crystal",
+	},
+	// ── Docs ───────────────────────────────────────────────────────────────────
+	{
+		name:    "docs",
+		relPath: ".cog/docs/framework-status.md",
+		wantURI: "cog:docs/framework-status.md",
+	},
+	// ── Hooks ──────────────────────────────────────────────────────────────────
+	{
+		name:    "hooks",
+		relPath: ".cog/hooks/session-start.sh",
+		wantURI: "cog:hooks/session-start.sh",
+	},
+	// ── Specs ──────────────────────────────────────────────────────────────────
+	// PathToURI emits the plural "specs" alias; ResolveURI accepts it.
+	// uriMappings strips .cog.md; "direct+Suffix" re-adds it.
+	{
+		name:    "specs",
+		relPath: ".cog/specs/my-spec.cog.md",
+		wantURI: "cog:specs/my-spec",
+	},
+	// ── Status ─────────────────────────────────────────────────────────────────
+	// uriMappings strips .json; "direct+Suffix" re-adds it.
+	{
+		name:    "status",
+		relPath: ".cog/status/kernel.json",
+		wantURI: "cog:status/kernel",
+	},
+	// ── Work ───────────────────────────────────────────────────────────────────
+	{
+		name:    "work",
+		relPath: ".cog/work/sprint-1.md",
+		wantURI: "cog:work/sprint-1.md",
+	},
+}
+
 // TestPathToURI_RoundTrip verifies parse → emit → parse round-trip equivalence
-// for projection URIs (ADR-067).
+// for every "direct"-pattern projection.  Cases are generated from
+// roundTripMappings so coverage automatically tracks the source of truth in
+// uriMappings / projections — adding a new direct-pattern namespace and row to
+// roundTripMappings is sufficient; no manual subtest boilerplate needed.
 //
-// The claim in this file's header ("parse → emit → parse gives identical
-// resolution") requires calling ResolveURI on the emitted URI and comparing
-// the resolved path back to the original absolute path.  The previous
-// implementation called PathToURI twice without ever calling ResolveURI,
-// making it a path-only stability test rather than a genuine round-trip.
+// Round-trip contract (per ADR-067):
 //
-// Covers both local projection form (cog:projection/path) and confirms
-// bare-form URIs resolve to the expected filesystem paths.
+//	PathToURI(root, absPath)  →  uri          (emit: path → URI)
+//	ResolveURI(root, uri)     →  res.Path     (parse: URI → path)
+//	res.Path == absPath                        (invariant)
+//
+// "directory"- and "glob"-pattern projections are excluded: directory projections
+// append a trailing separator on resolution (the round-trip path differs from
+// the input), and glob projections require matching files on disk.  Both are
+// exercised by other tests in uri_test.go.
 func TestPathToURI_RoundTrip(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 
-	// Set up a minimal workspace structure so ResolveURI can construct paths.
-	// "direct" and "singleton" projections do not require files to exist; they
-	// compute the path deterministically.
-	for _, dir := range []string{
-		".cog/mem/semantic/insights",
-		".cog/config",
-		".cog/ontology",
-		".cog/docs",
-	} {
-		if err := os.MkdirAll(filepath.Join(root, dir), 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	cases := []struct {
-		name    string
-		absPath string
-		wantURI string
-	}{
-		{
-			name:    "mem bare form",
-			absPath: filepath.Join(root, ".cog/mem/semantic/insights/foo.cog.md"),
-			wantURI: "cog:mem/semantic/insights/foo.cog.md",
-		},
-		{
-			name:    "conf bare form",
-			absPath: filepath.Join(root, ".cog/config/kernel.yaml"),
-			wantURI: "cog:conf/kernel.yaml",
-		},
-		{
-			// ontology strips .cog.md from the URI; ResolveURI re-adds it.
-			name:    "ontology extension-stripped",
-			absPath: filepath.Join(root, ".cog/ontology/crystal.cog.md"),
-			wantURI: "cog:ontology/crystal",
-		},
-		{
-			name:    "docs bare form",
-			absPath: filepath.Join(root, ".cog/docs/framework-status.md"),
-			wantURI: "cog:docs/framework-status.md",
-		},
-	}
-
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
+	for _, m := range roundTripMappings {
+		m := m
+		t.Run(m.name, func(t *testing.T) {
 			t.Parallel()
 
+			absPath := filepath.Join(root, filepath.FromSlash(m.relPath))
+
 			// Step 1: path → URI (emit).
-			uri, err := PathToURI(root, tc.absPath)
+			uri, err := PathToURI(root, absPath)
 			if err != nil {
-				t.Fatalf("PathToURI(%q): %v", tc.absPath, err)
+				t.Fatalf("PathToURI(%q): %v", absPath, err)
 			}
-			if uri != tc.wantURI {
-				t.Errorf("PathToURI = %q; want %q", uri, tc.wantURI)
+			if uri != m.wantURI {
+				t.Errorf("PathToURI = %q; want %q", uri, m.wantURI)
 			}
 
-			// Step 2: URI → resolved path (parse).  This is the round-trip leg
-			// the previous test was missing: call ResolveURI on the emitted URI
-			// and verify the resolved filesystem path matches the original input.
+			// Step 2: URI → resolved path (parse).  This is the genuine round-trip
+			// leg: ResolveURI must recover the original absolute path from the
+			// emitted URI.
 			res, err := ResolveURI(root, uri)
 			if err != nil {
 				t.Fatalf("ResolveURI(%q): %v", uri, err)
 			}
-			if res.Path != tc.absPath {
-				t.Errorf("round-trip path mismatch:\n  PathToURI input:   %q\n  ResolveURI output: %q", tc.absPath, res.Path)
+			if res.Path != absPath {
+				t.Errorf("round-trip path mismatch:\n  PathToURI input:   %q\n  ResolveURI output: %q", absPath, res.Path)
 			}
 		})
+	}
+}
+
+// TestPathToURI_RoundTrip_FragmentPreservation is an explicit edge-case that
+// the table-driven generator above does not naturally produce: a URI carrying
+// a fragment must survive the round-trip with the fragment intact.
+//
+// This is kept as a separate named test (not a row in roundTripMappings) because
+// fragment preservation is a URI-layer invariant, not a projection-mapping
+// concern — it applies across every namespace equally and does not belong to any
+// single mapping row.
+func TestPathToURI_RoundTrip_FragmentPreservation(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+
+	// Construct a mem path and emit its URI, then manually append a fragment and
+	// verify that ResolveURI preserves it.
+	absPath := filepath.Join(root, ".cog/mem/semantic/insights/eigenform.cog.md")
+	uri, err := PathToURI(root, absPath)
+	if err != nil {
+		t.Fatalf("PathToURI: %v", err)
+	}
+
+	uriWithFragment := uri + "#The-Seed"
+	res, err := ResolveURI(root, uriWithFragment)
+	if err != nil {
+		t.Fatalf("ResolveURI(%q): %v", uriWithFragment, err)
+	}
+	if res.Path != absPath {
+		t.Errorf("round-trip path mismatch:\n  input:  %q\n  output: %q", absPath, res.Path)
+	}
+	if res.Fragment != "The-Seed" {
+		t.Errorf("Fragment = %q; want %q (fragment was dropped)", res.Fragment, "The-Seed")
 	}
 }
 
