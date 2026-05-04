@@ -511,10 +511,14 @@ func (s *Server) handleBusStream(w http.ResponseWriter, r *http.Request, busID s
 	}
 
 	// Validate since range before upgrading to SSE — must not exceed current tip.
+	// An empty bus has tip=0, so any since>0 is out of range (RFC 7233 / 416).
 	if hasSince && s.busSessions != nil {
 		events, err := s.busSessions.ReadEvents(busID)
-		if err == nil && len(events) > 0 {
-			maxSeq := events[len(events)-1].Seq
+		if err == nil {
+			var maxSeq int // tip=0 for an empty bus
+			if len(events) > 0 {
+				maxSeq = events[len(events)-1].Seq
+			}
 			if sinceSeq > maxSeq {
 				http.Error(w, `{"error":"since exceeds current tip","code":"range_not_satisfiable"}`, http.StatusRequestedRangeNotSatisfiable)
 				return
