@@ -177,6 +177,41 @@ func TestParseMLXEntries_NoProvidersSection(t *testing.T) {
 	}
 }
 
+// TestParseMLXEntries_YAMLAnchors: YAML anchors/aliases are resolved correctly.
+// The bespoke parser silently dropped these; yaml.v3 expands them.
+func TestParseMLXEntries_YAMLAnchors(t *testing.T) {
+	t.Parallel()
+	input := `providers:
+  mlx-gemma:
+    type: &mlx_type mlx-supervised
+    endpoint: &ep http://localhost:1235
+    model: /vol/gemma
+  mlx-qwen:
+    type: *mlx_type
+    endpoint: *ep
+    model: /vol/qwen
+`
+	entries := parseMLXEntriesFromYAML([]byte(input), "providers.yaml")
+	if len(entries) != 2 {
+		t.Fatalf("anchors: got %d entries; want 2", len(entries))
+	}
+	for _, e := range entries {
+		if e.endpoint != "http://localhost:1235" {
+			t.Errorf("anchor alias not expanded: endpoint %q", e.endpoint)
+		}
+	}
+}
+
+// TestParseMLXEntries_MalformedYAML: invalid YAML yields empty result, no panic.
+func TestParseMLXEntries_MalformedYAML(t *testing.T) {
+	t.Parallel()
+	input := "providers:\n  bad: [\nunterminated"
+	entries := parseMLXEntriesFromYAML([]byte(input), "providers.yaml")
+	if len(entries) != 0 {
+		t.Errorf("malformed YAML: got %d entries; want 0", len(entries))
+	}
+}
+
 // ── loadMLXEntries (filesystem integration) ───────────────────────────────────
 
 // TestLoadMLXEntries_NoFiles: workspace without providers files yields empty.
