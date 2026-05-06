@@ -1,5 +1,16 @@
 # CogOS
 
+> [!IMPORTANT]
+> ## This repository is archived
+>
+> Active development of CogOS continues at **[cogos-dev/cogos](https://github.com/cogos-dev/cogos)**.
+>
+> This repo was a personal fork during early development. As of 2026-05-05, the canonical home is the [cogos-dev](https://github.com/cogos-dev) GitHub organization — that is where new issues, pull requests, releases, and discussion happen. Tags here (`v0.1.0`, `v0.3.0`) are a historical subset; the current release lineage is at [cogos-dev/cogos/releases](https://github.com/cogos-dev/cogos/releases).
+>
+> Closed PRs and branch history on this repo are preserved for archival reference only.
+
+---
+
 A cognitive daemon for AI agents. Written in Go. Runs locally.
 
 ```sh
